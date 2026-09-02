@@ -117,10 +117,30 @@ chmod 600 "$H/.ssh/known_hosts"
 ok "github.com em known_hosts"
 
 say "8. git do usuário (governança de autoria)"
-sudo -u "$U" git config --global user.name  "Ariel Evangelista"
-sudo -u "$U" git config --global user.email "ariel.evangelista@outlook.com"
+# Quem assina os commits desta máquina. Não há padrão possível: commit assinado
+# com o nome de outra pessoa é registro falso, e é o tipo de erro que só aparece
+# depois de publicado.
+GIT_NOME="${ORQ_GIT_NOME:-}"
+GIT_EMAIL="${ORQ_GIT_EMAIL:-}"
+if [ -z "$GIT_NOME" ] || [ -z "$GIT_EMAIL" ]; then
+  printf '  \033[33m!\033[0m quem assina os commits desta máquina?\n'
+  printf '      defina antes de rodar, ou informe agora:\n'
+  printf '        ORQ_GIT_NOME="Fulano de Tal" ORQ_GIT_EMAIL="fulano@empresa.com" \\\n'
+  printf '          sudo -E bash provisionar.sh %s\n' "$U"
+  [ -t 0 ] || { echo "  sem terminal para perguntar; pulando a configuração de autoria."; GIT_NOME=""; }
+  if [ -t 0 ]; then
+    printf '      nome:  '; read -r GIT_NOME
+    printf '      email: '; read -r GIT_EMAIL
+  fi
+fi
+if [ -n "$GIT_NOME" ] && [ -n "$GIT_EMAIL" ]; then
+  sudo -u "$U" git config --global user.name  "$GIT_NOME"
+  sudo -u "$U" git config --global user.email "$GIT_EMAIL"
+  ok "autor = $GIT_NOME <$GIT_EMAIL>"
+else
+  printf '  \033[33m!\033[0m autoria NÃO configurada — configure antes do primeiro commit\n'
+fi
 sudo -u "$U" git config --global init.defaultBranch main
-ok "autor = Ariel Evangelista <ariel.evangelista@outlook.com>"
 
 say "PRONTO — falta o que só uma pessoa pode fazer"
 echo

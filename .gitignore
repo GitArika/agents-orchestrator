@@ -1,0 +1,9 @@
+# Nenhum segredo, nunca. Estas linhas são a última barreira, não a primeira.
+*.env
+!*.env.exemplo
+credenciais*.json
+credenciais*.env
+.DS_Store
+__pycache__/
+*.pyc
+node_modules/

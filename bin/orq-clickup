@@ -1,0 +1,764 @@
+#!/usr/bin/env node
+// ClickUp API — minimal, token-frugal CLI wrapper.
+//
+// Each command pulls ONLY the fields you need out of ClickUp's verbose responses,
+// so a lookup that would dump a ~700-token task object into context returns a single
+// line — or, for `branch`/`field`, a single string. Auth + ID aliases come from the
+// co-located .env (loaded regardless of the directory node is invoked from).
+//
+// Why this exists: the clickup_* MCP get_task wrapper OMITS custom-field values
+// (it only reports custom_fields_count) and its responses are large objects. The raw
+// REST API used here is the only path that returns custom_fields[] values.
+//
+// Commands:
+//   lists       <folderId|alias>                      lists in a folder      -> NDJSON {id,name}
+//   tasks       <listId|alias> [--closed --desc --page=N]  open tasks in a list -> NDJSON {id,name,status,url}
+//   get         <taskId>                               status/tags/links by id -> {id,name,status,url,tags,linked}
+//   create-task <listId|alias> <name> [description]   create a task (auto-assigns API-key owner) -> {id,url}
+//   set-status  <taskId> <status>                     change a task's status -> {id,status,url}
+//   set-desc    <taskId> <file.md|-> [--dry]           replace the description (markdown) -> {id,url,chars}
+//   fields      <taskId>                              all custom fields      -> {name:value,...}
+//   field       <taskId> <fieldName>                  one custom field value -> plain string
+//   branch      <taskId>                              shorthand: field <id> branch -> plain string
+//
+// IDs may be raw ClickUp IDs or aliases defined in .env (LIST_<NAME>, FOLDER_<NAME>).
+
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+const API = 'https://api.clickup.com/api/v2'
+
+// --- carregador de credencial (zero dependências) --------------------------
+// A credencial vive FORA de qualquer repositório: um token dentro da árvore
+// clonada vai parar no GitHub interno no primeiro push distraído. Ordem:
+//   1. variável já exportada no ambiente (vence sempre)
+//   2. ~/.config/orquestrador/credenciais.env
+//   3. os caminhos antigos, para não quebrar quem já usava (com aviso)
+const ARQUIVOS_DE_CREDENCIAL = [
+  path.join(os.homedir(), '.config', 'orquestrador', 'credenciais.env'),
+  path.join(os.homedir(), '.env.clickup'),
+]
+const loadEnv = () => {
+  const file = ARQUIVOS_DE_CREDENCIAL.find((f) => fs.existsSync(f))
+  if (!file) return
+  for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+    const line = raw.trim()
+    if (!line || line.startsWith('#')) continue
+    const eq = line.indexOf('=')
+    if (eq === -1) continue
+    const key = line.slice(0, eq).trim()
+    let val = line.slice(eq + 1).trim()
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1)
+    }
+    if (!(key in process.env)) process.env[key] = val
+  }
+}
+loadEnv()
+
+const KEY = process.env.CLICKUP_API_KEY
+
+const die = (msg) => {
+  console.error(msg)
+  process.exit(1)
+}
+
+const AJUDA_CREDENCIAL = [
+  'CLICKUP_API_KEY não está definida.',
+  '',
+  `Crie ${ARQUIVOS_DE_CREDENCIAL[0]} com:`,
+  '',
+  '    CLICKUP_API_KEY=pk_...',
+  '',
+  'e proteja: chmod 600. O token é PESSOAL — tudo que a esteira escrever',
+  'aparece como escrito por você. Ele nunca deve entrar num repositório.',
+].join('\n')
+
+// Resolve an alias (LIST_TASKS, FOLDER_MAINTENANCE) to its ID; otherwise pass the
+// value through unchanged so raw numeric IDs keep working.
+const resolveId = (prefix, arg) => {
+  const key = `${prefix}_${arg.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`
+  return process.env[key] || arg
+}
+
+const api = async (method, endpoint, body) => {
+  if (!KEY) {
+    die(AJUDA_CREDENCIAL)
+  }
+  // Cap every request: a stalled ClickUp socket must fail fast, never hang the
+  // caller indefinitely (a timeout-less fetch once froze dispatched sessions ~16h).
+  const res = await fetch(`${API}${endpoint}`, {
+    method,
+    headers: {
+      Authorization: KEY,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(15000),
+  })
+  const text = await res.text()
+  let data
+  try {
+    data = text ? JSON.parse(text) : {}
+  } catch {
+    data = { raw: text }
+  }
+  if (!res.ok) {
+    die(`ClickUp API error ${res.status}: ${data.err || data.raw || text}`)
+  }
+  return data
+}
+
+// The ClickUp user id that owns CLICKUP_API_KEY (via GET /user). Used to
+// auto-assign new tasks to whoever's key the skill is configured with, so the
+// assignee follows the key instead of being hardcoded. Soft-fails (returns null)
+// so a lookup hiccup never blocks task creation. Cached per process.
+let _ownerId
+const currentUserId = async () => {
+  if (_ownerId !== undefined) return _ownerId
+  _ownerId = null
+  try {
+    if (!KEY) return _ownerId
+    const res = await fetch(`${API}/user`, { headers: { Authorization: KEY }, signal: AbortSignal.timeout(15000) })
+    if (res.ok) {
+      const data = await res.json()
+      _ownerId = data?.user?.id ?? null
+    }
+  } catch {
+    // ignore — leaves _ownerId null, task is created unassigned with a note
+  }
+  return _ownerId
+}
+
+// Decode a ClickUp custom-field value into human text. Dropdowns/labels/users store
+// option IDs or indexes; resolve them through type_config.options so callers get the
+// label, not an opaque id. Everything else (text, url, number, date) passes through.
+const formatField = (f) => {
+  const v = f.value
+  if (v === undefined || v === null || v === '') return null
+  const opts = f.type_config?.options || []
+  const byId = (id) => opts.find((o) => o.id === id || o.orderindex === id)
+  switch (f.type) {
+    case 'drop_down': {
+      const o = byId(v)
+      return o ? (o.name ?? o.label ?? String(v)) : String(v)
+    }
+    case 'labels':
+      return (Array.isArray(v) ? v : [v])
+        .map((id) => {
+          const o = byId(id)
+          return o ? (o.label ?? o.name) : id
+        })
+        .join(', ')
+    case 'users':
+      return (Array.isArray(v) ? v : [v]).map((u) => u.username || u.email || u.id).join(', ')
+    default:
+      return typeof v === 'object' ? JSON.stringify(v) : String(v)
+  }
+}
+
+// Turn a human-typed value into the shape ClickUp's set-field endpoint expects for
+// this field. Dropdowns/labels take option IDs, so resolve the typed label first.
+const toFieldValue = (f, input) => {
+  const opts = f.type_config?.options || []
+  const matchOpt = (s) =>
+    opts.find(
+      (o) =>
+        (o.name ?? o.label ?? '').toLowerCase() === s.toLowerCase() ||
+        o.id === s ||
+        String(o.orderindex) === s
+    )
+  switch (f.type) {
+    case 'drop_down': {
+      const o = matchOpt(input)
+      if (!o) die(`"${input}" is not an option for ${f.name}. Options: ${opts.map((x) => x.name ?? x.label).join(', ')}`)
+      return o.id
+    }
+    case 'labels':
+      return input.split(',').map((s) => {
+        const o = matchOpt(s.trim())
+        if (!o) die(`"${s.trim()}" is not a label for ${f.name}. Options: ${opts.map((x) => x.label ?? x.name).join(', ')}`)
+        return o.id
+      })
+    case 'number':
+    case 'currency':
+      return Number(input)
+    default:
+      return input
+  }
+}
+
+// A task-type name (bug, épico) -> numeric custom_item_id via TYPE_<NAME> in .env, or
+// a raw numeric id passed straight through. Omit entirely for the default "Task".
+const resolveType = (arg) => {
+  if (/^\d+$/.test(arg)) return Number(arg)
+  const key = `TYPE_${arg.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`
+  if (process.env[key]) return Number(process.env[key])
+  die(`Unknown task type "${arg}". Pass a numeric custom_item_id or set ${key} in .env (run \`types\` to list them).`)
+}
+
+const getTeamId = async () => {
+  if (process.env.TEAM_ID) return process.env.TEAM_ID
+  const { teams } = await api('GET', '/team')
+  if (teams && teams.length === 1) return teams[0].id
+  die('Set TEAM_ID in .env (the numeric workspace id from your ClickUp URL) — multiple/no workspaces found.')
+}
+
+const out = (obj) => console.log(JSON.stringify(obj))
+// Linha para humano ler. `out` serializa como JSON — o que é certo para as
+// saídas consumidas por script, e errado para uma frase.
+const linha = (texto) => console.log(texto)
+
+const flag = (flags, name) => flags.includes(`--${name}`)
+const flagVal = (flags, name) => {
+  const hit = flags.find((f) => f.startsWith(`--${name}=`))
+  return hit ? hit.slice(name.length + 3) : undefined
+}
+
+// Resolve TODAY's sprint list by date — never a stored id (sprint ids rotate daily).
+// Picks the active sprint whose [start,due] contains now; on overlap the latest start wins.
+async function resolveTodaySprint() {
+  const f = process.env.FOLDER_SPRINTS
+  if (!f) die('FOLDER_SPRINTS not set in .env')
+  const r = await api('GET', `/folder/${f}/list?archived=false`)
+  const now = Date.now()
+  const lists = (r.lists || []).map((l) => ({
+    id: l.id,
+    name: l.name,
+    start: Number(l.start_date) || 0,
+    due: Number(l.due_date) || 0,
+  }))
+  const active = lists.filter((l) => l.start && l.due && l.start <= now && now <= l.due)
+  const pool = active.length ? active : lists.filter((l) => l.start && l.start <= now)
+  const s = pool.sort((a, b) => b.start - a.start)[0]
+  if (!s) die('no current sprint found in FOLDER_SPRINTS — run `sprints` to inspect')
+  return s
+}
+
+// --- commands -------------------------------------------------------------
+// Os dez status da esteira. A conclusão de um estágio É a fila do seguinte: é
+// isso que faz a esteira andar sem ninguém empurrando.
+const STATUS_CANONICOS = [
+  { status: 'backlog',               type: 'open' },
+  { status: 'especificando',         type: 'custom' },
+  { status: 'spec pronta',           type: 'custom' },
+  { status: 'em progresso',          type: 'custom' },
+  { status: 'aguardando revisão',    type: 'custom' },
+  { status: 'revisando',             type: 'custom' },
+  { status: 'aguardando integração', type: 'custom' },
+  { status: 'integrando',            type: 'custom' },
+  // Espera humana visível no quadro. Sem ele, quem abre o ClickUp vê
+  // "revisando" e conclui que alguém está revisando.
+  { status: 'parado',                type: 'custom' },
+  { status: 'pronto',                type: 'closed' },
+]
+
+const commands = {
+  // Antes de QUALQUER escrita, saber de quem é a autoria. Em 27/08/2026 uma
+  // aprovação foi publicada assinada por outra pessoa porque a escrita saiu por
+  // uma sessão autenticada que não era a do dono do projeto. Aprovação atribuída
+  // a quem não aprovou é falsificação de registro, ainda que involuntária.
+  async whoami(flags) {
+    const u = await api('GET', '/user')
+    if (flag(flags, 'json')) return out(u)
+    linha(`${u.user.username} <${u.user.email}>  id=${u.user.id}`)
+  },
+
+  // Prova que a lista existe E responde. Algumas rotas de navegação devolvem id
+  // de lista já apagada: a leitura funciona e a escrita responde 404 sem dizer
+  // por quê. Resolver pelo nome (find-list) quando isso acontecer.
+  async list([id, ...flags]) {
+    if (!id) die('uso: list <listId|alias> [--json]')
+    const l = await api('GET', `/list/${resolveId('LIST', id)}`)
+    if (flag(flags, 'json')) return out(l)
+    linha(`${l.name}  (${l.id})`)
+    linha(`status: ${(l.statuses || []).map((s) => s.status).join(' · ')}`)
+  },
+
+  // Cria na lista os status que faltam para a esteira funcionar. Simulação por
+  // padrão: mexer nos status de uma lista com trabalho de verdade é decisão de
+  // quem é dono do processo, não da ferramenta.
+  async 'status-provisionar'([id, ...flags]) {
+    if (!id) die('uso: status-provisionar <listId|alias> [--aplicar]')
+    const listId = resolveId('LIST', id)
+    const l = await api('GET', `/list/${listId}`)
+    const existentes = (l.statuses || []).map((s) => s.status.toLowerCase())
+    const faltando = STATUS_CANONICOS.filter((s) => !existentes.includes(s.status))
+
+    linha(`lista: ${l.name} (${l.id})`)
+    linha(`já tem: ${existentes.join(' · ') || '(nenhum)'}`)
+    if (!faltando.length) return linha('nada a criar — os dez status já existem.')
+    linha(`vai criar: ${faltando.map((s) => s.status).join(' · ')}`)
+    // NUNCA renomear nem apagar status existente: pode haver tarefa nele.
+    if (!flag(flags, 'aplicar')) {
+      return linha('\nsimulação — nada foi escrito. Para criar de verdade: --aplicar')
+    }
+    const base = (l.statuses || []).map((s, i) => ({
+      status: s.status, type: s.type, orderindex: i,
+    }))
+    await api('PUT', `/list/${listId}`, {
+      statuses: [...base, ...faltando.map((s, i) => ({
+        status: s.status, type: s.type, orderindex: base.length + i,
+      }))],
+    })
+    linha(`\n${faltando.length} status criado(s).`)
+  },
+
+  async lists([folder]) {
+    if (!folder) die('usage: lists <folderId|alias>')
+    const { lists } = await api('GET', `/folder/${resolveId('FOLDER', folder)}/list`)
+    for (const l of lists) out({ id: l.id, name: l.name })
+  },
+
+  async tasks([list, ...flags]) {
+    if (!list) die('usage: tasks <listId|alias> [--closed] [--desc] [--page=N]')
+    const params = new URLSearchParams()
+    if (flag(flags, 'closed')) params.set('include_closed', 'true')
+    if (flagVal(flags, 'page')) params.set('page', flagVal(flags, 'page'))
+    const q = params.toString() ? `?${params}` : ''
+    const { tasks } = await api('GET', `/list/${resolveId('LIST', list)}/task${q}`)
+    for (const t of tasks) {
+      const row = { id: t.id, name: t.name, status: t.status?.status, url: t.url }
+      if (flag(flags, 'desc')) {
+        row.description = t.description ? t.description.slice(0, 100).replace(/\n/g, ' ') : ''
+      }
+      out(row)
+    }
+  },
+
+  async ['create-task']([list, name, ...rest]) {
+    if (!list || !name) {
+      die('usage: create-task <listId|alias> <name> [description] [--tag=NAME ...] [--type=NAME|id] [--status=S]')
+    }
+    const flags = rest.filter((a) => a.startsWith('--'))
+    const description = rest.filter((a) => !a.startsWith('--')).join(' ')
+    const body = { name }
+    if (description) body.markdown_content = description // descriptions render as markdown
+    const tags = flags.filter((f) => f.startsWith('--tag=')).map((f) => f.slice(6))
+    if (tags.length) body.tags = tags
+    const type = flagVal(flags, 'type')
+    if (type) body.custom_item_id = resolveType(type)
+    const status = flagVal(flags, 'status')
+    if (status) body.status = status
+    // Auto-assign to the API-key owner (robust: follows whichever key is set).
+    // Override with --assignee=<userId>; skip entirely with --no-assign.
+    const assigneeFlag = flagVal(flags, 'assignee')
+    if (assigneeFlag) {
+      body.assignees = [Number(assigneeFlag) || assigneeFlag]
+    } else if (!flags.includes('--no-assign')) {
+      const owner = await currentUserId()
+      if (owner != null) body.assignees = [owner]
+      else console.error('note: could not resolve API-key owner via GET /user — task created unassigned')
+    }
+    const t = await api('POST', `/list/${resolveId('LIST', list)}/task`, body)
+    out({ id: t.id, url: t.url, assignees: (t.assignees || []).map((a) => a.username || a.id) })
+  },
+
+  // Replace a task's description with the contents of a markdown file (or stdin).
+  // The body goes out as `markdown_content`, the only field ClickUp renders as
+  // markdown — `description` would land as plain text and lose every heading.
+  async ['set-desc']([taskId, file, ...rest]) {
+    if (!taskId || !file) die('usage: set-desc <taskId> <arquivo.md|-> [--dry]')
+    const md = file === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(file, 'utf8')
+    if (!md.trim()) die('recusado: descricao vazia (isso apagaria o cartao)')
+    if (rest.includes('--dry')) return out({ id: taskId, chars: md.length, dry: true })
+    const t = await api('PUT', `/task/${taskId}`, { markdown_content: md })
+    out({ id: t.id, url: t.url, chars: md.length })
+  },
+
+  // The user who owns CLICKUP_API_KEY — the account new tasks auto-assign to.
+  async me() {
+    const u = await api('GET', '/user')
+    out({ id: u?.user?.id, username: u?.user?.username, email: u?.user?.email })
+  },
+
+  // Assign a task to a user (defaults to the API-key owner). Useful to backfill
+  // tasks created before auto-assign, or to hand a task to someone else.
+  async assign([taskId, userId]) {
+    if (!taskId) die('usage: assign <taskId> [userId]  (defaults to the API-key owner)')
+    const uid = userId ? (Number(userId) || userId) : await currentUserId()
+    if (uid == null) die('could not resolve assignee (GET /user failed) — pass a userId explicitly')
+    const t = await api('PUT', `/task/${taskId}`, { assignees: { add: [uid] } })
+    out({ id: t.id, url: t.url, assignees: (t.assignees || []).map((a) => a.username || a.id) })
+  },
+
+  async ['set-status']([taskId, ...statusParts]) {
+    const status = statusParts.join(' ')
+    if (!taskId || !status) die('usage: set-status <taskId> <status>')
+    if (/^(done|closed|complete|completo|conclu|fechad)/i.test(status)) {
+      console.error(
+        'note: marking a task done/closed is the human reviewer\'s call (CRITICAL_CONSTRAINT #4). Use "in review" at the commit transition.'
+      )
+    }
+    const t = await api('PUT', `/task/${taskId}`, { status })
+    out({ id: t.id, status: t.status?.status, url: t.url })
+  },
+
+  async get([taskId]) {
+    if (!taskId) die('usage: get <taskId>')
+    const t = await api('GET', `/task/${taskId}`)
+    out({
+      id: t.id,
+      name: t.name,
+      status: t.status?.status,
+      url: t.url,
+      tags: (t.tags || []).map((x) => x.name),
+      linked: (t.linked_tasks || []).map((l) => l.task_id || l.link_id).filter(Boolean),
+    })
+  },
+
+  async fields([taskId]) {
+    if (!taskId) die('usage: fields <taskId>')
+    const t = await api('GET', `/task/${taskId}`)
+    const map = {}
+    for (const f of t.custom_fields || []) {
+      const val = formatField(f)
+      if (val !== null) map[f.name] = val
+    }
+    out(map)
+  },
+
+  async field([taskId, ...nameParts]) {
+    const name = nameParts.join(' ')
+    if (!taskId || !name) die('usage: field <taskId> <fieldName>')
+    const t = await api('GET', `/task/${taskId}`)
+    const f = (t.custom_fields || []).find((x) => (x.name || '').toLowerCase() === name.toLowerCase())
+    const val = f ? formatField(f) : null
+    console.log(val ?? `No ${name} found`)
+  },
+
+  async branch([taskId]) {
+    if (!taskId) die('usage: branch <taskId>')
+    return commands.field([taskId, 'branch'])
+  },
+
+  async tag([taskId, ...nameParts]) {
+    const name = nameParts.join(' ')
+    if (!taskId || !name) die('usage: tag <taskId> <tagName>')
+    await api('POST', `/task/${taskId}/tag/${encodeURIComponent(name)}`)
+    out({ task: taskId, tag: name, added: true })
+  },
+
+  async untag([taskId, ...nameParts]) {
+    const name = nameParts.join(' ')
+    if (!taskId || !name) die('usage: untag <taskId> <tagName>')
+    await api('DELETE', `/task/${taskId}/tag/${encodeURIComponent(name)}`)
+    out({ task: taskId, tag: name, removed: true })
+  },
+
+  // The epic<->task relation the contract requires (a ClickUp task link, not a subtask).
+  async relate([taskId, other]) {
+    if (!taskId || !other) die('usage: relate <taskId> <otherTaskId>')
+    await api('POST', `/task/${taskId}/link/${other}`)
+    out({ task: taskId, links_to: other, ok: true })
+  },
+
+  async comment([taskId, ...textParts]) {
+    const text = textParts.join(' ')
+    if (!taskId || !text) die('usage: comment <taskId> <text>')
+    const r = await api('POST', `/task/${taskId}/comment`, { comment_text: text })
+    out({ task: taskId, comment_id: r.id })
+  },
+
+  // --- Sprints (multi-list) ---------------------------------------------------
+  // List the sprint lists in the Sprints folder (id, name, dates) — find the active sprint fast.
+  async sprints() {
+    const f = process.env.FOLDER_SPRINTS
+    if (!f) die('FOLDER_SPRINTS not set in .env')
+    const r = await api('GET', `/folder/${f}/list?archived=false`)
+    for (const l of r.lists || []) out({ id: l.id, name: l.name, start: l.start_date, due: l.due_date })
+  },
+
+  // Add an EXISTING task to another list (ClickUp multi-list). The task's home list is
+  // unchanged; it becomes an additional member of <listId>. NDJSON note: GET /list/<id>/task
+  // returns only HOME-listed tasks, not multi-list adds — read a task's `.locations` to confirm.
+  async ['add-to-list']([taskId, list]) {
+    if (!taskId || !list) die('usage: add-to-list <taskId> <listId|alias>  (e.g. LIST_SPRINT)')
+    await api('POST', `/list/${resolveId('LIST', list)}/task/${taskId}`)
+    out({ task: taskId, added_to: resolveId('LIST', list), ok: true })
+  },
+
+  // Convenience: add a task straight into TODAY's sprint. The sprint list is RESOLVED
+  // DYNAMICALLY by date every call (never a stored id — sprint ids rotate daily): the
+  // active sprint whose [start,due] range contains now, and if ranges overlap the one with
+  // the LATEST start wins. Sprints are 1-DAY: this also sets the task's due date to end-of-TODAY.
+  async sprint([taskId]) {
+    if (!taskId) die("usage: sprint <taskId>  (adds to TODAY's sprint, due = today)")
+    const s = await resolveTodaySprint()
+    await api('POST', `/list/${s.id}/task/${taskId}`)
+    const n = new Date()
+    const eod = new Date(n.getFullYear(), n.getMonth(), n.getDate(), 23, 59, 0, 0).getTime()
+    await api('PUT', `/task/${taskId}`, { due_date: eod, due_date_time: true })
+    out({ task: taskId, added_to_sprint: s.id, sprint_name: s.name, due_date: eod, ok: true })
+  },
+
+  // Set a custom field BY NAME: read the task's field defs, resolve dropdown labels to
+  // option IDs, then write. Handles Dificuldade / Fase do Épico / Escopo / Prioridade.
+  async ['set-field']([taskId, name, ...valParts]) {
+    const value = valParts.join(' ')
+    if (!taskId || !name || !value) die('usage: set-field <taskId> <fieldName> <value>')
+    const t = await api('GET', `/task/${taskId}`)
+    const f = (t.custom_fields || []).find((x) => (x.name || '').toLowerCase() === name.toLowerCase())
+    if (!f) {
+      die(`No custom field "${name}" on ${taskId}. Available: ${(t.custom_fields || []).map((x) => x.name).join(', ')}`)
+    }
+    await api('POST', `/task/${taskId}/field/${f.id}`, { value: toFieldValue(f, value) })
+    out({ task: taskId, field: f.name, value, ok: true })
+  },
+
+  // Anti-duplication search: match keyword in name + description across lists (defaults
+  // to LIST_TASKS + LIST_EPICS). Server fetches pages; only matches land in context.
+  async search([...argv]) {
+    const flags = argv.filter((a) => a.startsWith('--'))
+    const terms = argv.filter((a) => !a.startsWith('--'))
+    const needle = terms.join(' ').toLowerCase()
+    if (!needle) die('usage: search <keyword> [--list=<id> ...] [--closed]')
+    let listIds = flags.filter((f) => f.startsWith('--list=')).map((f) => resolveId('LIST', f.slice(7)))
+    if (!listIds.length) listIds = ['LIST_TASKS', 'LIST_EPICS'].map((k) => process.env[k]).filter(Boolean)
+    if (!listIds.length) die('No lists to search. Pass --list=<id> (repeatable) or set LIST_TASKS/LIST_EPICS in .env.')
+    const closed = flags.includes('--closed')
+    const MAX_PAGES = 10
+    let matches = 0
+    for (const listId of listIds) {
+      let page = 0
+      for (; page < MAX_PAGES; page++) {
+        const params = new URLSearchParams({ page: String(page), subtasks: 'true' })
+        if (closed) params.set('include_closed', 'true')
+        const { tasks } = await api('GET', `/list/${listId}/task?${params}`)
+        if (!tasks || !tasks.length) break
+        for (const t of tasks) {
+          const hay = `${t.name || ''}\n${t.description || t.text_content || ''}`.toLowerCase()
+          if (hay.includes(needle)) {
+            out({ id: t.id, name: t.name, status: t.status?.status, list: t.list?.name || listId, url: t.url })
+            matches++
+          }
+        }
+        if (tasks.length < 100) break
+      }
+      if (page === MAX_PAGES) console.error(`(list ${listId} search capped at ${MAX_PAGES} pages — results may be incomplete)`)
+    }
+    if (!matches) console.error(`(no tasks match "${terms.join(' ')}" in ${listIds.length} list(s))`)
+  },
+
+  // --- Hierarquia (workspace -> space -> folder -> list) ----------------------
+  // A CLI só sabia descer de folder para baixo; sem isto, localizar uma lista por
+  // NOME exigia o MCP get_workspace_hierarchy (~700 tokens). Estes três descem a
+  // árvore inteira, uma linha por nó.
+  async spaces() {
+    const teamId = await getTeamId()
+    const { spaces } = await api('GET', `/team/${teamId}/space?archived=false`)
+    for (const s of spaces || []) out({ id: s.id, name: s.name })
+  },
+
+  async folders([space]) {
+    if (!space) die('usage: folders <spaceId|alias>')
+    const { folders } = await api('GET', `/space/${resolveId('SPACE', space)}/folder?archived=false`)
+    for (const f of folders || []) {
+      out({ id: f.id, name: f.name, lists: (f.lists || []).map((l) => ({ id: l.id, name: l.name })) })
+    }
+  },
+
+  // Listas soltas no space (fora de qualquer folder) — na UI aparecem no mesmo nível
+  // dos folders, e `folders` sozinho não as mostra.
+  async ['space-lists']([space]) {
+    if (!space) die('usage: space-lists <spaceId|alias>')
+    const { lists } = await api('GET', `/space/${resolveId('SPACE', space)}/list?archived=false`)
+    for (const l of lists || []) out({ id: l.id, name: l.name })
+  },
+
+  // Localiza uma lista pelo NOME em todo o workspace (case-insensitive, substring).
+  // Evita o "qual é o id daquela lista?" que hoje custa uma varredura manual.
+  async ['find-list']([...argv]) {
+    const needle = argv.join(' ').toLowerCase()
+    if (!needle) die('usage: find-list <trecho do nome>')
+    const teamId = await getTeamId()
+    const { spaces } = await api('GET', `/team/${teamId}/space?archived=false`)
+    let hits = 0
+    for (const sp of spaces || []) {
+      const { folders } = await api('GET', `/space/${sp.id}/folder?archived=false`)
+      for (const f of folders || []) {
+        for (const l of f.lists || []) {
+          if ((l.name || '').toLowerCase().includes(needle)) {
+            out({ id: l.id, name: l.name, folder: f.name, space: sp.name })
+            hits++
+          }
+        }
+      }
+      const { lists } = await api('GET', `/space/${sp.id}/list?archived=false`)
+      for (const l of lists || []) {
+        if ((l.name || '').toLowerCase().includes(needle)) {
+          out({ id: l.id, name: l.name, folder: null, space: sp.name })
+          hits++
+        }
+      }
+    }
+    if (!hits) console.error(`(nenhuma lista com "${argv.join(' ')}")`)
+  },
+
+  // --- Descrição -------------------------------------------------------------
+  // A descrição completa (a spec). `tasks --desc` trunca em 100 chars e `get` nem a
+  // devolve; para auditar spec vs. card é preciso o texto inteiro.
+  async desc([taskId, ...flags]) {
+    if (!taskId) die('usage: desc <taskId> [--max=N]')
+    // include_markdown_description is opt-in: without it ClickUp omits the field and
+    // this fell back to `description`, the flattened plain text — headings, bullets and
+    // tables all silently gone, which makes a markdown round-trip look like it failed.
+    const t = await api('GET', `/task/${taskId}?include_markdown_description=true`)
+    const max = Number(flagVal(flags, 'max') || 0)
+    const body = t.markdown_description || t.description || t.text_content || ''
+    console.log(`# ${t.name}  [${t.status?.status}]  ${t.id}`)
+    console.log(max > 0 ? body.slice(0, max) : body)
+  },
+
+  // --- Dependências ----------------------------------------------------------
+  // O bloqueio real do ClickUp (waiting on / blocking), que é coisa DIFERENTE do
+  // `relate` (task link, sem semântica de ordem). Sem isto não dá para responder
+  // "as dependências entre as tarefas estão claras?".
+  //   dependencies[]: { task_id, depends_on, type }  — type 1 = waiting_on, 0 = blocking
+  async deps([taskId]) {
+    if (!taskId) die('usage: deps <taskId>')
+    const t = await api('GET', `/task/${taskId}`)
+    const waiting = [] // esta task espera por...
+    const blocking = [] // esta task bloqueia...
+    for (const d of t.dependencies || []) {
+      if (d.task_id === t.id) waiting.push(d.depends_on)
+      else blocking.push(d.task_id)
+    }
+    out({
+      id: t.id,
+      name: t.name,
+      status: t.status?.status,
+      waiting_on: waiting,
+      blocking,
+      linked: (t.linked_tasks || [])
+        .map((l) => (l.task_id === t.id ? l.link_id : l.task_id))
+        .filter(Boolean),
+      subtasks: (t.subtasks || []).map((s) => s.id),
+      parent: t.parent || null,
+    })
+  },
+
+  // Cria a dependência de bloqueio. --blocks inverte o sentido.
+  //   dep A B          -> A espera por B (A waiting on B / B bloqueia A)
+  //   dep A B --blocks -> A bloqueia B
+  async dep([taskId, other, ...flags]) {
+    if (!taskId || !other) die('usage: dep <taskId> <otherTaskId> [--blocks]   (padrão: taskId espera por otherTaskId)')
+    const key = flag(flags, 'blocks') ? 'dependency_of' : 'depends_on'
+    await api('POST', `/task/${taskId}/dependency`, { [key]: other })
+    out({ task: taskId, [key]: other, ok: true })
+  },
+
+  async ['undep']([taskId, other, ...flags]) {
+    if (!taskId || !other) die('usage: undep <taskId> <otherTaskId> [--blocks]')
+    const key = flag(flags, 'blocks') ? 'dependency_of' : 'depends_on'
+    await api('DELETE', `/task/${taskId}/dependency?${key}=${other}`)
+    out({ task: taskId, removed: other, ok: true })
+  },
+
+  // --- Auditoria de lista -----------------------------------------------------
+  // UMA chamada devolve o mapa inteiro da lista: status, dependências, links,
+  // subtasks, tamanho da descrição e campos-chave. É o comando de "a lista está
+  // coerente e as dependências estão claras?" — sem ele são N+1 requisições.
+  async board([list, ...flags]) {
+    if (!list) die('usage: board <listId|alias> [--closed] [--fields]')
+    const params = new URLSearchParams({ subtasks: 'true', include_markdown_description: 'true' })
+    if (flag(flags, 'closed')) params.set('include_closed', 'true')
+    const listId = resolveId('LIST', list)
+    const all = []
+    for (let page = 0; page < 10; page++) {
+      params.set('page', String(page))
+      const { tasks } = await api('GET', `/list/${listId}/task?${params}`)
+      if (!tasks || !tasks.length) break
+      all.push(...tasks)
+      if (tasks.length < 100) break
+    }
+    for (const t of all) {
+      const waiting = []
+      const blocking = []
+      for (const d of t.dependencies || []) {
+        if (d.task_id === t.id) waiting.push(d.depends_on)
+        else blocking.push(d.task_id)
+      }
+      const body = t.markdown_description || t.description || t.text_content || ''
+      const row = {
+        id: t.id,
+        name: t.name,
+        status: t.status?.status,
+        parent: t.parent || null,
+        desc_len: body.length,
+        waiting_on: waiting,
+        blocking,
+        linked: (t.linked_tasks || []).map((l) => (l.task_id === t.id ? l.link_id : l.task_id)).filter(Boolean),
+        subtasks: (t.subtasks || []).length,
+        priority: t.priority?.priority || null,
+        assignees: (t.assignees || []).map((a) => a.username || a.id),
+      }
+      if (flag(flags, 'fields')) {
+        const m = {}
+        for (const f of t.custom_fields || []) {
+          const v = formatField(f)
+          if (v !== null) m[f.name] = v
+        }
+        row.fields = m
+      }
+      out(row)
+    }
+    console.error(`(${all.length} tasks em ${listId})`)
+  },
+
+  // List the workspace's custom task types, so you can find the id for create-task --type.
+  async types() {
+    const teamId = await getTeamId()
+    const { custom_items } = await api('GET', `/team/${teamId}/custom_item`)
+    for (const it of custom_items || []) out({ id: it.id, name: it.name })
+  },
+}
+
+const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
+  node .claude/skills/clickup-api/clickup.mjs <command> ...
+
+ read
+  lists       <folderId|alias>                          lists in a folder       -> NDJSON {id,name}
+  tasks       <listId|alias> [--closed --desc --page=N] open tasks in a list    -> NDJSON {id,name,status,url}
+  search      <keyword> [--list=<id> ...] [--closed]    name+desc match (anti-dup) -> NDJSON matches
+  get         <taskId>                                  status/tags/links by id -> {id,name,status,url,tags,linked}
+  fields      <taskId>                                  all custom fields        -> {name:value}
+  field       <taskId> <fieldName>                      one custom field value   -> plain string
+  branch      <taskId>                                  the task's "branch" field value
+  types                                                 workspace task types     -> NDJSON {id,name}
+  desc        <taskId> [--max=N]                        descricao COMPLETA (a spec) -> markdown
+  spaces                                                spaces do workspace      -> NDJSON {id,name}
+  folders     <spaceId|alias>                           folders + suas listas    -> NDJSON {id,name,lists[]}
+  space-lists <spaceId|alias>                           listas soltas do space   -> NDJSON {id,name}
+  find-list   <trecho do nome>                          acha uma lista por nome  -> NDJSON {id,name,folder,space}
+  deps        <taskId>                                  dependencias de 1 task   -> {waiting_on,blocking,linked,subtasks,parent}
+  board       <listId|alias> [--closed] [--fields]      MAPA da lista inteira    -> NDJSON {id,name,status,parent,desc_len,waiting_on,blocking,linked,subtasks,...}
+ write
+  create-task <listId|alias> <name> [desc] [--tag=N --type=N|id --status=S] [--assignee=userId|--no-assign]
+                                                        create a task (auto-assigned to the API-key owner) -> {id,url,assignees}
+  set-status  <taskId> <status>                         change a task's status  -> {id,status,url}
+  set-desc    <taskId> <arquivo.md|-> [--dry]           substitui a descricao (markdown; - = stdin) -> {id,url,chars}
+  set-field   <taskId> <fieldName> <value>             set a custom field by name -> {ok}
+  tag         <taskId> <tagName>                        add a tag (e.g. backend) -> {ok}
+  untag       <taskId> <tagName>                        remove a tag             -> {ok}
+  relate      <taskId> <otherTaskId>                    epic<->task relation     -> {ok}
+  comment     <taskId> <text>                           add a comment            -> {comment_id}
+  dep         <taskId> <otherId> [--blocks]             cria bloqueio (padrao: taskId espera por otherId) -> {ok}
+  undep       <taskId> <otherId> [--blocks]             remove o bloqueio        -> {ok}
+ sprints
+  sprints                                               list sprint lists (FOLDER_SPRINTS) -> NDJSON {id,name,start,due}
+  sprint      <taskId>                                  add a task to the CURRENT sprint (LIST_SPRINT) -> {ok}
+  add-to-list <taskId> <listId|alias>                   add a task to any list (multi-list) -> {ok}
+
+IDs may be raw ClickUp IDs or .env aliases (LIST_<NAME>, FOLDER_<NAME>).
+Sprint aliases: LIST_SPRINT (current sprint list), FOLDER_SPRINTS (the Sprints folder).
+Create a sprint task = create-task TASKS "<title>" ... then  sprint <newId>  (adds to current sprint).
+NOTE: tasks TASKS shows the Tasks list; sprint membership is multi-list — read a task's .locations, or use tasks LIST_SPRINT for home-listed sprint tasks.`
+
+const [cmd, ...rest] = process.argv.slice(2)
+const run = commands[cmd]
+if (!run) die(usage)
+run(rest).catch((e) => die(`error: ${e.message}`))

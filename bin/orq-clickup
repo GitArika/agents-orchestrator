@@ -721,6 +721,9 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   node .claude/skills/clickup-api/clickup.mjs <command> ...
 
  read
+  whoami      [--json]                                  de quem é a autoria     <- ANTES de escrever
+  list        <listId|alias> [--json]                   a lista e seus status
+  status-provisionar <listId> [--aplicar]               cria os 10 status da esteira (simula por padrão)
   lists       <folderId|alias>                          lists in a folder       -> NDJSON {id,name}
   tasks       <listId|alias> [--closed --desc --page=N] open tasks in a list    -> NDJSON {id,name,status,url}
   search      <keyword> [--list=<id> ...] [--closed]    name+desc match (anti-dup) -> NDJSON matches

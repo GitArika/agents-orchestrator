@@ -1,0 +1,157 @@
+# Esteira de __NOME__ — fonte de verdade do GRAFO: dependências, portões e
+# política de sessão. O ClickUp continua sendo a fonte de verdade do STATUS e do
+# CONTEÚDO de cada unidade. O que está vivo agora é derivado dos processos, e
+# nunca gravado aqui.
+#
+#   orq doctor → pré-voo   orq board → quadro   orq next → fila   orq dispatch -n N
+#
+# Este arquivo mora no repositório do PROJETO e é revisado como código: quem lê a
+# revisão precisa ver por que cada dependência existe.
+
+[pipeline]
+name            = "__NOME__"
+list_id         = "__LIST_ID__"
+repo            = "__REPO__"
+work_dir        = "__WORK_DIR__"
+base_branch     = "__BASE_BRANCH__"
+branch_template = "CU-{id}-{slug}"
+slug_max        = 28
+# FORA do repositório, de propósito. Worktrees dentro dele fazem o `git status`
+# do repositório pai listar milhares de arquivos não rastreados, e a partir daí
+# ninguém mais enxerga o que mudou de verdade.
+worktree_root   = "__WORKTREE_ROOT__"
+
+# O que "depender de outra unidade" significa aqui.
+#
+# A regra genérica da ferramenta é "para entrar no estágio S, a dependência já
+# passou do fim de S". Isso serve para dependência de DECISÃO. Para dependência
+# de CÓDIGO não basta: a worktree nasce do branch de publicação, e enquanto a
+# dependência não estiver INTEGRADA o código dela simplesmente não existe na
+# base da worktree.
+#
+# Em 01/09/2026 uma unidade foi despachada quando a dependência chegou em
+# "aguardando revisão", encontrou a base sem nada do que precisava, e teve de ser
+# bloqueada: uma sessão gasta, nada produzido.
+#
+# `from = "implement"` preserva o paralelismo — a ESPECIFICAÇÃO de B continua
+# correndo enquanto A é implementada. Só o trabalho de código espera a integração.
+[pipeline.dependency]
+after = "integrate"
+from  = "implement"
+
+[clickup]
+# O token é PESSOAL: tudo que a esteira escrever aparece como escrito por você.
+# Ele vive fora de qualquer repositório, com permissão 600.
+token_file = "~/.config/orquestrador/credenciais.env"
+token_key  = "CLICKUP_API_KEY"
+
+# ── Os estágios ──────────────────────────────────────────────────────────────
+# Cada estágio tem uma fila (de onde se pega), um status de trabalho (marcado ao
+# lançar) e um de conclusão (marcado ao terminar). A conclusão de um É a fila do
+# seguinte: é isso que faz a esteira andar sem ninguém empurrando.
+
+[[stage]]
+key     = "spec"
+label   = "Especificação"
+queue   = "backlog"
+working = "especificando"
+done    = "spec pronta"
+
+[[stage]]
+key     = "implement"
+label   = "Implementação"
+queue   = "spec pronta"
+working = "em progresso"
+done    = "aguardando revisão"
+
+[[stage]]
+key     = "review"
+label   = "Revisão"
+queue   = "aguardando revisão"
+working = "revisando"
+done    = "aguardando integração"
+
+[[stage]]
+key     = "integrate"
+label   = "Integração"
+queue   = "aguardando integração"
+working = "integrando"
+done    = "pronto"
+
+[session]
+permission_mode    = "auto"
+# Toda sessão sobe com acompanhamento remoto ligado e nomeada
+# <esteira>-<unidade>-<estágio>. Não é conveniência: é como uma pessoa vê e
+# interrompe, de outro dispositivo, uma sessão que está agindo sozinha.
+remote_control     = true
+# true = a última sessão fecha a tarefa, como especificado.
+# false = o último estágio para e o fechamento é seu.
+auto_close         = true
+model              = ""
+max_concurrent     = 4
+reserve_ram_gb     = 3.0          # o que fica para o sistema e para os seus apps
+ram_per_session_gb = 1.2          # usado quando o estágio não tem orçamento próprio
+
+# Status para onde a unidade vai quando trava esperando uma pessoa. Vazio desliga
+# o comportamento e a unidade fica onde estava — só faça isso se a sua lista não
+# puder ganhar o status, porque a partir daí o quadro passa a mentir: quem abre o
+# ClickUp vê "revisando" e conclui que alguém está revisando.
+status_parado      = "parado"
+
+# Orçamento de memória por estágio. CORRIJA POR MEDIDA, não por palpite:
+# `orq capacity` mostra o RSS real das sessões vivas. Um orçamento inventado sete
+# vezes acima do real já serializou uma esteira inteira — a máquina admitia uma
+# sessão por vez e o teto configurado nunca era alcançado.
+#
+# Não desça até o RSS medido: ele é só o processo do agente. Uma sessão de
+# implementação também dispara instalação de dependências, verificação de tipos e
+# testes, que sobem bem acima disso em rajada. Medida do agente + folga.
+[session.ram_per_stage_gb]
+spec      = 0.6
+implement = 1.5
+review    = 1.2
+integrate = 1.5
+
+# ── Laço autônomo ────────────────────────────────────────────────────────────
+[loop]
+interval_seconds    = 90   # cada ciclo reconsulta o ClickUp e recalcula bloqueios
+max_strikes         = 2    # arranques falhos seguidos antes da quarentena
+max_rework          = 2    # reprovações antes da quarentena: a 3ª volta significa
+                           # que o defeito está na spec, e isso é decisão humana
+idle_ticks_to_stop  = 20   # sem mudança por tempo demais = provável espera humana
+skip_modes          = []   # ex.: ["hands-on"] para o laço não disparar essas
+# Estágios que nunca rodam em paralelo consigo mesmos. A integração escreve no
+# branch de publicação; duas ao mesmo tempo correriam uma contra a outra.
+serial_stages       = ["integrate"]
+
+[gates]
+# Preparo da worktree: ela nasce sem dependências instaladas e sem os arquivos de
+# ambiente ignorados pelo git. Sem isto os portões falham por motivo errado, e o
+# time conclui que a ferramenta não presta.
+setup = __SETUP__
+
+# O que precisa passar antes de concluir. Estes comandos saem do que o projeto JÁ
+# declara — portão inventado falha por motivo errado.
+verify = __VERIFY__
+
+# Encerramento: roda quando a sessão termina, de qualquer maneira que termine —
+# concluindo, reprovando, travando, sendo parada de fora, ou morrendo. Não é boa
+# vontade da sessão: a sessão pode morrer.
+#
+# Em 01/09/2026, sem isto, 27 ambientes de teste sobreviveram à noite numa VPS
+# segurando 8,8 GB, com o swap da fatia 100% cheio e mais de um milhão de freadas
+# por memória — e o medidor da máquina mostrava 16 GB livres.
+#
+# Se a sua esteira sobe QUALQUER serviço para trabalhar, este bloco é obrigatório.
+teardown = []
+
+# ── As unidades ──────────────────────────────────────────────────────────────
+# Tarefa que existe no ClickUp e não está aqui aparece marcada no quadro como
+# deriva, e NUNCA é executada. A esteira só faz o que foi declarado.
+#
+# [[task]]
+# id         = "868xxxxxx"   # id da tarefa no ClickUp
+# key        = "FE-01"       # como você a chama; aparece no branch e no quadro
+# title      = "Uma frase em português comum, a mesma do cartão"
+# depends_on = []            # chaves de outras unidades: ["FE-01", "DS-02"]
+# mode       = "autonomous"  # ou "hands-on", para o laço não despachar sozinho

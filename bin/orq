@@ -2132,6 +2132,112 @@ def _prova_tmux():
     return "sessão aberta e encerrada"
 
 
+def descobrir_projeto(raiz: Path) -> dict:
+    """Lê o repositório antes de perguntar qualquer coisa.
+
+    O que for descoberto entra como proposta, nunca como decisão silenciosa: quem
+    revisa este arquivo precisa ver de onde veio cada linha. E portão inventado é
+    pior que portão ausente — ele falha por motivo errado na primeira sessão, e o
+    time conclui que a ferramenta não presta.
+    """
+    d = {"repo": str(raiz), "base_branch": "main", "work_dir": ".",
+         "gerenciador": "", "setup": [], "verify": [], "achados": []}
+
+    r = subprocess.run(["git", "-C", str(raiz), "symbolic-ref", "--short", "HEAD"],
+                       capture_output=True, text=True)
+    if r.stdout.strip():
+        d["base_branch"] = r.stdout.strip()
+        d["achados"].append(f"branch atual do repositório → base_branch")
+
+    # Onde está o package.json mais raso: é o diretório de trabalho provável.
+    if (raiz / "package.json").exists():
+        d["work_dir"] = "."
+    else:
+        for cand in sorted(x for x in raiz.iterdir() if x.is_dir() and not x.name.startswith(".")):
+            if (cand / "package.json").exists():
+                d["work_dir"] = cand.name
+                d["achados"].append(f"package.json em {cand.name}/ → work_dir")
+                break
+
+    for arquivo, ger, cmd in (("pnpm-lock.yaml", "pnpm", "pnpm install --frozen-lockfile"),
+                              ("yarn.lock", "yarn", "yarn install --frozen-lockfile"),
+                              ("package-lock.json", "npm", "npm ci"),
+                              ("pyproject.toml", "python", "python3 -m pip install -e .")):
+        if (raiz / arquivo).exists():
+            d["gerenciador"] = ger
+            d["setup"] = [cmd]
+            d["achados"].append(f"{arquivo} → gerenciador {ger}, preparo com instalação congelada")
+            break
+
+    pkg = raiz / d["work_dir"] / "package.json"
+    if pkg.exists():
+        try:
+            scripts = json.loads(pkg.read_text()).get("scripts", {})
+        except Exception:
+            scripts = {}
+        g = d["gerenciador"] or "npm"
+        for nome in ("typecheck", "lint", "test", "build"):
+            if nome in scripts:
+                d["verify"].append(f"{g} run {nome}")
+        if d["verify"]:
+            d["achados"].append(f"scripts declarados → portões: {', '.join(d['verify'])}")
+    return d
+
+
+def cmd_init(cfg, args):
+    """Cria o .orchestrator/pipeline.toml deste projeto, a partir do que ele é."""
+    raiz = Path(args.repo or os.getcwd()).expanduser().resolve()
+    if not (raiz / ".git").exists():
+        die(f"{raiz} não é a raiz de um repositório git.")
+    destino = raiz / ".orchestrator" / "pipeline.toml"
+    if destino.exists() and not args.forcar:
+        die(f"já existe: {destino}\n  Use --forcar para sobrescrever (e revise o diff).")
+
+    d = descobrir_projeto(raiz)
+    print(f"\n{C['b']}O que eu encontrei neste repositório{C['r']}")
+    for a in d["achados"]:
+        print(f"  · {a}")
+    if not d["verify"]:
+        print(f"  {C['yel']}· nenhum script de verificação declarado — a esteira vai "
+              f"nascer SEM portão de qualidade.{C['r']}")
+        print(f"    Não invento comando: acrescente 'verify' à mão depois, com o "
+              f"que o projeto realmente roda.")
+
+    wt = raiz.parent / f"{raiz.name}-worktrees"
+    lista = args.lista or "COLOQUE-O-ID-DA-LISTA"
+    print(f"\n{C['b']}O que eu vou escrever{C['r']}")
+    print(f"  arquivo         {destino}")
+    print(f"  esteira         {raiz.name}")
+    print(f"  lista ClickUp   {lista}")
+    print(f"  diretório       {d['work_dir']}")
+    print(f"  branch base     {d['base_branch']}")
+    print(f"  cópias em       {wt}   {C['d']}(fora do repositório, de propósito){C['r']}")
+    print(f"  preparo         {d['setup'] or '(nenhum)'}")
+    print(f"  portões         {d['verify'] or '(nenhum)'}")
+
+    if args.simular:
+        print(f"\n{C['d']}simulação — nada foi escrito. Sem --simular, escreve.{C['r']}")
+        return
+
+    modelo = (MODELOS / "pipeline.toml").read_text()
+    for marca, valor in (("__NOME__", raiz.name), ("__LIST_ID__", lista),
+                         ("__REPO__", str(raiz)), ("__WORK_DIR__", d["work_dir"]),
+                         ("__BASE_BRANCH__", d["base_branch"]),
+                         ("__WORKTREE_ROOT__", str(wt)),
+                         ("__SETUP__", json.dumps(d["setup"], ensure_ascii=False)),
+                         ("__VERIFY__", json.dumps(d["verify"], ensure_ascii=False))):
+        modelo = modelo.replace(marca, valor)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(modelo)
+
+    print(f"\n{C['grn']}✓{C['r']} escrito: {destino}")
+    print("\nAgora, nesta ordem:")
+    print(f"  1. Leia o arquivo inteiro. Os comentários explicam cada escolha.")
+    print(f"  2. Crie os status na sua lista:  orq-clickup status-provisionar {lista}")
+    print(f"  3. Declare as unidades no fim do arquivo (os blocos [[task]]).")
+    print(f"  4. Prove que está de pé:  orq doctor")
+
+
 def cmd_doctor(cfg, args):
     ok = True
     def chk(label, good, detail="", fatal=True):
@@ -2284,6 +2390,12 @@ def main():
         s.set_defaults(fn=fn, sem_config=sem_config)
         return s
 
+    s = add("init", cmd_init, "cria o pipeline.toml deste projeto, a partir do que ele é",
+            sem_config=True)
+    s.add_argument("--repo", help="raiz do repositório (padrão: o diretório atual)")
+    s.add_argument("--lista", help="id da lista no ClickUp")
+    s.add_argument("--simular", action="store_true", help="mostra e não escreve")
+    s.add_argument("--forcar", action="store_true", help="sobrescreve um já existente")
     s = add("doctor", cmd_doctor, "pré-voo: prova cada dependência por chamada real")
     s.add_argument("--rapido", action="store_true",
                    help="pula a chamada ao agente (a mais demorada). NÃO é prova: "

@@ -186,6 +186,9 @@ class Config:
     def gates(self): return self.raw.get("gates", {}).get("verify", [])
 
     @property
+    def teardown(self): return self.raw.get("gates", {}).get("teardown", [])
+
+    @property
     def setup(self): return self.raw.get("gates", {}).get("setup", [])
 
     @property
@@ -962,6 +965,45 @@ def archive_dir(cfg: Config) -> Path:
     return STATE / "archive" / slugify(cfg.name, 24)
 
 
+def anotar_evento(cfg: Config, u: Unit, tipo: str, texto: str) -> None:
+    """Acrescenta uma linha ao rastro da unidade.
+
+    Nada aqui é fonte de verdade — é o que permite reconstruir depois o que
+    aconteceu. O nome do arquivo segue o padrão que `finalize` já arquiva.
+    """
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / f"{u.key}-orq.events").open("a") as f:
+        f.write(f"{time.strftime('%FT%TZ', time.gmtime())}\t{tipo}\t{texto}\n")
+
+
+def rodar_teardown(cfg: Config, worktree: Path) -> list:
+    """Roda o encerramento declarado, na worktree, aconteça o que acontecer.
+
+    Encerramento não pode depender da boa vontade da sessão: a sessão pode
+    morrer. Em 01/09/2026, sem isto, 27 ambientes de teste sobreviveram à noite
+    numa VPS segurando 8,8 GB, com o swap da fatia 100% cheio e mais de um milhão
+    de freadas por memória — porque nada, em lugar nenhum, tinha a obrigação de
+    derrubá-los.
+
+    Falha de encerramento NÃO impede a transição: a unidade precisa andar. Mas
+    fica registrada, e o `sweep` a cobra. O pior desfecho é o silêncio.
+    """
+    if not cfg.teardown:
+        return []
+    if not worktree.exists():
+        return []
+    falhas = []
+    for cmd in cfg.teardown:
+        try:
+            r = subprocess.run(cmd, shell=True, cwd=str(worktree),
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                falhas.append(f"{cmd} → {((r.stderr or r.stdout) or '').strip()[:160]}")
+        except Exception as e:
+            falhas.append(f"{cmd} → {str(e)[:160]}")
+    return falhas
+
+
 def finalize(cfg: Config, u: Unit, stage: Stage | None, outcome: str,
              kill_delay: int = 3) -> Path | None:
     """Encerra a sessão da unidade e guarda os artefatos.
@@ -970,6 +1012,16 @@ def finalize(cfg: Config, u: Unit, stage: Stage | None, outcome: str,
     chamado de DENTRO da própria sessão, e matá-la na hora mataria o processo
     que está executando o comando antes de ele terminar.
     """
+    # O encerramento roda AQUI porque este é o ponto por onde passam todos os
+    # caminhos de saída — concluir, reprovar, travar, parar, varrer, e os do laço
+    # autônomo. Espalhar a chamada por cada comando deixaria buracos, e um buraco
+    # é uma máquina cheia de processo abandonado.
+    falhas_td = rodar_teardown(cfg, cfg.worktree_root / cfg.branch_for(u))
+    if falhas_td:
+        anotar_evento(cfg, u, "teardown-falhou", " | ".join(falhas_td))
+        print(f"{C['yel']}!{C['r']} o encerramento do ambiente falhou; "
+              f"'orq sweep' vai cobrar:\n  " + "\n  ".join(falhas_td))
+
     ts = time.strftime("%Y%m%d-%H%M%S")
     stg = stage.key if stage else "sem-estagio"
     dest = archive_dir(cfg) / f"{u.key}-{stg}-{ts}"
@@ -1505,10 +1557,35 @@ def cmd_sweep(cfg, args):
             swept.append((r.unit.key, r.state, dest))
     if not swept:
         print("nada a arquivar.")
-        return
-    for k, st, d in swept:
-        print(f"{C['grn']}✓{C['r']} {k:<8} ({st}) → {d.name}")
-    print(f"{C['d']}{len(swept)} arquivada(s) em {archive_dir(cfg)}{C['r']}")
+    else:
+        for k, st, d in swept:
+            print(f"{C['grn']}✓{C['r']} {k:<8} ({st}) → {d.name}")
+        print(f"{C['d']}{len(swept)} arquivada(s) em {archive_dir(cfg)}{C['r']}")
+
+    # Cobrança do encerramento. Uma worktree que sobreviveu ao arquivamento com
+    # ambiente de pé é memória presa que ninguém vai procurar: em 01/09/2026
+    # foram 27 delas, 8,8 GB, uma noite inteira.
+    if cfg.teardown:
+        pendentes = []
+        for f in sorted(STATE.glob("*-orq.events")):
+            for linha in f.read_text().splitlines():
+                if "teardown-falhou" in linha:
+                    pendentes.append(f"{f.name.split('-orq.events')[0]}: "
+                                     f"{linha.split(chr(9))[-1][:120]}")
+        if pendentes:
+            print(f"\n{C['yel']}O encerramento do ambiente falhou nestas:{C['r']}")
+            for p_ in pendentes:
+                print(f"  • {p_}")
+            print(f"{C['d']}  Rode o encerramento à mão na worktree, ou "
+                  f"'orq sweep --forcar' para tentar de novo.{C['r']}")
+        elif swept:
+            print(f"{C['d']}encerramento do ambiente: sem pendência.{C['r']}")
+
+    if getattr(args, "forcar", False):
+        for r in rows:
+            falhas = rodar_teardown(cfg, cfg.worktree_root / cfg.branch_for(r.unit))
+            if not falhas:
+                (STATE / f"{r.unit.key}-orq.events").unlink(missing_ok=True)
 
 
 def cmd_reset(cfg, args):
@@ -2237,6 +2314,8 @@ def main():
     s = add("sweep", cmd_sweep, "arquiva os artefatos de sessões que já terminaram")
     s.add_argument("--stalled", action="store_true",
                    help="arquiva também as travadas (perde o rastro para diagnóstico)")
+    s.add_argument("--forcar", action="store_true",
+                   help="tenta rodar de novo o encerramento que falhou")
     s = add("archive", cmd_archive, "arquiva a sessão de uma unidade agora")
     s.add_argument("unit")
     s = add("reset", cmd_reset, "devolve a unidade à fila do estágio (desfaz um arranque falho)")

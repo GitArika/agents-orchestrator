@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -858,8 +859,35 @@ def build_brief(cfg: Config, u: Unit, stage: Stage, worktree: Path, branch: str)
     return BRIEFS[stage.key].format(**ctx) + COMMON.format(**ctx)
 
 
-def settings_json(label: str) -> str:
+CERCA = ORQ_REPO / "hooks" / "cerca.sh"
+
+
+def cerca_impressao() -> str:
+    """Impressão do arquivo da cerca, para o diagnóstico notar adulteração."""
+    return hashlib.sha256(CERCA.read_bytes()).hexdigest()[:12]
+
+
+def settings_json(label: str, stage_key: str = "", worktree: str = "") -> str:
+    """As configurações que a sessão recebe: a cerca e os avisos.
+
+    A CERCA É UM GANCHO, não uma lista de negação — e isso foi decidido por
+    experimento, não por gosto. Em 02/09/2026, contra o Claude Code 2.1.252, uma
+    negação `Bash(git push:*)` vinda por --settings NÃO venceu um `allow`
+    idêntico nas configurações da própria pessoa: o comando executou. E regra por
+    prefixo jamais pegaria `cd /outro/lugar && git push`, que é uma linha de
+    shell trivial. O gancho vê o comando inteiro, roda sempre e não é anulável
+    por permissão de ninguém.
+    """
+    if not CERCA.exists():
+        die(f"a cerca sumiu: {CERCA}\n"
+            f"  Nenhuma sessão sobe sem ela. Restaure com:\n"
+            f"    git -C {ORQ_REPO} checkout hooks/cerca.sh")
+    amb = f"ORQ_UNIT={label} ORQ_STAGE={stage_key} ORQ_WORKTREE={worktree}"
     return json.dumps({"hooks": {
+        # A cerca vê TODA ferramenta: o comando de shell e também o caminho de
+        # escrita, porque escrever no arquivo de credencial não passa por shell.
+        "PreToolUse": [{"hooks": [{"type": "command",
+                                   "command": f"{amb} {CERCA}"}]}],
         "Notification": [{"hooks": [{"type": "command",
                                      "command": f"ORQ_UNIT={label} {HOOK} notification"}]}],
         "Stop": [{"hooks": [{"type": "command",
@@ -922,7 +950,7 @@ def launch(cfg: Config, u: Unit, stage: Stage, attach: bool = False) -> str:
     brief = STATE / f"{slugify(cfg.name,16)}-{u.id}-{stage.key}.brief.md"
     brief.write_text(build_brief(cfg, u, stage, wt, branch))
     setts = STATE / f"{slugify(cfg.name,16)}-{u.id}.settings.json"
-    setts.write_text(settings_json(label))
+    setts.write_text(settings_json(label, stage.key, str(wt)))
     logf = log_path(cfg, u.id)
 
     cmd = ["claude", "--permission-mode", str(cfg.sess("permission_mode", "auto")),
@@ -2294,6 +2322,10 @@ def cmd_doctor(cfg, args):
     chk("orq na PATH (as sessões usam)", shutil.which("orq") is not None,
         shutil.which("orq") or "as sessões não conseguirão chamar `orq advance`")
     chk("hook de notificação", HOOK.exists() and os.access(HOOK, os.X_OK), str(HOOK))
+    # Sem cerca, nenhuma sessão sobe. Sessão em modo automático sem cerca é a
+    # decisão mais perigosa que esta ferramenta toma.
+    chk("cerca de permissões", CERCA.exists() and os.access(CERCA, os.X_OK),
+        f"impressão {cerca_impressao()}" if CERCA.exists() else f"SUMIU: {CERCA}")
     chk("repositório", (cfg.repo / ".git").exists(), str(cfg.repo))
     chk("diretório de trabalho", cfg.work_dir.exists(), str(cfg.work_dir))
     r = subprocess.run(["git", "-C", str(cfg.repo), "rev-parse", "--verify", cfg.base_branch],

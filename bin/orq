@@ -1,0 +1,2100 @@
+#!/usr/bin/env python3
+"""orq — orquestrador de esteiras guiadas por ClickUp.
+
+Máquina de estágios: cada unidade atravessa uma cadeia de estágios declarada em
+pipeline.toml. Cada estágio tem uma fila (de onde se pega), um status de trabalho
+(marcado ao lançar) e um status de conclusão (marcado ao terminar).
+
+Divisão de autoridade, de propósito:
+  * ClickUp       -> status e conteúdo de cada unidade (o quadro do time)
+  * pipeline.toml -> a cadeia de estágios e o grafo de dependências (versionado)
+  * processos     -> o que está vivo agora (derivado, nunca gravado como autoridade)
+
+MAPA DO ARQUIVO. Este motor é um arquivo só de propósito: é o que faz a
+instalação ser um symlink e não haver dependência para dar errado na máquina de
+outra pessoa. As seções abaixo são a divisão interna; localize-as por
+`grep -n '^# ---' bin/orq`, que devolve a linha de cada uma.
+
+  modelo          Config, Unit, Stage — leitura e validação do pipeline.toml
+  clickup         chamadas à API: status, comentário, descrição
+  capacidade      quanto a máquina aguenta; host: o que de fato limita
+  sessões         worktree, confiança de pasta, briefing, lançamento, cerca
+  classificação   em que estágio está cada unidade, e o que a bloqueia
+  comandos        um cmd_* por verbo da linha de comando
+  laço autônomo   o ciclo que despacha sozinho, com quarentena e parada
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import unicodedata
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# O repositório resolve os PRÓPRIOS recursos em relação a si mesmo: instalar é um
+# symlink para bin/orq, e `git pull` tem de atualizar hook e modelos junto.
+ORQ_REPO = Path(__file__).resolve().parent.parent
+MODELOS = ORQ_REPO / "modelos"
+HOOK = ORQ_REPO / "hooks" / "notificar.sh"
+
+# O ESTADO fica onde sempre esteve. Mudar este caminho transformaria a adoção nas
+# máquinas que já rodam a versão anterior numa migração, com risco de perder o
+# rastro de uma sessão viva.
+ORQ_HOME = Path.home() / ".claude" / "orchestrator"
+STATE = ORQ_HOME / "state"
+API = "https://api.clickup.com/api/v2"
+
+C = {"r": "\033[0m", "b": "\033[1m", "d": "\033[2m", "red": "\033[31m",
+     "grn": "\033[32m", "yel": "\033[33m", "blu": "\033[34m",
+     "mag": "\033[35m", "cyn": "\033[36m"}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+
+def die(msg: str, code: int = 1):
+    print(f"{C['red']}erro:{C['r']} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def slugify(text: str, maxlen: int = 40) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
+    return re.sub(r"-{2,}", "-", text)[:maxlen].strip("-")
+
+
+def norm(s: str) -> str:
+    """Compara status sem tropeçar em acento, caixa ou espaço extra."""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+# ---------------------------------------------------------------- modelo
+
+@dataclass
+class Stage:
+    key: str
+    label: str
+    queue: str
+    working: str
+    done: str
+    idx: int
+
+
+@dataclass
+class Unit:
+    id: str
+    key: str
+    title: str = ""
+    depends_on: list = field(default_factory=list)
+    # Exigência por ARESTA: {id_da_dependência: (estágio_exigido, a_partir_de)}.
+    #
+    # A regra padrão da esteira é "para entrar no estágio S, a dependência já
+    # passou do FIM de S". Isso vale para dependência de DECISÃO — a spec de B
+    # pode ser escrita assim que a spec de A existe. Mas não vale para
+    # dependência de CÓDIGO: a worktree nasce do branch de publicação, e o
+    # código de A só está lá depois da INTEGRAÇÃO. Foi assim que uma unidade foi
+    # despachada com a dependência apenas revisada, encontrou a base sem nada do
+    # que precisava, e teve de ser bloqueada — sessão gasta, nada produzido.
+    dep_after: dict = field(default_factory=dict)
+    mode: str = "autonomous"
+    order: int = 0
+    status: str = "?"
+    priority: str = ""
+    url: str = ""
+
+
+@dataclass
+class Config:
+    path: Path
+    raw: dict
+
+    @property
+    def name(self): return self.raw["pipeline"]["name"]
+
+    @property
+    def list_id(self): return str(self.raw["pipeline"]["list_id"])
+
+    @property
+    def repo(self): return Path(self.raw["pipeline"]["repo"]).expanduser()
+
+    @property
+    def work_sub(self): return self.raw["pipeline"].get("work_dir", "") or "."
+
+    @property
+    def work_dir(self):
+        sub = self.raw["pipeline"].get("work_dir", "")
+        return self.repo / sub if sub else self.repo
+
+    @property
+    def base_branch(self): return self.raw["pipeline"].get("base_branch", "main")
+
+    @property
+    def worktree_root(self):
+        v = self.raw["pipeline"].get("worktree_root")
+        return Path(v).expanduser() if v else self.repo.parent / f"{self.repo.name}.worktrees"
+
+    @property
+    def slug_max(self): return int(self.raw["pipeline"].get("slug_max", 40))
+
+    def publish_note_for(self, stage_key: str) -> str:
+        """Aviso de publicação por estágio.
+
+        Era um texto só, colado em todo briefing. Quando a integração passou a
+        existir, esse texto — escrito para quem NÃO publica — passou a
+        contradizer o procedimento da única sessão que publica. Um briefing que
+        se contradiz obriga o agente a adivinhar qual metade vale."""
+        v = self.raw["pipeline"].get("publish_note", "")
+        if isinstance(v, dict):
+            return v.get(stage_key, v.get("default", ""))
+        return v
+
+    def browser_note_for(self, stage_key: str) -> str:
+        """O que a sessão pode e não pode provar em navegador.
+
+        Era texto fixo dizendo "não existe navegador — use `orq hold` no que for
+        visual". Isso vale enquanto a esteira não tem arnês de navegador; quando
+        ela passa a ter, o mesmo texto manda a sessão parar em cima de um
+        critério que ela conseguiria provar sozinha. Seis specs desta esteira
+        declararam critérios "improváveis neste repositório" por causa dele.
+        Agora quem declara o que existe é a esteira, em pipeline.toml — texto
+        único ou um por estágio, como o publish_note."""
+        v = self.raw["pipeline"].get("browser_note")
+        if v is None:
+            return SEM_NAVEGADOR
+        if isinstance(v, dict):
+            return v.get(stage_key, v.get("default", SEM_NAVEGADOR))
+        return v
+
+    def branch_for(self, u: Unit) -> str:
+        return self.raw["pipeline"].get("branch_template", "CU-{id}-{slug}").format(
+            id=u.id, key=u.key.lower(), slug=slugify(u.title or u.key, self.slug_max))
+
+    def cu(self, k, d=None): return self.raw.get("clickup", {}).get(k, d)
+
+    def sess(self, k, d=None): return self.raw.get("session", {}).get(k, d)
+
+    @property
+    def gates(self): return self.raw.get("gates", {}).get("verify", [])
+
+    @property
+    def setup(self): return self.raw.get("gates", {}).get("setup", [])
+
+    @property
+    def stages(self) -> list:
+        out = []
+        for i, s in enumerate(self.raw.get("stage", [])):
+            out.append(Stage(key=s["key"], label=s.get("label", s["key"]),
+                             queue=s["queue"], working=s["working"],
+                             done=s["done"], idx=i))
+        if not out:
+            die("pipeline.toml não declara nenhum [[stage]].")
+        return out
+
+    def stage(self, key: str) -> Stage:
+        for s in self.stages:
+            if s.key == key:
+                return s
+        die(f"estágio '{key}' não existe. Disponíveis: "
+            + ", ".join(s.key for s in self.stages))
+
+    @property
+    def auto_close(self) -> bool:
+        return bool(self.raw.get("session", {}).get("auto_close", True))
+
+    @staticmethod
+    def _parse_deps(raw_list):
+        """Aceita as duas formas de aresta, e devolve (ids, exigências).
+
+            depends_on = ["868abc"]                                  # regra padrão
+            depends_on = [{ id = "868abc", after = "integrate" }]    # exige integrada
+            depends_on = [{ id = "868abc", after = "integrate", for = "implement" }]
+
+        `after` diz até onde a dependência precisa ter andado; `for` diz a partir
+        de qual estágio DESTA unidade a exigência passa a valer — sem ele, vale
+        em todos, o que serializa até a especificação sem necessidade.
+        """
+        ids, after = [], {}
+        for x in raw_list or []:
+            if isinstance(x, dict):
+                did = str(x["id"])
+                ids.append(did)
+                if x.get("after"):
+                    after[did] = (str(x["after"]), str(x["for"]) if x.get("for") else None)
+            else:
+                ids.append(str(x))
+        return ids, after
+
+    @property
+    def units(self):
+        # Padrão da esteira para arestas que não dizem nada. Numa esteira de
+        # CÓDIGO o padrão certo não é o da ferramenta: a worktree nasce do branch
+        # de publicação, então a dependência precisa estar INTEGRADA, não apenas
+        # revisada. Declarar isso uma vez aqui evita anotar vinte arestas — e o
+        # `from` preserva o paralelismo que faz a esteira valer a pena: a
+        # especificação de B continua correndo enquanto A é implementada.
+        d = self.raw.get("pipeline", {}).get("dependency", {}) or {}
+        pad_after, pad_from = d.get("after"), d.get("from")
+        out = []
+        for i, t in enumerate(self.raw.get("task", [])):
+            ids, after = self._parse_deps(t.get("depends_on", []))
+            if pad_after:
+                for did in ids:
+                    after.setdefault(did, (str(pad_after),
+                                           str(pad_from) if pad_from else None))
+            out.append(Unit(id=str(t["id"]), key=t.get("key", str(t["id"])),
+                            title=t.get("title", ""),
+                            depends_on=ids, dep_after=after,
+                            mode=t.get("mode", "autonomous"), order=i))
+        return out
+
+    def token(self) -> str:
+        f = Path(self.cu("token_file", "")).expanduser()
+        key = self.cu("token_key", "api_token")
+        if not f.exists():
+            die(f"arquivo de token não encontrado: {f}")
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() in (key, key.upper()):
+                    return v.strip().strip('"').strip("'")
+            elif line.startswith("pk_"):
+                return line
+        die(f"chave '{key}' não encontrada em {f}")
+
+
+LAST_PIPELINE = STATE / "last-pipeline"
+
+
+def find_config(explicit: str | None) -> Config:
+    """Resolve o pipeline. Ordem: argumento → variável → subindo os diretórios →
+    o último usado. A última regra existe porque monitorar a esteira de outra
+    janela é o caso comum, e obrigar a estar dentro do repo transforma
+    `orq status` num comando que às vezes funciona."""
+    p = None
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+    elif os.environ.get("ORQ_PIPELINE"):
+        p = Path(os.environ["ORQ_PIPELINE"]).expanduser().resolve()
+    else:
+        p = next((d / ".orchestrator" / "pipeline.toml"
+                  for d in [Path.cwd(), *Path.cwd().parents]
+                  if (d / ".orchestrator" / "pipeline.toml").exists()), None)
+        if p is None and LAST_PIPELINE.exists():
+            cand = Path(LAST_PIPELINE.read_text().strip())
+            if cand.exists():
+                p = cand
+                print(f"{C['d']}(usando o último pipeline: {p}){C['r']}", file=sys.stderr)
+    if p is None:
+        die("nenhum pipeline encontrado. Rode de dentro do repo, use --pipeline "
+            "ou defina ORQ_PIPELINE.")
+    if not p.exists():
+        die(f"pipeline não encontrado: {p}")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        LAST_PIPELINE.write_text(str(p))
+    except Exception:
+        pass
+    return Config(path=p, raw=tomllib.loads(p.read_text()))
+
+
+# ---------------------------------------------------------------- clickup
+
+def api(cfg: Config, method: str, path: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        f"{API}{path}", method=method,
+        data=json.dumps(body).encode() if body else None,
+        headers={"Authorization": cfg.token(), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        die(f"ClickUp {e.code} em {method} {path}: {e.read().decode()[:300]}")
+    except urllib.error.URLError as e:
+        die(f"rede indisponível ao falar com o ClickUp: {e.reason}")
+
+
+def status_order(cfg: Config) -> dict:
+    """status normalizado -> orderindex. É o que dá ordem à esteira."""
+    d = api(cfg, "GET", f"/list/{cfg.list_id}")
+    return {norm(s["status"]): int(s["orderindex"]) for s in d.get("statuses", [])}
+
+
+def fetch_board(cfg: Config) -> dict:
+    out, page = {}, 0
+    while True:
+        d = api(cfg, "GET", f"/list/{cfg.list_id}/task"
+                            f"?include_closed=true&subtasks=true&page={page}")
+        for t in d.get("tasks", []):
+            out[t["id"]] = {"status": (t.get("status") or {}).get("status", "?"),
+                            "priority": ((t.get("priority") or {}) or {}).get("priority") or "",
+                            "url": t.get("url", ""), "name": t.get("name", "")}
+        if d.get("last_page", True) or not d.get("tasks"):
+            break
+        page += 1
+    return out
+
+
+def set_status(cfg: Config, task_id: str, status: str):
+    api(cfg, "PUT", f"/task/{task_id}", {"status": status})
+
+
+def comment(cfg: Config, task_id: str, text: str):
+    api(cfg, "POST", f"/task/{task_id}/comment",
+        {"comment_text": text, "notify_all": False})
+
+
+# ---------------------------------------------------------------- capacidade
+
+def total_ram_gb() -> float:
+    try:
+        if sys.platform == "darwin":
+            return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                      text=True, timeout=5).stdout.strip()) / 1024 ** 3
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / 1024 ** 2
+    except Exception:
+        pass
+    return 0.0
+
+
+def available_ram_gb() -> float:
+    """Memória recuperável, não apenas 'livre'.
+
+    Em macOS o 'free' engana: o kernel quase nada mantém livre e recupera páginas
+    inativas sob demanda. `memory_pressure` traz o número da própria Apple.
+    """
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["memory_pressure"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            m = re.search(r"free percentage:\s*(\d+)%", out)
+            if m:
+                return total_ram_gb() * int(m.group(1)) / 100
+        except Exception:
+            pass
+        try:
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            page = int(re.search(r"page size of (\d+)", out).group(1))
+            def pg(l):
+                m = re.search(rf"{l}:\s+(\d+)", out)
+                return int(m.group(1)) if m else 0
+            return (pg("Pages free") + pg("Pages inactive") + pg("Pages purgeable")
+                    + pg("Pages speculative")) * page / 1024 ** 3
+        except Exception:
+            return -1.0
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024 ** 2
+    except Exception:
+        pass
+    return -1.0
+
+
+def session_rss_gb(cfg: Config) -> dict:
+    """RSS real de cada sessão viva. É o que permite corrigir o orçamento com
+    medida em vez de palpite — o custo de uma sessão de spec e o de uma de
+    implementação diferem por um fator grande."""
+    out = {}
+    for uid, info in running_sessions(cfg).items():
+        if info["kind"] != "tmux":
+            continue
+        r = subprocess.run(["tmux", "list-panes", "-t", info["ref"], "-F", "#{pane_pid}"],
+                           capture_output=True, text=True)
+        for pane_pid in r.stdout.split():
+            ps = subprocess.run(["ps", "-o", "rss=", "-g", pane_pid],
+                                capture_output=True, text=True)
+            kb = sum(int(x) for x in ps.stdout.split() if x.isdigit())
+            if kb:
+                out[uid] = round(kb / 1024 ** 2, 2)
+    return out
+
+
+def stage_ram(cfg: Config, stage_key: str | None) -> float:
+    table = cfg.sess("ram_per_stage_gb", {}) or {}
+    if stage_key and stage_key in table:
+        return float(table[stage_key])
+    return float(cfg.sess("ram_per_session_gb", 2.5))
+
+
+def capacity(cfg: Config, stage_key: str | None = None, extra_live: int = 0,
+             extra_ram: float = 0.0) -> dict:
+    """Quantas sessões A MAIS deste estágio cabem agora.
+
+    Duas correções que custaram caro para aparecer:
+
+    1. O número é de VAGAS LIVRES, não de teto total. A RAM disponível já
+       desconta o que as sessões vivas consomem, então comparar "vivas >= teto"
+       contava o mesmo consumo duas vezes e travava a esteira em zero.
+    2. O load é I/O, não CPU. Uma sessão de agente passa a maior parte do tempo
+       esperando a API; tratar load como teto rígido de CPU zerava a capacidade
+       assim que três sessões subiam, mesmo com RAM sobrando.
+    """
+    logical = os.cpu_count() or 4
+    total, load1 = total_ram_gb(), os.getloadavg()[0]
+    free = available_ram_gb() - extra_ram
+    per = stage_ram(cfg, stage_key)
+    reserve = float(cfg.sess("reserve_ram_gb", 3.0))
+    nlive = len(running_sessions(cfg)) + extra_live
+
+    by_ram = max(0, int((free - reserve) // per)) if free >= 0 else 1
+    cpu_ceiling = max(1, logical - 2)
+    # O load é guarda contra atropelo, não medida de saturação. Numa máquina
+    # Apple ele sobe com indexação do Spotlight e I/O de instalação — coisas que
+    # não disputam nada com uma sessão de agente, que passa o tempo esperando a
+    # API. Fator alto de propósito: aqui ele só barra thrashing de verdade.
+    load_ceiling = max(1, int(logical * float(cfg.sess("load_factor", 3.0)) - load1))
+    by_cpu = max(0, cpu_ceiling - nlive)
+    by_load = max(0, load_ceiling - nlive)
+    hard = int(cfg.sess("max_concurrent", 0) or 0)
+    by_hard = max(0, hard - nlive) if hard else 10**6
+
+    return {"logical_cpus": logical, "total_ram_gb": round(total, 1),
+            "free_ram_gb": round(free, 1), "load1": round(load1, 2),
+            "ram_per_session_gb": per, "reserve_ram_gb": reserve,
+            "stage": stage_key or "-", "live": nlive,
+            "by_ram": by_ram, "by_cpu": by_cpu, "by_load": by_load,
+            "cpu_ceiling": cpu_ceiling, "load_ceiling": load_ceiling,
+            "hard_cap": hard, "slots_free": min(by_ram, by_cpu, by_load, by_hard)}
+
+
+# ---------------------------------------------------------------- sessões
+
+def has_tmux() -> bool:
+    return shutil.which("tmux") is not None
+
+
+def pfx(cfg: Config) -> str:
+    return f"orq-{slugify(cfg.name, 16)}-"
+
+
+def sess_name(cfg: Config, uid: str) -> str:
+    return f"{pfx(cfg)}{uid}"
+
+
+def running_sessions(cfg: Config) -> dict:
+    out = {}
+    if has_tmux():
+        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith(pfx(cfg)):
+                out[line[len(pfx(cfg)):]] = {"kind": "tmux", "ref": line}
+    for f in sorted(STATE.glob(f"{slugify(cfg.name,16)}-*.pid")):
+        uid = f.stem.rsplit("-", 1)[-1]
+        if uid in out:
+            continue
+        try:
+            os.kill(int(f.read_text().strip()), 0)
+            out[uid] = {"kind": "proc", "ref": f.read_text().strip()}
+        except Exception:
+            f.unlink(missing_ok=True)
+    return out
+
+
+def log_path(cfg: Config, uid: str) -> Path:
+    return STATE / f"{slugify(cfg.name,16)}-{uid}.log"
+
+
+CONTEXT = """
+ANTES DE QUALQUER COISA — leia a tarefa INTEIRA:
+
+    orq show {key}
+
+Isso imprime a descrição E todos os comentários, do mais antigo ao mais recente.
+Os comentários não são conversa paralela: é onde mora o que a descrição não tem.
+
+- Divergências entre a descrição e o código real, registradas por quem veio antes.
+- Ambiguidades que uma sessão anterior encontrou e deliberadamente NÃO resolveu
+  sozinha — se você resolver por conta própria sem dizer, ninguém saberá.
+- Achados fora de escopo que alguém decidiu não consertar, e por quê.
+- Um comentário "REPROVADO": esta é uma rodada de RETRABALHO, e aqueles achados
+  são o seu escopo, com prioridade sobre o resto. Ignorá-los produz a mesma
+  reprovação.
+- Instruções escritas por uma pessoa no meio do caminho.
+
+Tratar a descrição como o todo é o erro mais caro desta esteira: você refaz uma
+decisão que já foi tomada, ou repete um engano que já foi diagnosticado.
+"""
+
+SEM_NAVEGADOR = """
+SEM NAVEGADOR — não existe navegador interativo nesta sessão. Não tente carregar
+a skill de automação de Chrome, procurar Chrome/Chromium no sistema nem subir um
+servidor esperando olhar a tela: você vai gastar tempo e não vai conseguir.
+
+Prove o que dá para provar sem olhar: teste automatizado, asserção sobre o HTML
+ou o CSS gerado, `curl -I` nos cabeçalhos, saída da construção, `grep` no bundle
+publicado. Boa parte do que parece precisar de navegador não precisa — um
+cabeçalho de segurança se confere com curl, um resquício de biblioteca se confere
+com grep no bundle.
+
+O que sobra e é genuinamente visual — layout, contraste, se a tela "parece
+certa" — não é seu para decidir sozinho: `orq hold` com o que precisa ser olhado
+e por quê. Declarar um critério visual como atendido sem ter visto é o pior
+desfecho possível, pior que parar.
+"""
+
+COMMON = """
+PREPARO — a worktree nasce sem dependências e sem os arquivos de ambiente (o git
+os ignora). Rode isto primeiro, a partir de {worktree}:
+{setup}
+Se algum falhar, PARE e reporte: sem eles os portões falham por motivo errado.
+
+PORTÕES desta esteira (a partir de {worktree}/{work_sub}):
+{gates}
+{browser}{publish}
+ENCERRAMENTO — toda sessão termina por UM destes três caminhos. Encerrar sem
+nenhum deles deixa a unidade parada num status de trabalho, e a esteira lê isso
+como sessão morta: ela reinicia o trabalho do zero e conta uma falta.
+
+1. CONCLUÍ (definição de pronto satisfeita):
+      orq note {key} --text "<resumo de uma linha do que foi entregue>"
+      orq advance {key}            # → "{done_status}"
+
+2. O TRABALHO NÃO PASSA (só na revisão, veredito REPROVADO):
+      orq reject {key} --file <achados.md>      # volta a quem pode corrigir
+
+3. TRAVEI EM ALGO QUE SÓ UMA PESSOA RESOLVE:
+      orq hold {key} --reason "<o que exatamente trava>"
+
+   MAS: se o que trava é OUTRA UNIDADE não ter chegado a algum ponto, isso não
+   é decisão humana — é uma condição verificável. Declare-a e a esteira solta
+   sozinha, sem ninguém precisar notar:
+
+      orq hold {key} --reason "<por que não dá para seguir agora>" \\
+        --until-unit DS-01 --until-stage integrate
+
+   Vale sobretudo para dependência de CÓDIGO: a sua worktree nasce do branch de
+   publicação, então o código de outra unidade só existe na sua base depois que
+   ela é INTEGRADA — estar "aprovada na revisão" não basta.
+
+   Bloqueio sem condição fica parado até alguém digitar `orq release`. Já
+   aconteceu de uma unidade esperar horas depois de estar livre porque o motivo
+   estava só em prosa. Se der para escrever a condição, escreva.
+
+SEMPRE QUE UMA PESSOA TE RESPONDER ALGO, REGISTRE ANTES DE USAR:
+      orq note {key} --text "DECISÃO DO DONO: <a pergunta> → <a resposta>"
+Resposta dada dentro da sessão existe só no histórico deste terminal. Se a sessão
+morrer, for reiniciada ou a unidade voltar para retrabalho, a decisão some e a
+próxima sessão vai perguntar de novo — ou pior, decidir sozinha diferente. Isso
+vale para escolha de escopo, ambiguidade de critério e qualquer julgamento de
+produto: o comentário é onde a decisão passa a existir para a esteira.
+
+Depois de qualquer um deles, encerre a sessão.
+"""
+
+BRIEFS = {
+    "spec": """Você é uma sessão de ESPECIFICAÇÃO da esteira "{pipeline}".
+
+OBJETIVO ÚNICO: transformar a tarefa {key} ({id}) numa especificação técnica que
+outra pessoa consiga implementar sem te perguntar nada. Você NÃO implementa —
+nenhuma linha de código de produção sai desta sessão.
+
+Tarefa: {title}   ·   {url}
+Worktree para leitura do código: {worktree} (branch {branch}, base {base})
+{context}
+O que a especificação precisa conter, nesta ordem:
+1. **Ponto de partida medido.** Leia o código de verdade e registre os números que
+   sustentam a tarefa — arquivos, linhas, contagens. Se a descrição afirma algo
+   que o código contradiz, o achado vai para a spec e você avisa com `orq note`.
+2. **Desenho da solução.** Quais arquivos nascem, quais mudam, quais somem. Nomes
+   de módulo, assinaturas, formato de dado. Onde a mudança encosta em outra parte
+   do sistema.
+3. **Passos de implementação**, na ordem em que devem ser feitos, cada um pequeno
+   o bastante para ser verificável sozinho.
+4. **Como provar cada critério de aceite.** Para cada critério da descrição, o
+   teste ou a observação que o demonstra. Critério sem prova é critério ambíguo:
+   registre a ambiguidade em vez de inventar a resposta.
+5. **Riscos e o que NÃO fazer.** O que está fora de escopo e por quê.
+
+Regras:
+- Escreva em português do Brasil, no mesmo tom da descrição existente: linguagem
+  direta, sem jargão gratuito, afirmações verificáveis.
+- Leia o código antes de afirmar qualquer coisa sobre ele. Uma spec que descreve
+  um código que não existe custa mais caro que spec nenhuma.
+- Não invente critério de aceite. Os critérios são da descrição; você diz COMO
+  prová-los.
+- Entrega: escreva o markdown COMPLETO da descrição (as seções que já existem,
+  preservadas, mais a sua especificação detalhada) em
+  {spec_file}, e publique com:
+      orq describe {key} --file {spec_file}
+  Confira com `orq show {key}` que a descrição no ClickUp ficou como você quis.
+""",
+    "implement": """Você é uma sessão de IMPLEMENTAÇÃO da esteira "{pipeline}".
+
+OBJETIVO ÚNICO: implementar a tarefa {key} ({id}) conforme a especificação já
+aprovada, até um commit verificado nesta worktree. Nada além dela.
+
+Tarefa: {title}   ·   {url}
+Worktree isolada: {worktree} (branch {branch}, criado a partir de {base})
+Código: {worktree}/{work_sub}
+NÃO toque no checkout principal ({repo}) nem em outra worktree.
+{context}
+Definição de pronto — não avance sem TODOS estes itens:
+1. Todos os passos da especificação executados, ou o desvio justificado por
+   escrito. A spec é o plano; se ela estiver errada, diga onde, não a ignore em
+   silêncio.
+1b. Todo achado de revisão anterior corrigido, com a evidência da correção.
+2. Todos os critérios de aceite atendidos, um a um, com a evidência de cada um.
+3. Portões verdes, rodados por você, com a saída colada no relatório.
+4. Commit nesta worktree, mensagem em Conventional Commits.
+
+Regras:
+- Escopo é o da tarefa. Outro defeito encontrado vira `orq note`, não conserto.
+- Critério ambíguo ou impossível: PARE e pergunte. A pergunta vira notificação
+  para o humano. Não invente o critério.
+""",
+    "integrate": """Você é uma sessão de INTEGRAÇÃO da esteira "{pipeline}".
+
+OBJETIVO ÚNICO: levar a tarefa {key} ({id}), já revisada e aprovada, para dentro
+de `{base}` — resolvendo o que for preciso no caminho — e confirmar que a
+publicação disparou.
+
+Tarefa: {title}   ·   {url}
+Worktree: {worktree}, branch {branch}
+{context}
+ATENÇÃO — esta é a única sessão da esteira que escreve em `{base}`, e um push lá
+publica em homologação. Leia o aviso de publicação abaixo antes de qualquer git.
+
+Procedimento:
+
+1. `git fetch origin` e veja quanto `{base}` andou desde que este branch nasceu.
+   Outras unidades entraram antes; o código com que você vai conviver mudou.
+
+2. Traga o branch para cima do `{base}` atual (`git rebase origin/{base}`, ou
+   merge se o histórico já foi publicado em algum lugar).
+
+3. **Conflito é trabalho de julgamento, não de escolher um lado.** Cada lado é
+   uma mudança que alguém especificou, implementou e teve aprovada. Antes de
+   resolver, leia as DUAS tarefas envolvidas — `orq show` na sua e na da outra
+   unidade — e produza um resultado que cumpra os critérios de aceite das duas.
+   Escolher "o meu" ou "o deles" é quase sempre apagar trabalho revisado.
+   Se os dois critérios forem genuinamente incompatíveis, isso é decisão de
+   produto: `orq hold {key} --reason "<o conflito exato e por que não dá para
+   conciliar>"` e pare. Não invente a conciliação.
+
+4. Rode os portões **depois** da integração, na árvore integrada. Verde antes de
+   integrar não diz nada sobre o resultado da junção — é justamente aqui que a
+   regressão de integração aparece.
+{gates}
+
+5. Se um portão ficar vermelho por culpa desta unidade, ela não está pronta:
+   `orq reject {key} --file <achados>` com o que quebrou, e pare.
+
+6. Publique: empurre o branch, abra o PR e faça o merge com squash.
+       git push -u origin {branch}
+       gh pr create --base {base} --head {branch} --title "<tipo(escopo): assunto>" --body "<...>"
+       gh pr merge --merge                        # SEM --delete-branch, veja abaixo
+       git push origin --delete {branch}          # apague o remoto assim
+   Execute o merge. Não peça confirmação: a decisão é sua desde que a revisão
+   tenha aprovado, o rebase tenha passado e os portões estejam verdes na árvore
+   fundida — as três coisas que o passo 4 acabou de estabelecer. Veja o aviso de
+   publicação abaixo, que é onde a esteira declara essa delegação.
+   O título do PR vira a mensagem do merge em `{base}`: Conventional Commits,
+   minúsculo, escopo obrigatório. O corpo diz o que mudou e como testar — escrito
+   como engenheiro, sem rodapé de ferramenta.
+   A estratégia de merge pode ser fixada por esteira no aviso de publicação; se
+   ele disser outra coisa, ele vence esta linha.
+   `--delete-branch` tenta trocar para o branch padrão do repositório (`main`),
+   que não existe nesta cópia local, e falha deixando o remoto para trás. Por
+   isso a remoção é explícita.
+   O PR não terá verificação automática: este repositório não tem workflow em
+   `pull_request`. Os portões que VOCÊ rodou no passo 4 são a única prova.
+
+7. Confirme que a publicação disparou: `gh run list --branch {base} --limit 3`.
+   Registre a URL da execução no `orq note`. Se o deploy falhar, isso é achado —
+   `orq note` com o log e `orq hold`, porque homologação quebrada é assunto de
+   pessoa.
+
+Você NÃO implementa funcionalidade nova. Só integra, concilia e publica.
+""",
+
+    "review": """Você é uma sessão de REVISÃO da esteira "{pipeline}".
+
+OBJETIVO ÚNICO: julgar se a tarefa {key} ({id}) está realmente pronta. Você NÃO
+implementa e NÃO corrige — se algo está errado, o veredito é reprovado.
+
+Tarefa: {title}   ·   {url}
+Trabalho a revisar: worktree {worktree}, branch {branch} contra {base}.
+{context}
+Procedimento:
+1. `git -C {worktree} diff {base}...HEAD` — leia a mudança inteira, não a amostra.
+2. Para CADA critério de aceite, decida atendido / não atendido / não verificável,
+   citando arquivo e linha como evidência. Sem evidência não é atendido.
+3. Rode os portões você mesmo. Não confie no relatório de quem implementou — o
+   ponto da revisão independente é exatamente esse.
+4. Procure ativamente o que a implementação pode ter quebrado FORA do escopo dela.
+5. Confira que o commit não traz nada que a spec não pedia.
+6. Confronte com os comentários: toda ambiguidade que uma sessão anterior deixou
+   registrada em aberto continua em aberto, ou foi resolvida e declarada? Uma
+   ambiguidade resolvida em silêncio é achado — foi uma decisão de produto tomada
+   sem ninguém saber.
+
+Veredito — os dois caminhos são finais, e você DEVE tomar um deles:
+
+**APROVADO** exige todos os critérios atendidos com evidência, portões verdes e
+nenhum achado grave. Encerre com `orq note` + `orq advance {key}`.
+
+**REPROVADO** exige pelo menos um achado concreto e reproduzível. Encerre com:
+
+    orq reject {key} --file <arquivo-com-os-achados>
+
+Isso devolve a unidade a quem pode corrigi-la, levando seus achados junto. Escolha
+para onde volta:
+- **implementação** (padrão) — a spec está certa, o código não a cumpriu.
+- **especificação** (`--to spec`) — o defeito nasce na spec: critério ambíguo,
+  contraditório ou impossível de provar como está escrito. Mandar de volta para
+  implementação nesse caso só produz a mesma reprovação de novo.
+
+Reprovar é resultado válido do controle de qualidade, não falha sua. O que NÃO
+pode acontecer é você avançar trabalho reprovado, nem parar sem tomar um dos dois
+caminhos — unidade parada em status de trabalho é lida como sessão morta.
+
+Se estiver travado em algo que só uma pessoa resolve (acesso que falta, decisão de
+produto, ambiente quebrado), use `orq hold {key} --reason "<o que trava>"`.
+""",
+}
+
+
+def build_brief(cfg: Config, u: Unit, stage: Stage, worktree: Path, branch: str) -> str:
+    ctx = dict(
+        pipeline=cfg.name, key=u.key, id=u.id, title=u.title or "(ver ClickUp)",
+        url=u.url or f"https://app.clickup.com/t/{u.id}",
+        worktree=worktree, branch=branch, base=cfg.base_branch, repo=cfg.repo,
+        work_sub=cfg.work_sub, done_status=stage.done,
+        publish=cfg.publish_note_for(stage.key),
+        setup="\n".join(f"   {i+1}. {c}" for i, c in enumerate(cfg.setup)) or "   (nada)",
+        context=CONTEXT.format(key=u.key),
+        browser=cfg.browser_note_for(stage.key),
+        gates="\n".join(f"   - {g}" for g in cfg.gates) or "   (nenhum)",
+        spec_file=STATE / f"{slugify(cfg.name,16)}-{u.id}.spec.md",
+    )
+    return BRIEFS[stage.key].format(**ctx) + COMMON.format(**ctx)
+
+
+def settings_json(label: str) -> str:
+    return json.dumps({"hooks": {
+        "Notification": [{"hooks": [{"type": "command",
+                                     "command": f"ORQ_UNIT={label} {HOOK} notification"}]}],
+        "Stop": [{"hooks": [{"type": "command",
+                             "command": f"ORQ_UNIT={label} {HOOK} stop"}]}]}})
+
+
+CLAUDE_JSON = Path.home() / ".claude.json"
+
+
+def ensure_trusted(cfg: Config, path: Path):
+    """Faz a worktree herdar a confiança do repositório base.
+
+    Toda worktree é um caminho novo, e o Claude Code abre o diálogo de confiança
+    em caminho desconhecido — o que trava uma sessão desacoplada antes de ela
+    começar. A confiança é HERDADA, nunca inventada: se o repositório base não
+    estiver registrado como confiável, isto recusa em vez de decidir por você.
+    """
+    if not CLAUDE_JSON.exists():
+        die(f"{CLAUDE_JSON} não existe — abra o Claude Code uma vez antes.")
+    try:
+        d = json.loads(CLAUDE_JSON.read_text())
+    except Exception as e:
+        die(f"não consegui ler {CLAUDE_JSON}: {e}")
+    projects = d.setdefault("projects", {})
+    base = projects.get(str(cfg.repo), {})
+    if not base.get("hasTrustDialogAccepted"):
+        die(f"o repositório base não está marcado como confiável.\n"
+            f"  Abra-o uma vez e aceite: cd {cfg.repo} && claude\n"
+            f"  A esteira só herda confiança; nunca a concede por conta própria.")
+    entry = projects.setdefault(str(path), {})
+    if entry.get("hasTrustDialogAccepted"):
+        return
+    entry["hasTrustDialogAccepted"] = True
+    tmp = CLAUDE_JSON.with_suffix(".json.orq-tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    tmp.replace(CLAUDE_JSON)
+
+
+def ensure_worktree(cfg: Config, u: Unit) -> tuple:
+    branch = cfg.branch_for(u)
+    wt = cfg.worktree_root / branch
+    if wt.exists():
+        return wt, branch
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    exists = subprocess.run(["git", "-C", str(cfg.repo), "rev-parse", "--verify", branch],
+                            capture_output=True).returncode == 0
+    args = ["git", "-C", str(cfg.repo), "worktree", "add", str(wt)]
+    args += [branch] if exists else ["-b", branch, cfg.base_branch]
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"falha ao criar worktree para {u.key}: {r.stderr.strip()[:300]}")
+    return wt, branch
+
+
+def launch(cfg: Config, u: Unit, stage: Stage, attach: bool = False) -> str:
+    STATE.mkdir(parents=True, exist_ok=True)
+    wt, branch = ensure_worktree(cfg, u)
+    ensure_trusted(cfg, wt)
+    label = f"{u.key}-{stage.key}"
+    brief = STATE / f"{slugify(cfg.name,16)}-{u.id}-{stage.key}.brief.md"
+    brief.write_text(build_brief(cfg, u, stage, wt, branch))
+    setts = STATE / f"{slugify(cfg.name,16)}-{u.id}.settings.json"
+    setts.write_text(settings_json(label))
+    logf = log_path(cfg, u.id)
+
+    cmd = ["claude", "--permission-mode", str(cfg.sess("permission_mode", "auto")),
+           "--settings", str(setts), "--add-dir", str(wt)]
+    if cfg.sess("remote_control", True):
+        # Nome legível na lista remota: <esteira>-<unidade>-<estágio>.
+        cmd += ["--remote-control", f"{slugify(cfg.name, 16)}-{label}"]
+    if cfg.sess("model", ""):
+        cmd += ["--model", cfg.sess("model")]
+    cmd += [f"Leia e siga integralmente o briefing em {brief}. "
+            f"Ele é a sua única ordem de serviço."]
+
+    env = {**os.environ, "ORQ_UNIT": label, "ORQ_LOG_DIR": str(STATE),
+           "ORQ_PIPELINE": str(cfg.path)}
+    name = sess_name(cfg, u.id)
+    if has_tmux():
+        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(wt)] + cmd,
+                       env=env, check=True)
+        subprocess.run(["tmux", "pipe-pane", "-t", name, "-o", f"cat >> {logf}"],
+                       capture_output=True)
+        how = f"orq attach {u.key}   (ou: tmux attach -t {name})"
+        if attach:
+            os.execvp("tmux", ["tmux", "attach", "-t", name])
+    else:
+        with open(logf, "ab") as fh:
+            p = subprocess.Popen(cmd, cwd=str(wt), env=env, stdout=fh,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        (STATE / f"{slugify(cfg.name,16)}-{u.id}.pid").write_text(str(p.pid))
+        how = f"orq log {u.key} -f   (tmux ausente)"
+    with open(STATE / "runs.jsonl", "a") as fh:
+        fh.write(json.dumps({"ts": time.strftime("%FT%TZ", time.gmtime()),
+                             "pipeline": cfg.name, "unit": u.key, "id": u.id,
+                             "stage": stage.key, "branch": branch}) + "\n")
+    return how
+
+
+def archive_dir(cfg: Config) -> Path:
+    return STATE / "archive" / slugify(cfg.name, 24)
+
+
+def finalize(cfg: Config, u: Unit, stage: Stage | None, outcome: str,
+             kill_delay: int = 3) -> Path | None:
+    """Encerra a sessão da unidade e guarda os artefatos.
+
+    A morte do tmux é adiada e desacoplada de propósito: `advance` costuma ser
+    chamado de DENTRO da própria sessão, e matá-la na hora mataria o processo
+    que está executando o comando antes de ele terminar.
+    """
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    stg = stage.key if stage else "sem-estagio"
+    dest = archive_dir(cfg) / f"{u.key}-{stg}-{ts}"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    sl = slugify(cfg.name, 16)
+    moved = []
+    for pat in (f"{sl}-{u.id}*.brief.md", f"{sl}-{u.id}*.spec.md",
+                f"{sl}-{u.id}.settings.json", f"{sl}-{u.id}.log"):
+        for f in STATE.glob(pat):
+            shutil.move(str(f), dest / f.name)
+            moved.append(f.name)
+    for f in STATE.glob(f"{u.key}-*.events"):
+        shutil.move(str(f), dest / f.name)
+        moved.append(f.name)
+    (STATE / f"{sl}-{u.id}.pid").unlink(missing_ok=True)
+
+    (dest / "meta.json").write_text(json.dumps({
+        "pipeline": cfg.name, "unit": u.key, "id": u.id, "stage": stg,
+        "outcome": outcome, "status_final": u.status,
+        "archived_at": time.strftime("%FT%TZ", time.gmtime()),
+        "artifacts": moved,
+    }, ensure_ascii=False, indent=2))
+
+    live = running_sessions(cfg)
+    if u.id in live and live[u.id]["kind"] == "tmux":
+        name = live[u.id]["ref"]
+        # Encerrar com EDUCAÇÃO antes de matar o tmux.
+        #
+        # `tmux kill-session` derruba o painel sem dar ao Claude Code a chance de
+        # se despedir — e a sessão sobe com --remote-control, cujo registro fica
+        # do lado do servidor. Morta de supetão, ela continua listada em
+        # claude.ai/code como sessão offline, para sempre. Com 81 sessões
+        # arquivadas, é uma lista de fantasmas que esconde o que está vivo.
+        #
+        # SIGTERM no processo do painel deixa o bridge se desregistrar; só depois
+        # o tmux é derrubado, e aí como rede de segurança, não como método.
+        panes = subprocess.run(["tmux", "list-panes", "-t", name, "-F", "#{pane_pid}"],
+                               capture_output=True, text=True).stdout.split()
+        alvos = " ".join(f"-{p}" for p in panes)   # -PID = o grupo inteiro
+        encerra = (f"sleep {kill_delay}; "
+                   + (f"kill -TERM {alvos} 2>/dev/null; sleep 4; " if panes else "")
+                   + f"tmux kill-session -t {name}")
+        subprocess.Popen(["sh", "-c", encerra],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    elif u.id in live:
+        try:
+            os.kill(int(live[u.id]["ref"]), 15)
+        except Exception:
+            pass
+    return dest
+
+
+# ---------------------------------------------------------------- classificação
+
+PRIO = {"urgent": 0, "high": 1, "normal": 2, "low": 3, "": 4}
+
+
+@dataclass
+class Row:
+    unit: Unit
+    state: str          # ready | running | stalled | blocked | done | unknown
+    stage: Stage | None  # estágio em que está (working) ou para o qual está pronta
+    why: str = ""
+
+
+def classify(cfg: Config, units: list, board: dict, live: dict, order: dict) -> list:
+    stages = cfg.stages
+    q_of = {norm(s.queue): s for s in stages}
+    w_of = {norm(s.working): s for s in stages}
+    terminal = norm(stages[-1].done)
+    extra_done = {norm(x) for x in cfg.cu("status_done", [])}
+
+    for u in units:
+        m = board.get(u.id)
+        if m:
+            u.status, u.priority, u.url = m["status"], m["priority"], m["url"]
+            u.title = u.title or m["name"]
+        else:
+            u.status = "AUSENTE-NO-CLICKUP"
+
+    rank = {u.id: order.get(norm(u.status), -1) for u in units}
+    by_id = {u.id: u for u in units}
+    # O livro-razão do laço é a QUARTA autoridade, e o board precisa lê-la.
+    # Sem isto ele mente de dois jeitos opostos: unidade em espera humana num
+    # status de TRABALHO vira 💥 stalled (alarme falso — foi a própria sessão
+    # que pediu a espera), e num status de FILA vira 🟢 ready enquanto o laço a
+    # pula para sempre. O segundo é o caro: espera-se por algo que nunca começa.
+    st_loop = loop_state(cfg)
+    held, quar = st_loop.get("hold", {}), set(st_loop.get("quarantine", []))
+    rows = []
+    for u in units:
+        ns = norm(u.status)
+        stage_of = w_of.get(ns) or q_of.get(ns)   # preserva o estágio: `orq run`,
+                                                  # `orq hold` e `finalize` dependem dele
+        if u.id in live:
+            rows.append(Row(u, "running", stage_of, f"sessão viva ({live[u.id]['kind']})"))
+        elif ns == terminal or ns in extra_done:
+            rows.append(Row(u, "done", None, u.status))
+        elif u.id in quar:
+            rows.append(Row(u, "quarantined", stage_of,
+                            f"quarentena · '{u.status}' · orq unquarantine {u.key}"))
+        elif u.id in held:
+            motivo = " ".join(str(held[u.id].get("reason", "")).split())
+            rows.append(Row(u, "held", stage_of,
+                            f"espera humana · '{u.status}' · "
+                            f"{motivo[:70]}{'…' if len(motivo) > 70 else ''}"))
+        elif ns in w_of:
+            rows.append(Row(u, "stalled", w_of[ns],
+                            f"marcada '{u.status}' sem sessão viva"))
+        elif ns in q_of:
+            stg = q_of[ns]
+            need = order.get(norm(stg.done), 99)
+            # Cada aresta tem a sua própria exigência. A padrão é "passou do fim
+            # do estágio que estou entrando"; uma aresta de CÓDIGO pode exigir
+            # mais — tipicamente que a dependência já esteja integrada, porque a
+            # worktree nasce do branch de publicação e é só lá que o código dela
+            # existe. Guardamos o texto do que falta por aresta: dizer "espera
+            # DS-01 ≥ aguardando revisão" quando o que falta é a integração
+            # manda a pessoa conferir a coisa errada.
+            missing = []
+            for d in u.depends_on:
+                exige_status, exige_ord = stg.done, need
+                regra = u.dep_after.get(d)
+                if regra:
+                    alvo_key, a_partir = regra
+                    alvo = next((s for s in stages if s.key == alvo_key), None)
+                    aplica = a_partir is None or stg.idx >= next(
+                        (s.idx for s in stages if s.key == a_partir), 0)
+                    if alvo and aplica and order.get(norm(alvo.done), 99) > need:
+                        exige_status, exige_ord = alvo.done, order.get(norm(alvo.done), 99)
+                if rank.get(d, -1) < exige_ord:
+                    missing.append((d, exige_status))
+            if missing:
+                por_exig = {}
+                for d, exig in missing:
+                    por_exig.setdefault(exig, []).append(
+                        by_id[d].key if d in by_id else d)
+                partes = [f"{', '.join(ks)} ≥ {exig}" for exig, ks in por_exig.items()]
+                rows.append(Row(u, "blocked", stg, f"{stg.key}: espera " + " · ".join(partes)))
+            else:
+                rows.append(Row(u, "ready", stg, f"pronta para {stg.label.lower()}"))
+        else:
+            rows.append(Row(u, "unknown", None,
+                            f"status '{u.status}' fora da esteira declarada"))
+    return rows
+
+
+# Ordem de leitura do board: primeiro o que está quebrado, depois o que espera
+# uma pessoa, depois o que anda sozinho.
+ORDER = {"stalled": 0, "quarantined": 1, "held": 2, "running": 3, "ready": 4,
+         "blocked": 5, "unknown": 6, "done": 7}
+ICON = {"stalled": "💥", "quarantined": "🚫", "held": "✋", "running": "▶ ",
+        "ready": "🟢", "blocked": "⛔", "unknown": "❓", "done": "✅"}
+COL = {"stalled": C["red"], "quarantined": C["red"], "held": C["yel"],
+       "running": C["cyn"], "ready": C["grn"], "blocked": C["d"],
+       "unknown": C["yel"], "done": C["d"]}
+
+
+def ready_queue(rows: list, stage_key: str | None = None) -> list:
+    r = [x for x in rows if x.state == "ready"
+         and (stage_key is None or x.stage.key == stage_key)]
+    return sorted(r, key=lambda x: (PRIO.get(x.unit.priority, 4),
+                                    x.stage.idx, x.unit.order))
+
+
+def load(cfg: Config):
+    return (cfg.units, fetch_board(cfg), running_sessions(cfg), status_order(cfg))
+
+
+# ---------------------------------------------------------------- comandos
+
+def cmd_board(cfg, args):
+    units, board, live, order = load(cfg)
+    rows = classify(cfg, units, board, live, order)
+    rows.sort(key=lambda r: (ORDER[r.state], PRIO.get(r.unit.priority, 4),
+                             r.stage.idx if r.stage else 9, r.unit.order))
+    cap = capacity(cfg)
+    nlive = sum(1 for r in rows if r.state == "running")
+
+    print(f"\n{C['b']}{cfg.name}{C['r']}  {C['d']}lista {cfg.list_id}{C['r']}")
+    print(f"{C['d']}esteira: " + " → ".join(
+        f"{s.queue}/[{s.key}]/{s.done}" for s in cfg.stages) + C["r"])
+    print(f"{C['d']}{'':2} {'unidade':8} {'estado':8} {'estágio':10} {'prio':7} porquê{C['r']}")
+    for r in rows:
+        if r.state == "done" and not args.all:
+            continue
+        stg = r.stage.key if r.stage else "-"
+        print(f"{ICON[r.state]} {COL[r.state]}{r.unit.key:<8}{C['r']} {r.state:<8} "
+              f"{stg:<10} {r.unit.priority or '-':<7} {C['d']}{r.why[:52]}{C['r']}")
+
+    stray = [(i, m) for i, m in board.items() if i not in {u.id for u in units}]
+    if stray:
+        print(f"\n{C['yel']}não declaradas no pipeline.toml{C['r']} "
+              f"{C['d']}(a esteira nunca executa o que não foi declarado){C['r']}")
+        for i, m in stray:
+            print(f"   ❓ {i}  {m['status']:<20} {m['name'][:52]}")
+
+    counts = {}
+    for r in rows:
+        counts[r.state] = counts.get(r.state, 0) + 1
+    print("\n" + C["d"] + " · ".join(f"{k}: {v}" for k, v in
+          sorted(counts.items(), key=lambda x: ORDER[x[0]])) + C["r"])
+    per = {}
+    for r in rows:
+        if r.state == "ready":
+            per[r.stage.key] = per.get(r.stage.key, 0) + 1
+    if per:
+        print(C["b"] + "prontas por estágio: " + C["r"]
+              + "  ".join(f"{k}={v}" for k, v in per.items()))
+    room = {st.key: capacity(cfg, st.key)["slots_free"] for st in cfg.stages}
+    print(f"{C['d']}capacidade: {nlive} viva(s) · vagas livres "
+          + ", ".join(f"{k}={v}" for k, v in room.items())
+          + f" (RAM livre {cap['free_ram_gb']}GB, load {cap['load1']}){C['r']}")
+    q = ready_queue(rows)
+    if q:
+        print(f"\n{C['b']}próximas{C['r']}: " +
+              "  ".join(f"{r.unit.key}·{r.stage.key}" for r in q[:6]))
+
+
+def cmd_capacity(cfg, args):
+    c, live = capacity(cfg), running_sessions(cfg)
+    print(f"\n{C['b']}Recursos{C['r']}")
+    for k, v in [("CPUs lógicos", c["logical_cpus"]), ("RAM total (GB)", c["total_ram_gb"]),
+                 ("RAM disponível (GB)", c["free_ram_gb"]), ("load (1 min)", c["load1"])]:
+        print(f"  {k:<22} {v}")
+    print(f"\n{C['b']}Vagas livres{C['r']}  {C['d']}(quantas sessões A MAIS cabem agora){C['r']}")
+    for k, v in [("por RAM", c["by_ram"]),
+                 (f"por CPU (teto {c['cpu_ceiling']})", c["by_cpu"]),
+                 (f"por load (teto {c['load_ceiling']})", c["by_load"]),
+                 ("teto configurado", c["hard_cap"] or "—")]:
+        print(f"  {k:<26} {v}")
+    print(f"  {C['b']}{'vagas':<26} {c['slots_free']}{C['r']}  "
+          f"{C['d']}(vivas: {len(live)}, orçamento {c['ram_per_session_gb']}GB){C['r']}")
+    table = cfg.sess("ram_per_stage_gb", {}) or {}
+    if table:
+        print(f"\n{C['b']}Orçamento por estágio{C['r']}")
+        for st in cfg.stages:
+            per = stage_ram(cfg, st.key)
+            cs = capacity(cfg, st.key)
+            print(f"  {st.key:<12} {per:>4} GB → cabem mais {cs['slots_free']}")
+    rss = session_rss_gb(cfg)
+    if rss:
+        print(f"\n{C['b']}Consumo medido agora{C['r']}  {C['d']}(corrija o orçamento por isto){C['r']}")
+        for uid, gb in rss.items():
+            key = next((u.key for u in cfg.units if u.id == uid), uid)
+            print(f"  {key:<12} {gb} GB")
+
+
+def cmd_next(cfg, args):
+    units, board, live, order = load(cfg)
+    rows = classify(cfg, units, board, live, order)
+    q = ready_queue(rows, args.stage)
+    room = max(capacity(cfg, st.key)["slots_free"] for st in cfg.stages)
+    n = args.n or room
+    if not q:
+        print("nada pronto: tudo bloqueado, em execução ou concluído.")
+        return
+    print(f"{C['d']}{len(q)} prontas · {room} vaga(s){C['r']}")
+    for i, r in enumerate(q):
+        mark = f"{C['grn']}→{C['r']}" if i < n else " "
+        print(f"{mark} {r.unit.key:<8} {r.stage.key:<10} {r.unit.priority or '-':<7} "
+              f"{r.unit.mode:<10} {r.unit.title[:48]}")
+
+
+def _row(cfg, ref: str):
+    units, board, live, order = load(cfg)
+    rows = classify(cfg, units, board, live, order)
+    for r in rows:
+        if ref in (r.unit.id, r.unit.key) or r.unit.key.lower() == ref.lower():
+            return r, rows
+    die(f"unidade '{ref}' não está no pipeline.toml")
+
+
+def cmd_run(cfg, args):
+    r, rows = _row(cfg, args.unit)
+    u = r.unit
+    stage = cfg.stage(args.stage) if args.stage else r.stage
+    if stage is None:
+        die(f"{u.key} está '{u.status}' — não há estágio para essa situação.")
+    live = running_sessions(cfg)
+    if r.state == "running" and not args.force:
+        die(f"{u.key} já tem sessão viva. `orq attach {u.key}` ou --force.")
+    if r.state == "blocked" and not args.force:
+        die(f"{u.key} bloqueada ({r.why}). --force ignora.")
+    if r.state == "done" and not args.force:
+        die(f"{u.key} já está concluída.")
+    cap = capacity(cfg, stage.key)
+    if cap["slots_free"] <= 0 and not args.force:
+        die(f"sem vaga para '{stage.key}': RAM livre {cap['free_ram_gb']}GB "
+            f"(precisa de {cap['ram_per_session_gb']}GB + {cap['reserve_ram_gb']}GB de reserva), "
+            f"load {cap['load1']}, {cap['live']} viva(s). --force ignora.")
+
+    how = launch(cfg, u, stage, attach=args.attach)
+    if norm(u.status) != norm(stage.working):
+        try:
+            set_status(cfg, u.id, stage.working)
+        except SystemExit:
+            print(f"{C['yel']}aviso:{C['r']} sessão iniciada, status não mudou no ClickUp.")
+    print(f"{C['grn']}✓{C['r']} {u.key} · estágio '{stage.key}' "
+          f"({stage.queue} → {stage.working} → {stage.done})")
+    print(f"  {how}")
+
+
+def cmd_dispatch(cfg, args):
+    units, board, live, order = load(cfg)
+    rows = classify(cfg, units, board, live, order)
+    q = ready_queue(rows, args.stage)
+    room = max(capacity(cfg, st.key)["slots_free"] for st in cfg.stages)
+    n = min(args.n or room, room, len(q))
+    if n <= 0:
+        print(f"nada a disparar (prontas: {len(q)}, vagas: {room}).")
+        return
+    picked = q[:n]
+    print(f"{C['b']}Disparando {n}{C['r']} de {len(q)} prontas (vagas: {room})")
+    for r in picked:
+        print(f"  {r.unit.key:<8} {r.stage.key:<10} {r.unit.mode:<10} {r.unit.title[:44]}")
+    hands = [r.unit.key for r in picked if r.unit.mode == "hands-on"]
+    if hands:
+        print(f"{C['yel']}atenção:{C['r']} {', '.join(hands)} hands-on — acompanhe com attach.")
+    if not args.yes and input("\nconfirmar? [s/N] ").strip().lower() not in ("s", "sim", "y"):
+        print("cancelado.")
+        return
+    for r in picked:
+        ns = argparse.Namespace(unit=r.unit.id, stage=r.stage.key, attach=False, force=False)
+        try:
+            cmd_run(cfg, ns)
+        except SystemExit as e:
+            print(f"{C['red']}pulou {r.unit.key}{C['r']}: {e}")
+
+
+def cmd_advance(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    u = r.unit
+    stage = cfg.stage(args.stage) if args.stage else None
+    if stage is None:
+        for s in cfg.stages:
+            if norm(u.status) == norm(s.working):
+                stage = s
+                break
+    if stage is None:
+        die(f"{u.key} está '{u.status}', que não é um status de trabalho. "
+            f"Use --stage para forçar.")
+    if stage.idx == len(cfg.stages) - 1 and not cfg.auto_close:
+        die(f"o último estágio exige fechamento humano (auto_close=false). "
+            f"{u.key} fica em '{u.status}'.")
+    set_status(cfg, u.id, stage.done)
+    print(f"{C['grn']}✓{C['r']} {u.key}: {u.status} → {stage.done}")
+    if not args.keep:
+        dest = finalize(cfg, u, stage, outcome=f"advanced:{stage.key}")
+        print(f"{C['d']}  sessão arquivada em {dest}{C['r']}")
+
+
+def cmd_note(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    text = Path(args.file).read_text() if args.file else args.text
+    if not text:
+        die("informe --text ou --file")
+    comment(cfg, r.unit.id, text)
+    print(f"{C['grn']}✓{C['r']} comentário publicado em {r.unit.key}")
+
+
+def cmd_describe(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    md = Path(args.file).read_text()
+    if len(md.strip()) < 200:
+        die("descrição com menos de 200 caracteres — recusada para não apagar a original.")
+    api(cfg, "PUT", f"/task/{r.unit.id}", {"markdown_description": md})
+    print(f"{C['grn']}✓{C['r']} descrição de {r.unit.key} atualizada ({len(md)} caracteres)")
+
+
+def cmd_show(cfg, args):
+    """Tarefa + comentários.
+
+    Os comentários carregam o que a descrição não tem: achados de revisão,
+    descobertas fora de escopo, instruções do humano, o relato de rodadas
+    anteriores. Vinham sendo ignorados porque este comando só imprimia a
+    descrição — e os briefings mandavam usá-lo para lê-los."""
+    r, _ = _row(cfg, args.unit)
+    d = api(cfg, "GET", f"/task/{r.unit.id}")
+    print(f"{C['b']}{d['name']}{C['r']}  {C['d']}{d['url']}{C['r']}")
+    print(f"{C['d']}status: {(d.get('status') or {}).get('status')}{C['r']}\n")
+    print(d.get("markdown_description") or d.get("description") or "(sem descrição)")
+    if args.no_comments:
+        return
+    cs = api(cfg, "GET", f"/task/{r.unit.id}/comment").get("comments", [])
+    cs = list(reversed(cs))          # cronológico: a história lê para a frente
+    print(f"\n{C['b']}{'═'*72}{C['r']}")
+    if not cs:
+        print(f"{C['d']}sem comentários{C['r']}")
+        return
+    print(f"{C['b']}COMENTÁRIOS ({len(cs)}){C['r']}  "
+          f"{C['d']}do mais antigo ao mais recente{C['r']}\n")
+    for i, c in enumerate(cs, 1):
+        who = (c.get("user") or {}).get("username", "?")
+        when = ""
+        try:
+            when = time.strftime("%d/%m %H:%M",
+                                 time.localtime(int(c.get("date", 0)) / 1000))
+        except Exception:
+            pass
+        body = (c.get("comment_text") or "").strip()
+        print(f"{C['cyn']}[{i}] {who} · {when}{C['r']}")
+        print(body if body else "(vazio)")
+        print()
+
+
+def cmd_status(cfg, args):
+    while True:
+        live = running_sessions(cfg)
+        print(f"\n{C['b']}{time.strftime('%H:%M:%S')}{C['r']}  {len(live)} sessão(ões) viva(s)")
+        for u in cfg.units:
+            if u.id not in live:
+                continue
+            lf = log_path(cfg, u.id)
+            age = int(time.time() - lf.stat().st_mtime) if lf.exists() else -1
+            flag = (f"{C['red']}⏸ sem saída há {age//60}m{C['r']}" if age > 480
+                    else f"{C['d']}ativa{C['r']}")
+            print(f"  ▶  {u.key:<8} {flag}  {C['d']}{live[u.id]['ref']}{C['r']}")
+        for f in sorted(STATE.glob("*.events")):
+            lines = [l for l in f.read_text().splitlines() if "\tnotification\t" in l]
+            if lines:
+                ts, _, msg = lines[-1].split("\t", 2)
+                print(f"  {C['yel']}⚠ {f.stem}{C['r']} {C['d']}{ts}{C['r']} {msg[:88]}")
+        if not args.watch:
+            return
+        time.sleep(args.interval)
+
+
+def cmd_attach(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    if not has_tmux():
+        die("tmux ausente — use `orq log <unidade> -f`.")
+    os.execvp("tmux", ["tmux", "attach", "-t", sess_name(cfg, r.unit.id)])
+
+
+def cmd_log(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    lf = log_path(cfg, r.unit.id)
+    if not lf.exists():
+        die(f"sem log para {r.unit.key}")
+    os.execvp("tail", ["tail", "-f", str(lf)] if args.follow
+              else ["tail", "-n", "200", str(lf)])
+
+
+def cmd_stop(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    live = running_sessions(cfg)
+    if r.unit.id not in live:
+        die(f"{r.unit.key} não tem sessão viva.")
+    i = live[r.unit.id]
+    if i["kind"] == "tmux":
+        subprocess.run(["tmux", "kill-session", "-t", i["ref"]], check=False)
+    else:
+        os.kill(int(i["ref"]), 15)
+        (STATE / f"{slugify(cfg.name,16)}-{r.unit.id}.pid").unlink(missing_ok=True)
+    if args.archive:
+        dest = finalize(cfg, r.unit, r.stage, outcome="stopped", kill_delay=0)
+        print(f"{C['d']}  artefatos em {dest}{C['r']}")
+    print(f"{C['grn']}✓{C['r']} sessão de {r.unit.key} encerrada; "
+          f"status segue '{r.unit.status}'. Worktree e branch continuam.")
+
+
+def cmd_brief(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    stage = cfg.stage(args.stage) if args.stage else r.stage
+    if stage is None:
+        die(f"{r.unit.key} está '{r.unit.status}' — sem estágio. Use --stage.")
+    print(build_brief(cfg, r.unit, stage, cfg.worktree_root / cfg.branch_for(r.unit),
+                      cfg.branch_for(r.unit)))
+
+
+def cmd_sweep(cfg, args):
+    """Arquiva o que já terminou. Rede de segurança para a sessão que encerrou
+    sem chamar `advance` — sem isso ela some da vista e o artefato fica órfão."""
+    units, board, live, order = load(cfg)
+    rows = classify(cfg, units, board, live, order)
+    sl = slugify(cfg.name, 16)
+    swept = []
+    for r in rows:
+        if r.state == "running":
+            continue
+        has_artifacts = any(STATE.glob(f"{sl}-{r.unit.id}*")) or \
+                        any(STATE.glob(f"{r.unit.key}-*.events"))
+        if not has_artifacts:
+            continue
+        if r.state in ("done", "ready") or (r.state == "stalled" and args.stalled):
+            dest = finalize(cfg, r.unit, r.stage, outcome=f"sweep:{r.state}", kill_delay=0)
+            swept.append((r.unit.key, r.state, dest))
+    if not swept:
+        print("nada a arquivar.")
+        return
+    for k, st, d in swept:
+        print(f"{C['grn']}✓{C['r']} {k:<8} ({st}) → {d.name}")
+    print(f"{C['d']}{len(swept)} arquivada(s) em {archive_dir(cfg)}{C['r']}")
+
+
+def cmd_reset(cfg, args):
+    """Devolve a unidade à fila do estágio atual.
+
+    Existe porque `run` marca o status de trabalho ANTES de saber se a sessão
+    conseguiu trabalhar. Sessão que morre no arranque deixa o quadro mentindo;
+    isto desfaz a marcação em vez de deixar o humano corrigir na mão."""
+    r, _ = _row(cfg, args.unit)
+    u = r.unit
+    stage = cfg.stage(args.stage) if args.stage else None
+    if stage is None:
+        for st in cfg.stages:
+            if norm(u.status) == norm(st.working):
+                stage = st
+                break
+    if stage is None:
+        die(f"{u.key} está '{u.status}', que não é status de trabalho. Use --stage.")
+    live = running_sessions(cfg)
+    if u.id in live:
+        i = live[u.id]
+        if i["kind"] == "tmux":
+            subprocess.run(["tmux", "kill-session", "-t", i["ref"]], check=False)
+        else:
+            try:
+                os.kill(int(i["ref"]), 15)
+            except Exception:
+                pass
+    dest = finalize(cfg, u, stage, outcome="reset", kill_delay=0)
+    set_status(cfg, u.id, stage.queue)
+    print(f"{C['grn']}✓{C['r']} {u.key}: {u.status} → {stage.queue} (sessão encerrada)")
+    print(f"{C['d']}  artefatos em {dest}{C['r']}")
+
+
+def cmd_reject(cfg, args):
+    """Saída da revisão quando o veredito é REPROVADO.
+
+    Reprovar não é falha de sessão — é resultado válido do controle de
+    qualidade. Sem uma transição para trás, a unidade fica parada num status de
+    trabalho, o laço a lê como arranque falho e gasta outra revisão para chegar
+    ao mesmo achado. O trabalho volta ao estágio que pode corrigi-lo, levando os
+    achados junto."""
+    r, _ = _row(cfg, args.unit)
+    u = r.unit
+    text = Path(args.file).read_text() if args.file else (args.text or "")
+    if len(text.strip()) < 40:
+        die("uma reprovação precisa de achados concretos (mínimo 40 caracteres). "
+            "Sem o achado, quem for corrigir não sabe o quê.")
+
+    cur = r.stage or next((st for st in cfg.stages
+                           if norm(u.status) == norm(st.working)), None)
+    if cur is None:
+        die(f"{u.key} está '{u.status}' — não dá para reprovar fora de um estágio.")
+    target = cfg.stage(args.to) if args.to else (
+        cfg.stages[cur.idx - 1] if cur.idx > 0 else cur)
+
+    st = loop_state(cfg)
+    n = st["rework"].get(u.id, 0) + 1
+    st["rework"][u.id] = n
+    max_rework = int(cfg.raw.get("loop", {}).get("max_rework", 2))
+
+    comment(cfg, u.id, f"REPROVADO (retrabalho {n}/{max_rework}) — volta para "
+                       f"'{target.queue}'.\n\n{text}")
+    finalize(cfg, u, cur, outcome=f"rejected->{target.key}", kill_delay=3)
+
+    if n >= max_rework:
+        st["quarantine"].append(u.id)
+        save_loop_state(cfg, st)
+        notify(f"⛔ {u.key} em quarentena",
+               f"{n} reprovações. O problema provavelmente é a especificação, "
+               f"não a implementação — precisa de você.")
+        print(f"{C['yel']}⛔{C['r']} {u.key}: {n}ª reprovação → quarentena. "
+              f"Status segue '{u.status}' para você inspecionar.")
+        return
+    set_status(cfg, u.id, target.queue)
+    save_loop_state(cfg, st)
+    notify(f"↩︎ {u.key} reprovada",
+           f"Volta para {target.label.lower()} (retrabalho {n}/{max_rework}).")
+    print(f"{C['yel']}↩︎{C['r']} {u.key}: {u.status} → {target.queue} "
+          f"(retrabalho {n}/{max_rework})")
+
+
+def cmd_hold(cfg, args):
+    """Marca a unidade como bloqueada por decisão humana.
+
+    Diferente de reprovar: aqui a sessão não consegue concluir por algo que só
+    uma pessoa resolve. O laço para de mexer nela — nem reinicia, nem conta
+    falta — em vez de repetir um arranque que vai falhar igual."""
+    r, _ = _row(cfg, args.unit)
+    if not args.reason or len(args.reason.strip()) < 20:
+        die("--reason é obrigatório e precisa dizer o que trava (mín. 20 caracteres).")
+    st = loop_state(cfg)
+    entrada = {"reason": args.reason,
+               "at": time.strftime("%FT%TZ", time.gmtime()),
+               "status": r.unit.status}
+
+    # Espera por outra unidade não é decisão humana — é uma condição verificável.
+    # Declarada aqui, o laço a confere a cada ciclo e solta sozinho. Sem isto o
+    # bloqueio sobrevive ao próprio motivo e a unidade fica parada horas depois
+    # de estar livre.
+    if getattr(args, "until_unit", None):
+        alvo = next((u for u in cfg.units
+                     if u.key.upper() == args.until_unit.upper()), None)
+        if not alvo:
+            die(f"--until-unit: não existe unidade '{args.until_unit}' no pipeline.toml.")
+        est = getattr(args, "until_stage", None) or cfg.stages[-1].key
+        if not any(s.key == est for s in cfg.stages):
+            die(f"--until-stage: '{est}' não é estágio desta esteira "
+                f"({', '.join(s.key for s in cfg.stages)}).")
+        entrada["until"] = {"unit": alvo.key, "stage": est}
+
+    st["hold"][r.unit.id] = entrada
+    save_loop_state(cfg, st)
+    cond = entrada.get("until")
+    sufixo = ""
+    if cond:
+        stg = next(s for s in cfg.stages if s.key == cond["stage"])
+        sufixo = (f"\n\nDESBLOQUEIO AUTOMÁTICO quando {cond['unit']} chegar em "
+                  f"'{stg.done}'. Ninguém precisa fazer nada; a esteira confere "
+                  f"a cada ciclo.")
+    comment(cfg, r.unit.id,
+            (f"AGUARDANDO {'CONDIÇÃO' if cond else 'DECISÃO HUMANA'}: "
+             f"{args.reason}{sufixo}"))
+    finalize(cfg, r.unit, r.stage, outcome="hold", kill_delay=3)
+    if cond:
+        notify(f"⏳ {r.unit.key} espera {cond['unit']}",
+               f"Solta sozinha quando {cond['unit']} passar de {cond['stage']}.")
+        print(f"{C['yel']}⏳{C['r']} {r.unit.key} esperando {cond['unit']} ≥ "
+              f"{cond['stage']}. O laço solta sozinho — não precisa de `orq release`.")
+    else:
+        notify(f"✋ {r.unit.key} aguarda você", args.reason)
+        print(f"{C['yel']}✋{C['r']} {r.unit.key} em espera humana. "
+              f"O laço não vai tocar nela até `orq release {r.unit.key}`.")
+
+
+def cmd_release(cfg, args):
+    st = loop_state(cfg)
+    r, _ = _row(cfg, args.unit)
+    was = []
+    if r.unit.id in st["quarantine"]:
+        st["quarantine"].remove(r.unit.id); was.append("quarentena")
+    if st["hold"].pop(r.unit.id, None):
+        was.append("espera humana")
+    st["strikes"].pop(r.unit.id, None)
+    if args.reset_rework:
+        st["rework"].pop(r.unit.id, None); was.append("contador de retrabalho")
+    save_loop_state(cfg, st)
+    print(f"{C['grn']}✓{C['r']} {r.unit.key} liberada"
+          + (f" ({', '.join(was)})" if was else " (não estava retida)"))
+
+
+def cmd_archive(cfg, args):
+    r, _ = _row(cfg, args.unit)
+    dest = finalize(cfg, r.unit, r.stage, outcome="manual", kill_delay=0)
+    print(f"{C['grn']}✓{C['r']} {r.unit.key} arquivada em {dest}")
+
+
+# ---------------------------------------------------------------- laço autônomo
+
+def loop_state_path(cfg: Config) -> Path:
+    return STATE / f"loop-{slugify(cfg.name, 24)}.json"
+
+
+def loop_state(cfg: Config) -> dict:
+    p = loop_state_path(cfg)
+    if p.exists():
+        try:
+            d = json.loads(p.read_text())
+            for k, v in (("strikes", {}), ("quarantine", []), ("hold", {}),
+                         ("rework", {}), ("ticks", 0), ("dispatched", 0)):
+                d.setdefault(k, v)
+            return d
+        except Exception:
+            pass
+    return {"strikes": {}, "quarantine": [], "hold": {}, "rework": {},
+            "ticks": 0, "dispatched": 0}
+
+
+def save_loop_state(cfg: Config, st: dict):
+    loop_state_path(cfg).write_text(json.dumps(st, ensure_ascii=False, indent=2))
+
+
+def notify(title: str, msg: str):
+    """Aviso ao humano — nunca deixa de registrar, nunca derruba quem chamou.
+
+    Chamado nos pontos terminais do laço (quarentena, reprovação, espera humana,
+    fim da esteira). Num host sem `osascript` a versão antiga levantava
+    FileNotFoundError e matava o laço justamente ali. O registro em arquivo é o
+    canal que sempre existe; o resto é entrega, e entrega pode falhar.
+
+    Canal, em ordem: $ORQ_NOTIFY_CMD (recebe título e mensagem em argv, e também
+    em ORQ_NOTIFY_TITLE/ORQ_NOTIFY_MSG) → osascript no macOS → notify-send num
+    desktop Linux → stderr.
+    """
+    title, msg = title[:120], (msg or "")[:400]
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with (STATE / "notify.log").open("a") as fh:
+            fh.write(f"{time.strftime('%FT%TZ', time.gmtime())}\t{title}\t"
+                     f"{msg.replace(chr(10), ' ')}\n")
+    except Exception:
+        pass
+
+    cmd = os.environ.get("ORQ_NOTIFY_CMD", "").strip()
+    try:
+        if cmd:
+            subprocess.run([*cmd.split(), title, msg], capture_output=True, timeout=20,
+                           env={**os.environ, "ORQ_NOTIFY_TITLE": title,
+                                "ORQ_NOTIFY_MSG": msg})
+        elif sys.platform == "darwin":
+            subprocess.run(["osascript", "-e",
+                            f'display notification "{msg[:200]}" with title "{title[:80]}" '
+                            f'sound name "Ping"'], capture_output=True, timeout=20)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, msg], capture_output=True, timeout=20)
+        else:
+            print(f"{C['y']}🔔 {title}{C['r']} — {msg}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def auth_ok() -> bool:
+    try:
+        d = json.loads(subprocess.run(["claude", "auth", "status"], capture_output=True,
+                                      text=True, timeout=20).stdout)
+        return bool(d.get("loggedIn"))
+    except Exception:
+        return False
+
+
+def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
+    """Um ciclo: colhe o que morreu, preenche a capacidade livre.
+
+    Devolve um resumo. Não levanta exceção por falha de uma unidade — o laço
+    precisa sobreviver a uma unidade ruim sem parar as outras.
+    """
+    st = loop_state(cfg)
+    st["ticks"] += 1
+    out = {"reaped": [], "dispatched": [], "quarantined": [], "released": [],
+           "fatal": None}
+
+    if not auth_ok():
+        out["fatal"] = "sessão do Claude Code sem login (claude auth login)"
+        save_loop_state(cfg, st)
+        return out
+    try:
+        units, board, live, order = load(cfg)
+    except SystemExit:
+        out["fatal"] = "ClickUp inacessível"
+        save_loop_state(cfg, st)
+        return out
+    rows = classify(cfg, units, board, live, order)
+
+    # 0. soltar sozinho o que estava esperando outra unidade andar.
+    #
+    # Um bloqueio guarda o motivo em prosa e some da esteira até alguém digitar
+    # `orq release`. Quando o motivo é "espero a unidade X chegar em Y", isso é
+    # verificável — e deixar para uma pessoa notar significa que a unidade fica
+    # parada horas depois de estar livre. Já aconteceu duas vezes aqui: uma
+    # esperando integração que saiu, outra esperando um status do ClickUp que
+    # foi criado. Bloqueio SEM condição declarada continua intocado: falta de
+    # credencial e decisão de produto não se resolvem sozinhas.
+    by_key = {u.key.upper(): u for u in units}
+    for uid, h in list(st["hold"].items()):
+        cond = h.get("until")
+        if not cond:
+            continue
+        alvo = by_key.get(str(cond.get("unit", "")).upper())
+        if not alvo:
+            continue
+        exig = cond.get("stage") or cfg.stages[-1].key
+        stg = next((s for s in cfg.stages if s.key == exig), None)
+        if not stg:
+            continue
+        preciso = order.get(norm(stg.done), 99)
+        atual = order.get(norm(alvo.status), -1)
+        if atual < preciso:
+            continue
+        st["hold"].pop(uid, None)
+        st["strikes"].pop(uid, None)   # a espera não é falta; não conta strike
+        u = next((x for x in units if x.id == uid), None)
+        rotulo = u.key if u else uid
+        out["released"].append(rotulo)
+        try:
+            comment(cfg, uid, f"DESBLOQUEIO AUTOMÁTICO: a condição registrada no bloqueio "
+                              f"foi satisfeita — {alvo.key} chegou em '{alvo.status}' "
+                              f"(exigido: ≥ {stg.done}). A esteira volta a considerar "
+                              f"esta unidade. Motivo original: {h.get('reason','')[:400]}")
+        except SystemExit:
+            pass
+        notify(f"▶ {rotulo} destravada sozinha",
+               f"{alvo.key} chegou em '{alvo.status}'. A espera acabou.")
+    if out["released"]:
+        # `classify` relê o estado do disco, então o desbloqueio precisa estar
+        # gravado antes — senão o quadro renasce com os bloqueios que acabamos
+        # de soltar. Refazer o quadro é o que permite despachar as recém-soltas
+        # JÁ neste ciclo, em vez de esperar o próximo.
+        save_loop_state(cfg, st)
+        rows = classify(cfg, units, board, live, order)
+
+    # 1. colher: unidade em status de trabalho sem sessão viva = arranque falho
+    max_strikes = int(cfg.raw.get("loop", {}).get("max_strikes", 2))
+    for r in rows:
+        if r.state != "stalled" or r.unit.id in st["quarantine"] \
+                or r.unit.id in st["hold"]:
+            continue
+        # Recém-solta da espera: ela está num status de TRABALHO sem sessão viva
+        # porque foi bloqueada ali, não porque o arranque falhou. Devolver para a
+        # fila é certo; contar falta não é. Sem esta exceção, duas esperas
+        # legítimas mandam para a quarentena uma unidade que nunca falhou.
+        if r.unit.key in out["released"]:
+            try:
+                finalize(cfg, r.unit, r.stage, outcome="release-requeue", kill_delay=0)
+                set_status(cfg, r.unit.id, r.stage.queue)
+                out["reaped"].append(f"{r.unit.key}(espera)")
+            except SystemExit:
+                pass
+            continue
+        n = st["strikes"].get(r.unit.id, 0) + 1
+        st["strikes"][r.unit.id] = n
+        if n >= max_strikes:
+            st["quarantine"].append(r.unit.id)
+            out["quarantined"].append(r.unit.key)
+            notify(f"⛔ {r.unit.key} em quarentena",
+                   f"{n} arranques falhos seguidos. A esteira parou de tentar.")
+            continue
+        try:
+            finalize(cfg, r.unit, r.stage, outcome=f"loop-reset:{n}", kill_delay=0)
+            set_status(cfg, r.unit.id, r.stage.queue)
+            out["reaped"].append(f"{r.unit.key}({n})")
+        except SystemExit:
+            pass
+
+    # 2. preencher a capacidade livre, respeitando o custo do estágio de cada uma
+    nlive = sum(1 for r in rows if r.state == "running")
+    q = [r for r in ready_queue(rows)
+         if r.unit.id not in st["quarantine"] and r.unit.id not in st["hold"]]
+    skip_modes = set(cfg.raw.get("loop", {}).get("skip_modes", []))
+    # Estágio serial: no máximo um por vez em toda a esteira. A integração escreve
+    # no branch de publicação; duas ao mesmo tempo correriam uma contra a outra.
+    serial = set(cfg.raw.get("loop", {}).get("serial_stages", []))
+    busy_serial = {r2.stage.key for r2 in rows
+                   if r2.state == "running" and r2.stage and r2.stage.key in serial}
+    started, committed = 0, 0.0   # committed = RAM já comprometida NESTE ciclo
+    for r in q:
+        if r.stage.key in serial and r.stage.key in busy_serial:
+            continue
+        if max_new and started >= max_new:
+            break
+        if r.unit.mode in skip_modes:
+            continue
+        cap = capacity(cfg, r.stage.key, extra_live=started, extra_ram=committed)
+        if cap["slots_free"] <= 0:
+            continue
+        try:
+            launch(cfg, r.unit, r.stage)
+            set_status(cfg, r.unit.id, r.stage.working)
+            out["dispatched"].append(f"{r.unit.key}·{r.stage.key}")
+            started += 1
+            committed += stage_ram(cfg, r.stage.key)
+            if r.stage.key in serial:
+                busy_serial.add(r.stage.key)
+            st["dispatched"] += 1
+            if r.unit.mode == "hands-on":
+                notify(f"👐 {r.unit.key} · {r.stage.key}",
+                       "Unidade hands-on iniciada — vale acompanhar: orq attach "
+                       + r.unit.key)
+        except SystemExit as e:
+            out["reaped"].append(f"{r.unit.key}!falha-ao-lançar")
+
+    st["strikes"] = {k: v for k, v in st["strikes"].items()
+                     if k not in {r.unit.id for r in rows if r.state == "done"}}
+    save_loop_state(cfg, st)
+    out["live"] = nlive + started
+    out["ready"] = len(q)
+    return out
+
+
+def cmd_tick(cfg, args):
+    o = tick(cfg, max_new=args.n)
+    if o["fatal"]:
+        die(o["fatal"])
+    parts = []
+    for k, icon in (("released", "⏳→"), ("dispatched", "▶"),
+                    ("reaped", "♻"), ("quarantined", "⛔")):
+        if o[k]:
+            parts.append(f"{icon} {' '.join(o[k])}")
+    print(f"{time.strftime('%H:%M:%S')}  vivas={o['live']} prontas={o['ready']}  "
+          + ("  ".join(parts) or "sem mudança"))
+
+
+def cmd_loop(cfg, args):
+    lp = cfg.raw.get("loop", {})
+    interval = args.interval or int(lp.get("interval_seconds", 90))
+    idle_stop = int(lp.get("idle_ticks_to_stop", 20))
+    name = f"orq-loop-{slugify(cfg.name, 20)}"
+
+    if args.detach:
+        if not has_tmux():
+            die("--detach exige tmux.")
+        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", name,
+                        "orq", "--pipeline", str(cfg.path), "loop",
+                        "--interval", str(interval)], check=True)
+        print(f"{C['grn']}✓{C['r']} laço em segundo plano · sessão tmux '{name}'")
+        print(f"  acompanhar : tmux attach -t {name}")
+        print(f"  parar      : orq loop-stop")
+        return
+
+    print(f"{C['b']}Laço autônomo — {cfg.name}{C['r']}  "
+          f"{C['d']}intervalo {interval}s · Ctrl-C para parar{C['r']}")
+    idle = 0
+    while True:
+        # Relê o grafo a cada ciclo. O laço já reconsultava o ClickUp, mas
+        # carregava pipeline.toml uma única vez no arranque — declarar uma
+        # unidade nova com o laço no ar não tinha efeito nenhum, e o sintoma era
+        # mudo: `orq board` mostrava 'ready' e o laço imprimia 'prontas=0'.
+        # Aconteceu em 01/09/2026 ao declarar a FE-16 com a esteira rodando.
+        # Se o arquivo estiver sendo salvo neste instante, segue com o anterior:
+        # um TOML pela metade não pode derrubar a esteira.
+        try:
+            cfg = Config(path=cfg.path, raw=tomllib.loads(cfg.path.read_text()))
+        except Exception as e:
+            print(f"{C['yel']}aviso: pipeline.toml ilegível neste ciclo "
+                  f"({str(e)[:80]}) — seguindo com o grafo anterior{C['r']}", flush=True)
+        o = tick(cfg)
+        if o["fatal"]:
+            notify("💥 Laço parado", o["fatal"])
+            die(f"laço parado: {o['fatal']}")
+        parts = []
+        for k, icon in (("released", "⏳→"), ("dispatched", "▶"),
+                    ("reaped", "♻"), ("quarantined", "⛔")):
+            if o[k]:
+                parts.append(f"{icon} {' '.join(o[k])}")
+        moved = bool(parts)
+        print(f"{time.strftime('%H:%M:%S')}  vivas={o['live']} prontas={o['ready']}  "
+              + ("  ".join(parts) or f"{C['d']}sem mudança{C['r']}"), flush=True)
+        if o["live"] == 0 and o["ready"] == 0:
+            notify("✅ Esteira concluída",
+                   f"{cfg.name}: nada vivo e nada pronto. O laço parou.")
+            print(f"\n{C['grn']}esteira sem trabalho pendente — laço encerrado.{C['r']}")
+            return
+        # Ocioso é o laço esperando UMA PESSOA — não esperando a si mesmo.
+        # Contar como ocioso um ciclo em que há sessão viva mata o laço no meio
+        # do próprio trabalho: uma revisão de 30 min produz 20 ciclos "sem
+        # mudança", o laço se encerra, e quando a sessão finalmente avança a
+        # unidade não sobrou ninguém para despachar o estágio seguinte.
+        # Aconteceu duas vezes em 01/09/2026 (04:47 e 17:05); na segunda, a
+        # DS-02 ficou pronta para integração com o laço já morto.
+        idle = 0 if (moved or o["live"]) else idle + 1
+        if idle >= idle_stop:
+            notify("⏸ Laço ocioso",
+                   f"{idle} ciclos sem nada vivo e sem nada avançar. "
+                   f"Provável espera humana. Laço parado.")
+            print(f"\n{C['yel']}{idle} ciclos sem mudança — laço parado. "
+                  f"Veja `orq board`.{C['r']}")
+            return
+        time.sleep(interval)
+
+
+def cmd_loop_stop(cfg, args):
+    name = f"orq-loop-{slugify(cfg.name, 20)}"
+    r = subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"{C['grn']}✓{C['r']} laço parado. As sessões de unidade em curso continuam "
+              f"(veja `orq status`).")
+    else:
+        print(f"{C['d']}nenhum laço em segundo plano.{C['r']}")
+
+
+def cmd_unquarantine(cfg, args):
+    st = loop_state(cfg)
+    r, _ = _row(cfg, args.unit)
+    if r.unit.id in st["quarantine"]:
+        st["quarantine"].remove(r.unit.id)
+    st["strikes"].pop(r.unit.id, None)
+    save_loop_state(cfg, st)
+    print(f"{C['grn']}✓{C['r']} {r.unit.key} liberada da quarentena.")
+
+
+def cmd_doctor(cfg, args):
+    ok = True
+    def chk(label, good, detail="", fatal=True):
+        nonlocal ok
+        mark = (f"{C['grn']}✓{C['r']}" if good else
+                (f"{C['red']}✗{C['r']}" if fatal else f"{C['yel']}!{C['r']}"))
+        print(f" {mark} {label:<32} {C['d']}{detail}{C['r']}")
+        if not good and fatal:
+            ok = False
+
+    print(f"\n{C['b']}Pré-voo — {cfg.name}{C['r']}")
+    chk("claude na PATH", shutil.which("claude") is not None,
+        subprocess.run(["claude", "--version"], capture_output=True,
+                       text=True).stdout.strip()[:40] if shutil.which("claude") else "")
+    chk("tmux", has_tmux(), "ok" if has_tmux() else "ausente → sem attach", fatal=False)
+    # Sessão sem login sobe, recebe a ordem de serviço e morre em "Login expired"
+    # sem produzir log nem notificação — o ClickUp fica marcado como se ela
+    # estivesse trabalhando. Falha barata de detectar, cara de descobrir depois.
+    try:
+        a = json.loads(subprocess.run(["claude", "auth", "status"], capture_output=True,
+                                      text=True, timeout=20).stdout)
+        chk("autenticado", bool(a.get("loggedIn")),
+            a.get("authMethod", "?") if a.get("loggedIn")
+            else "rode: claude auth login")
+    except Exception as e:
+        chk("autenticado", False, f"não consegui verificar ({e})")
+    chk("orq na PATH (as sessões usam)", shutil.which("orq") is not None,
+        shutil.which("orq") or "as sessões não conseguirão chamar `orq advance`")
+    chk("hook de notificação", HOOK.exists() and os.access(HOOK, os.X_OK), str(HOOK))
+    chk("repositório", (cfg.repo / ".git").exists(), str(cfg.repo))
+    chk("diretório de trabalho", cfg.work_dir.exists(), str(cfg.work_dir))
+    r = subprocess.run(["git", "-C", str(cfg.repo), "rev-parse", "--verify", cfg.base_branch],
+                       capture_output=True, text=True)
+    chk(f"branch base '{cfg.base_branch}'", r.returncode == 0, r.stdout.strip()[:12])
+    try:
+        _t = json.loads(CLAUDE_JSON.read_text()).get("projects", {})
+        chk("repositório base confiável",
+            bool(_t.get(str(cfg.repo), {}).get("hasTrustDialogAccepted")),
+            "worktrees herdam" if _t.get(str(cfg.repo), {}).get("hasTrustDialogAccepted")
+            else f"abra uma vez: cd {cfg.repo} && claude")
+    except Exception:
+        chk("repositório base confiável", False, f"não consegui ler {CLAUDE_JSON}")
+    chk("raiz das worktrees fora do repo",
+        not str(cfg.worktree_root).startswith(str(cfg.repo)), str(cfg.worktree_root))
+    try:
+        tok = cfg.token()
+        chk("token do ClickUp", bool(tok), f"{tok[:6]}…")
+    except SystemExit:
+        chk("token do ClickUp", False, "não encontrado")
+        return
+
+    order = status_order(cfg)
+    print(f"\n{C['b']}Esteira declarada vs. status da lista{C['r']}")
+    for s in cfg.stages:
+        parts = []
+        for role, val in (("fila", s.queue), ("trabalho", s.working), ("fim", s.done)):
+            good = norm(val) in order
+            parts.append(f"{'✓' if good else '✗'} {role}={val}")
+            if not good:
+                ok = False
+        seq = (order.get(norm(s.queue), -1) < order.get(norm(s.working), -1)
+               < order.get(norm(s.done), 99))
+        print(f"   {'✓' if seq else '✗'} {s.key:<10} " + "  ".join(parts))
+        if not seq:
+            ok = False
+            print(f"      {C['red']}ordem inválida na lista do ClickUp{C['r']}")
+    unused = [k for k in order if k not in
+              {norm(v) for s in cfg.stages for v in (s.queue, s.working, s.done)}]
+    if unused:
+        print(f"   {C['yel']}!{C['r']} status da lista fora da esteira: {', '.join(unused)}")
+
+    try:
+        board = fetch_board(cfg)
+        chk("lista acessível", True, f"{len(board)} tarefa(s)")
+        missing = [u.key for u in cfg.units if u.id not in board]
+        chk("unidades existem no ClickUp", not missing, ", ".join(missing) or "todas")
+        ids = {u.id for u in cfg.units}
+        bad = [f"{u.key}→{d}" for u in cfg.units for d in u.depends_on if d not in ids]
+        chk("dependências resolvem", not bad, ", ".join(bad) or "todas")
+        rows = classify(cfg, cfg.units, board, running_sessions(cfg), order)
+        unk = [r.unit.key for r in rows if r.state == "unknown"]
+        chk("todas em status da esteira", not unk, ", ".join(unk) or "sim")
+    except SystemExit:
+        chk("lista acessível", False, "falha na API")
+    c = capacity(cfg)
+    chk("vagas livres > 0", c["slots_free"] > 0,
+        f"{c['slots_free']} vaga(s) · RAM {c['free_ram_gb']}GB · load {c['load1']}",
+        fatal=False)
+    # A integração empurra e abre PR. Sem isto a sessão trava num prompt de
+    # credencial que ninguém responde — a mesma classe de falha do login expirado.
+    needs_git = any(st.key == "integrate" for st in cfg.stages)
+    if needs_git:
+        has_gh = shutil.which("gh") is not None
+        chk("gh na PATH", has_gh, shutil.which("gh") or "brew install gh")
+        if has_gh:
+            r2 = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+            chk("gh autenticado", r2.returncode == 0,
+                next((l.strip() for l in (r2.stdout + r2.stderr).splitlines()
+                      if "Logged in" in l), "gh auth login"))
+        r3 = subprocess.run(["git", "-C", str(cfg.repo), "ls-remote", "--exit-code",
+                             "origin", cfg.base_branch],
+                            capture_output=True, text=True,
+                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        chk(f"acesso ao remoto (origin/{cfg.base_branch})", r3.returncode == 0,
+            r3.stdout.split()[0][:12] if r3.returncode == 0
+            else "sem credencial não interativa — ssh-add --apple-use-keychain ou gh auth setup-git")
+        serial = cfg.raw.get("loop", {}).get("serial_stages", [])
+        chk("integração é serial (WIP 1)", "integrate" in serial,
+            "serial_stages inclui integrate" if "integrate" in serial
+            else "DUAS integrações simultâneas escreveriam em " + cfg.base_branch)
+    # Este diálogo trava a sessão desacoplada sem produzir log nem transição —
+    # o agente parece morto quando só está esperando alguém dispensar um convite.
+    try:
+        _cj = json.loads((Path.home() / ".claude.json").read_text())
+        chk("convite do Chrome dispensado", bool(_cj.get("chromeInstallUpsellDismissed")),
+            "não volta a perguntar" if _cj.get("chromeInstallUpsellDismissed")
+            else "responda 'Don't ask again' uma vez numa sessão anexada", fatal=False)
+    except Exception:
+        pass
+    chk("remote control", bool(cfg.sess("remote_control", True)),
+        "ligado em toda sessão (--remote-control)" if cfg.sess("remote_control", True)
+        else "desligado", fatal=False)
+    chk("arquivo de sessões", archive_dir(cfg).parent.exists() or True,
+        f"{archive_dir(cfg)} · "
+        f"{len(list(archive_dir(cfg).glob('*'))) if archive_dir(cfg).exists() else 0} entrada(s)",
+        fatal=False)
+    chk("fechamento automático no fim", True,
+        "agente fecha (auto_close=true)" if cfg.auto_close
+        else "último estágio para no humano", fatal=False)
+    print(f"\n{C['grn' if ok else 'red']}{C['b']}{'PRONTO' if ok else 'NÃO PRONTO'}{C['r']}\n")
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="orq",
+                                description="Orquestrador de esteiras guiadas por ClickUp.")
+    p.add_argument("--pipeline", help="caminho do pipeline.toml (ou $ORQ_PIPELINE)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help):
+        s = sub.add_parser(name, help=help)
+        s.set_defaults(fn=fn)
+        return s
+
+    add("doctor", cmd_doctor, "pré-voo: ferramentas, token, esteira, capacidade")
+    s = add("board", cmd_board, "quadro completo por estágio")
+    s.add_argument("-a", "--all", action="store_true", help="inclui concluídas")
+    add("capacity", cmd_capacity, "recursos e limite de sessões simultâneas")
+    s = add("next", cmd_next, "fila priorizada do que pode começar")
+    s.add_argument("-n", type=int, default=0)
+    s.add_argument("--stage", help="restringe a um estágio")
+    s = add("run", cmd_run, "inicia a sessão do estágio atual de uma unidade")
+    s.add_argument("unit"); s.add_argument("--stage")
+    s.add_argument("--attach", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s = add("dispatch", cmd_dispatch, "dispara as N prontas de maior prioridade")
+    s.add_argument("-n", type=int, default=0); s.add_argument("--stage")
+    s.add_argument("-y", "--yes", action="store_true")
+    s = add("advance", cmd_advance,
+            "move a unidade para o fim do estágio atual e arquiva a sessão")
+    s.add_argument("unit"); s.add_argument("--stage")
+    s.add_argument("--keep", action="store_true",
+                   help="não arquivar nem encerrar a sessão")
+    s = add("sweep", cmd_sweep, "arquiva os artefatos de sessões que já terminaram")
+    s.add_argument("--stalled", action="store_true",
+                   help="arquiva também as travadas (perde o rastro para diagnóstico)")
+    s = add("archive", cmd_archive, "arquiva a sessão de uma unidade agora")
+    s.add_argument("unit")
+    s = add("reset", cmd_reset, "devolve a unidade à fila do estágio (desfaz um arranque falho)")
+    s.add_argument("unit"); s.add_argument("--stage")
+    s = add("tick", cmd_tick, "um ciclo do laço: colhe o que morreu, preenche a capacidade")
+    s.add_argument("-n", type=int, default=0, help="teto de novos lançamentos neste ciclo")
+    s = add("loop", cmd_loop, "roda a esteira sozinha até acabar ou ficar ociosa")
+    s.add_argument("--interval", type=int, default=0)
+    s.add_argument("--detach", action="store_true", help="roda em tmux próprio")
+    add("loop-stop", cmd_loop_stop, "para o laço em segundo plano")
+    s = add("reject", cmd_reject, "REPROVADO: devolve a unidade ao estágio anterior com os achados")
+    s.add_argument("unit"); s.add_argument("--to", help="estágio de destino (padrão: o anterior)")
+    s.add_argument("--text"); s.add_argument("--file")
+    s = add("hold", cmd_hold, "marca a unidade como bloqueada por decisão humana")
+    s.add_argument("unit"); s.add_argument("--reason", required=True)
+    s.add_argument("--until-unit", metavar="UNIDADE",
+                   help="espera por OUTRA unidade, não por uma pessoa: o laço "
+                        "confere a cada ciclo e solta sozinho")
+    s.add_argument("--until-stage", metavar="ESTAGIO",
+                   help="até onde essa unidade precisa chegar (padrão: o último "
+                        "estágio da esteira)")
+    s = add("release", cmd_release, "libera de quarentena ou de espera humana")
+    s.add_argument("unit")
+    s.add_argument("--reset-rework", action="store_true", help="zera o contador de retrabalho")
+    s = add("unquarantine", cmd_unquarantine, "atalho antigo para release")
+    s.add_argument("unit")
+    s = add("note", cmd_note, "publica um comentário na tarefa")
+    s.add_argument("unit"); s.add_argument("--text"); s.add_argument("--file")
+    s = add("describe", cmd_describe, "substitui a descrição da tarefa por um arquivo")
+    s.add_argument("unit"); s.add_argument("--file", required=True)
+    s = add("show", cmd_show, "imprime a tarefa e seus comentários")
+    s.add_argument("unit")
+    s.add_argument("--no-comments", action="store_true")
+    s = add("status", cmd_status, "o que está vivo e o que pede decisão")
+    s.add_argument("-w", "--watch", action="store_true")
+    s.add_argument("--interval", type=int, default=30)
+    s = add("attach", cmd_attach, "entra na sessão (tmux)"); s.add_argument("unit")
+    s = add("log", cmd_log, "lê o log da sessão")
+    s.add_argument("unit"); s.add_argument("-f", "--follow", action="store_true")
+    s = add("stop", cmd_stop, "encerra a sessão"); s.add_argument("unit")
+    s.add_argument("--archive", action="store_true", help="também arquiva os artefatos")
+    s = add("brief", cmd_brief, "imprime o briefing sem lançar nada")
+    s.add_argument("unit"); s.add_argument("--stage")
+
+    args = p.parse_args()
+    cfg = find_config(args.pipeline)
+    STATE.mkdir(parents=True, exist_ok=True)
+    args.fn(cfg, args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

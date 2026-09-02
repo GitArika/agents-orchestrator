@@ -1989,6 +1989,72 @@ def cmd_unquarantine(cfg, args):
     print(f"{C['grn']}✓{C['r']} {r.unit.key} liberada da quarentena.")
 
 
+def _prova(fn):
+    """Executa uma verificação e devolve (passou, evidência).
+
+    A evidência é o que a chamada devolveu DE VERDADE — nunca a palavra "ok".
+    Pré-voo que acredita em declaração é pior do que não ter pré-voo: ele dá
+    permissão para seguir e some do caminho quando o problema aparece. Foi o que
+    aconteceu com o token morto: o pré-voo ficava verde perguntando à ferramenta
+    se ela estava bem, e cada sessão morria em dois segundos depois de nascer.
+    """
+    try:
+        return True, str(fn() or "").strip()[:200]
+    except Exception as e:
+        return False, str(e).strip()[:200]
+
+
+def _prova_agente():
+    """O agente responde a um prompt de verdade?"""
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        raise RuntimeError(
+            "CLAUDE_CODE_OAUTH_TOKEN está no ambiente. Essa variável vence o "
+            "login interativo, DESLIGA o acompanhamento remoto e REBAIXA o "
+            "modelo do plano. Remova-a e autentique com `claude` uma vez.")
+    r = subprocess.run(["claude", "-p", "responda apenas: ok"],
+                       capture_output=True, text=True, timeout=180)
+    saida = (r.stdout or "").strip()
+    if r.returncode != 0 or "ok" not in saida.lower():
+        raise RuntimeError(f"não respondeu: {((r.stderr or saida) or '(vazio)')[:160]}")
+    return f"respondeu {saida[:40]!r}"
+
+
+def _prova_clickup(cfg):
+    """Quem sou eu para o ClickUp, e a lista responde?
+
+    Usa a MESMA chamada que o motor faz para despachar. Provar por outro caminho
+    provaria outra coisa.
+    """
+    eu = api(cfg, "GET", "/user")["user"]
+    lista = api(cfg, "GET", f"/list/{cfg.list_id}")
+    return f"autenticado como {eu['username']}; lista {lista['name']!r} respondeu"
+
+
+def _prova_git(cfg):
+    """Criar e remover uma worktree de verdade. Falha aqui é falha na primeira
+    sessão — e lá custa uma unidade inteira."""
+    alvo = Path(cfg.worktree_root) / f".prova-{os.getpid()}"
+    alvo.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "-C", str(cfg.repo), "worktree", "add", "--detach",
+                        str(alvo), cfg.base_branch],
+                       capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[:160])
+    subprocess.run(["git", "-C", str(cfg.repo), "worktree", "remove", "--force", str(alvo)],
+                   capture_output=True, text=True, timeout=60)
+    return f"criada e removida a partir de {cfg.base_branch}"
+
+
+def _prova_tmux():
+    nome = f"orq-prova-{os.getpid()}"
+    r = subprocess.run(["tmux", "new-session", "-d", "-s", nome, "true"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[:160])
+    subprocess.run(["tmux", "kill-session", "-t", nome], capture_output=True, timeout=20)
+    return "sessão aberta e encerrada"
+
+
 def cmd_doctor(cfg, args):
     ok = True
     def chk(label, good, detail="", fatal=True):
@@ -2004,17 +2070,15 @@ def cmd_doctor(cfg, args):
         subprocess.run(["claude", "--version"], capture_output=True,
                        text=True).stdout.strip()[:40] if shutil.which("claude") else "")
     chk("tmux", has_tmux(), "ok" if has_tmux() else "ausente → sem attach", fatal=False)
-    # Sessão sem login sobe, recebe a ordem de serviço e morre em "Login expired"
-    # sem produzir log nem notificação — o ClickUp fica marcado como se ela
-    # estivesse trabalhando. Falha barata de detectar, cara de descobrir depois.
-    try:
-        a = json.loads(subprocess.run(["claude", "auth", "status"], capture_output=True,
-                                      text=True, timeout=20).stdout)
-        chk("autenticado", bool(a.get("loggedIn")),
-            a.get("authMethod", "?") if a.get("loggedIn")
-            else "rode: claude auth login")
-    except Exception as e:
-        chk("autenticado", False, f"não consegui verificar ({e})")
+    # Sessão sem login sobe, recebe a ordem de serviço e morre em dois segundos
+    # sem produzir log — e o ClickUp fica marcado como se ela estivesse
+    # trabalhando. `claude auth status` NÃO detecta isso: responde loggedIn:true
+    # só por existir a variável de ambiente. A única prova é chamar.
+    if not args.rapido:
+        p_ok, p_ev = _prova(_prova_agente)
+        chk("o agente responde (chamada real)", p_ok, p_ev)
+    else:
+        chk("o agente responde", True, "pulado por --rapido — NÃO é prova", fatal=False)
     chk("orq na PATH (as sessões usam)", shutil.which("orq") is not None,
         shutil.which("orq") or "as sessões não conseguirão chamar `orq advance`")
     chk("hook de notificação", HOOK.exists() and os.access(HOOK, os.X_OK), str(HOOK))
@@ -2039,6 +2103,14 @@ def cmd_doctor(cfg, args):
     except SystemExit:
         chk("token do ClickUp", False, "não encontrado")
         return
+
+    for rotulo, fn in (("ClickUp responde (chamada real)", lambda: _prova_clickup(cfg)),
+                       ("git cria e remove worktree", lambda: _prova_git(cfg))):
+        p_ok, p_ev = _prova(fn)
+        chk(rotulo, p_ok, p_ev)
+    if has_tmux():
+        p_ok, p_ev = _prova(_prova_tmux)
+        chk("tmux abre e fecha sessão", p_ok, p_ev, fatal=False)
 
     order = status_order(cfg)
     print(f"\n{C['b']}Esteira declarada vs. status da lista{C['r']}")
@@ -2135,7 +2207,10 @@ def main():
         s.set_defaults(fn=fn, sem_config=sem_config)
         return s
 
-    add("doctor", cmd_doctor, "pré-voo: ferramentas, token, esteira, capacidade")
+    s = add("doctor", cmd_doctor, "pré-voo: prova cada dependência por chamada real")
+    s.add_argument("--rapido", action="store_true",
+                   help="pula a chamada ao agente (a mais demorada). NÃO é prova: "
+                        "use só quando já provou o agente há pouco.")
     s = add("board", cmd_board, "quadro completo por estágio")
     s.add_argument("-a", "--all", action="store_true", help="inclui concluídas")
     add("capacity", cmd_capacity, "recursos e limite de sessões simultâneas")

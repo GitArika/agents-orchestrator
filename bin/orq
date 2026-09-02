@@ -358,6 +358,104 @@ def comment(cfg: Config, task_id: str, text: str):
 
 # ---------------------------------------------------------------- capacidade
 
+# ---------------------------------------------------------------- host
+
+CGROUP = Path("/sys/fs/cgroup")
+
+
+def _cg_valor(texto: str):
+    """Número de um arquivo de cgroup. 'max' quer dizer SEM teto, não infinito."""
+    t = (texto or "").strip()
+    if not t or t == "max":
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _cg_evento(texto: str, chave: str) -> int:
+    """memory.events é uma linha 'chave valor' por evento."""
+    for linha in (texto or "").splitlines():
+        p = linha.split()
+        if len(p) == 2 and p[0] == chave:
+            try:
+                return int(p[1])
+            except ValueError:
+                return 0
+    return 0
+
+
+def _pressao_livre_pct(saida: str):
+    m = re.search(r"free percentage:\s*(\d+)%", saida or "")
+    return int(m.group(1)) if m else None
+
+
+def fatia_do_usuario():
+    """A fatia systemd desta sessão de usuário, quando existe cgroup v2."""
+    p = CGROUP / "user.slice" / f"user-{os.getuid()}.slice"
+    return p if (p / "memory.current").exists() else None
+
+
+def host_memoria() -> dict:
+    """O que LIMITA esta máquina agora, e por quê.
+
+    Em Linux com systemd o teto que importa é o da fatia do usuário, não o da
+    máquina. Em 02/09/2026 a fatia estava em 12,7 GB de 18, com o swap dela 100%
+    cheio e 1.104.943 freadas por memória, enquanto /proc/meminfo anunciava 16 GB
+    disponíveis. Despachar por esse número teria enfiado mais sessões dentro de
+    uma fatia que já sufocava.
+    """
+    def ler(p):
+        try:
+            return p.read_text()
+        except Exception:
+            return ""
+
+    fatia = fatia_do_usuario()
+    if fatia:
+        usado = _cg_valor(ler(fatia / "memory.current")) or 0.0
+        teto = _cg_valor(ler(fatia / "memory.max"))
+        sw_usado = _cg_valor(ler(fatia / "memory.swap.current")) or 0.0
+        sw_teto = _cg_valor(ler(fatia / "memory.swap.max"))
+        eventos = ler(fatia / "memory.events")
+        if teto:
+            g = 1024 ** 3
+            return {"fonte": f"fatia {fatia.name}",
+                    "disponivel_gb": max(0.0, (teto - usado) / g),
+                    "teto_gb": teto / g,
+                    "usado_gb": usado / g,
+                    "swap_pct": round(sw_usado * 100 / sw_teto) if sw_teto else 0,
+                    "freadas": _cg_evento(eventos, "high"),
+                    "oom": _cg_evento(eventos, "oom_kill")}
+
+    if sys.platform == "darwin":
+        try:
+            saida = subprocess.run(["memory_pressure"], capture_output=True,
+                                   text=True, timeout=5).stdout
+            pct = _pressao_livre_pct(saida)
+            if pct is not None:
+                total = total_ram_gb()
+                return {"fonte": "pressão de memória da Apple",
+                        "disponivel_gb": total * pct / 100, "teto_gb": total,
+                        "usado_gb": total * (100 - pct) / 100,
+                        "swap_pct": 0, "freadas": 0, "oom": 0}
+        except Exception:
+            pass
+
+    total = total_ram_gb()
+    disp = -1.0
+    try:
+        for linha in Path("/proc/meminfo").read_text().splitlines():
+            if linha.startswith("MemAvailable:"):
+                disp = int(linha.split()[1]) / 1024 ** 2
+    except Exception:
+        pass
+    return {"fonte": "máquina inteira", "disponivel_gb": disp, "teto_gb": total,
+            "usado_gb": max(0.0, total - disp), "swap_pct": 0,
+            "freadas": 0, "oom": 0}
+
+
 def total_ram_gb() -> float:
     try:
         if sys.platform == "darwin":
@@ -372,37 +470,8 @@ def total_ram_gb() -> float:
 
 
 def available_ram_gb() -> float:
-    """Memória recuperável, não apenas 'livre'.
-
-    Em macOS o 'free' engana: o kernel quase nada mantém livre e recupera páginas
-    inativas sob demanda. `memory_pressure` traz o número da própria Apple.
-    """
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.run(["memory_pressure"], capture_output=True,
-                                 text=True, timeout=5).stdout
-            m = re.search(r"free percentage:\s*(\d+)%", out)
-            if m:
-                return total_ram_gb() * int(m.group(1)) / 100
-        except Exception:
-            pass
-        try:
-            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
-            page = int(re.search(r"page size of (\d+)", out).group(1))
-            def pg(l):
-                m = re.search(rf"{l}:\s+(\d+)", out)
-                return int(m.group(1)) if m else 0
-            return (pg("Pages free") + pg("Pages inactive") + pg("Pages purgeable")
-                    + pg("Pages speculative")) * page / 1024 ** 3
-        except Exception:
-            return -1.0
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 1024 ** 2
-    except Exception:
-        pass
-    return -1.0
+    """Memória recuperável do que LIMITA esta máquina. Ver host_memoria()."""
+    return host_memoria()["disponivel_gb"]
 
 
 def session_rss_gb(cfg: Config) -> dict:
@@ -1120,6 +1189,49 @@ def cmd_board(cfg, args):
     if q:
         print(f"\n{C['b']}próximas{C['r']}: " +
               "  ".join(f"{r.unit.key}·{r.stage.key}" for r in q[:6]))
+
+
+def cmd_host(cfg, args):
+    """Relatório do que limita a máquina, e alerta quando aperta.
+
+    Não precisa de esteira nenhuma: serve para decidir se esta máquina aguenta
+    uma, e para diagnosticar quando ela para de aguentar. Os limiares são de
+    infraestrutura (tuning), não regra de negócio.
+    """
+    h = host_memoria()
+    lim_swap = int(os.environ.get("ORQ_SWAP_PCT", 70))
+    lim_mem = int(os.environ.get("ORQ_MEM_PCT", 80))
+    usado_pct = round(h["usado_gb"] * 100 / h["teto_gb"]) if h["teto_gb"] else 0
+
+    alertas = []
+    if h["swap_pct"] >= lim_swap:
+        alertas.append(f"swap em {h['swap_pct']}% do teto — daqui em diante cada "
+                       f"sessão nova entra em disputa por página")
+    if usado_pct >= lim_mem:
+        alertas.append(f"memória em {usado_pct}% do teto")
+    if h["oom"]:
+        alertas.append(f"o núcleo já matou {h['oom']} processo(s) por falta de memória")
+
+    if args.json:
+        print(json.dumps({**h, "usado_pct": usado_pct, "alertas": alertas},
+                         indent=2, ensure_ascii=False))
+        sys.exit(1 if alertas else 0)
+    if args.check:
+        for a in alertas:
+            print(f"  • {a}")
+        sys.exit(1 if alertas else 0)
+
+    print(f"Fonte: {h['fonte']}")
+    print(f"Uso:   {h['usado_gb']:.1f} GB de {h['teto_gb']:.1f} GB ({usado_pct}%)"
+          f" · disponível {h['disponivel_gb']:.1f} GB")
+    if h["freadas"]:
+        print(f"Freadas por excesso de memória: {h['freadas']} · "
+              f"mortes por falta: {h['oom']}")
+    if h["swap_pct"]:
+        print(f"Swap:  {h['swap_pct']}% do teto")
+    for a in alertas:
+        print(f"\nATENÇÃO: {a}")
+    sys.exit(1 if alertas else 0)
 
 
 def cmd_capacity(cfg, args):
@@ -2016,15 +2128,22 @@ def main():
     p.add_argument("--pipeline", help="caminho do pipeline.toml (ou $ORQ_PIPELINE)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, help):
+    def add(name, fn, help, sem_config=False):
         s = sub.add_parser(name, help=help)
-        s.set_defaults(fn=fn)
+        # `host` fala da MÁQUINA, não de uma esteira: precisa responder num
+        # diretório qualquer, inclusive antes de existir qualquer pipeline.toml.
+        s.set_defaults(fn=fn, sem_config=sem_config)
         return s
 
     add("doctor", cmd_doctor, "pré-voo: ferramentas, token, esteira, capacidade")
     s = add("board", cmd_board, "quadro completo por estágio")
     s.add_argument("-a", "--all", action="store_true", help="inclui concluídas")
     add("capacity", cmd_capacity, "recursos e limite de sessões simultâneas")
+    s = add("host", cmd_host, "o que limita esta máquina agora (dispensa esteira)",
+            sem_config=True)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--check", action="store_true",
+                   help="só alerta; sai com 1 quando há alerta")
     s = add("next", cmd_next, "fila priorizada do que pode começar")
     s.add_argument("-n", type=int, default=0)
     s.add_argument("--stage", help="restringe a um estágio")
@@ -2088,7 +2207,7 @@ def main():
     s.add_argument("unit"); s.add_argument("--stage")
 
     args = p.parse_args()
-    cfg = find_config(args.pipeline)
+    cfg = None if getattr(args, "sem_config", False) else find_config(args.pipeline)
     STATE.mkdir(parents=True, exist_ok=True)
     args.fn(cfg, args)
 

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Vigia de memória. Existe como nome próprio porque é assim que as pessoas o
+# procuram; a leitura de verdade é uma só, dentro do motor.
+exec "$(cd "$(dirname "$0")" && pwd)/orq" host "$@"

@@ -1709,6 +1709,22 @@ def cmd_hold(cfg, args):
     comment(cfg, r.unit.id,
             (f"AGUARDANDO {'CONDIÇÃO' if cond else 'DECISÃO HUMANA'}: "
              f"{args.reason}{sufixo}"))
+    # O quadro do ClickUp precisa dizer a verdade: enquanto isto espera uma
+    # pessoa, ninguém está trabalhando nela. Sem isto, quem abre a lista vê
+    # "revisando" e conclui que alguém está revisando. O status de origem já foi
+    # guardado na entrada de espera, ali em cima, e volta no `release`.
+    parado = cfg.sess("status_parado", "")
+    if parado and norm(r.unit.status) != norm(parado):
+        try:
+            set_status(cfg, r.unit.id, parado)
+            print(f"{C['d']}  status: {r.unit.status} → {parado} "
+                  f"(volta ao soltar){C['r']}")
+        except Exception as e:
+            # Falhar aqui não pode impedir a unidade de entrar em espera: o
+            # bloqueio é o que importa, o status é a visibilidade dele.
+            print(f"{C['yel']}!{C['r']} não consegui mover para '{parado}': "
+                  f"{str(e)[:120]}")
+
     finalize(cfg, r.unit, r.stage, outcome="hold", kill_delay=3)
     if cond:
         notify(f"⏳ {r.unit.key} espera {cond['unit']}",
@@ -1727,8 +1743,21 @@ def cmd_release(cfg, args):
     was = []
     if r.unit.id in st["quarantine"]:
         st["quarantine"].remove(r.unit.id); was.append("quarentena")
-    if st["hold"].pop(r.unit.id, None):
+    entrada = st["hold"].pop(r.unit.id, None)
+    if entrada:
         was.append("espera humana")
+        # Devolve ao status de onde saiu, não a um lugar arbitrário: a unidade
+        # tem de voltar para a mesma fila em que estava quando travou.
+        origem = entrada.get("status")
+        parado = cfg.sess("status_parado", "")
+        if origem and parado and norm(r.unit.status) == norm(parado):
+            try:
+                set_status(cfg, r.unit.id, origem)
+                print(f"{C['d']}  status: {parado} → {origem} "
+                      f"(de onde ela saiu){C['r']}")
+            except Exception as e:
+                print(f"{C['yel']}!{C['r']} não consegui devolver a '{origem}': "
+                      f"{str(e)[:120]}")
     st["strikes"].pop(r.unit.id, None)
     if args.reset_rework:
         st["rework"].pop(r.unit.id, None); was.append("contador de retrabalho")

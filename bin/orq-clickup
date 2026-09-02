@@ -281,30 +281,88 @@ const commands = {
   // Cria na lista os status que faltam para a esteira funcionar. Simulação por
   // padrão: mexer nos status de uma lista com trabalho de verdade é decisão de
   // quem é dono do processo, não da ferramenta.
+  // Cria na lista os status que faltam para a esteira funcionar.
+  //
+  // DUAS ARMADILHAS, as duas descobertas escrevendo isto em 02/09/2026:
+  //
+  // 1. Uma lista costuma HERDAR os status da pasta ou do espaço
+  //    (override_statuses: false). Escrever status nela exige ligar a
+  //    substituição — o que muda a lista e é decisão de quem é dono do processo.
+  // 2. A API aceitou o PUT e respondeu 200 SEM APLICAR NADA. Por isso esta
+  //    função relê a lista depois de escrever e compara. Ferramenta que acredita
+  //    na resposta da API mente para quem confia nela.
   async 'status-provisionar'([id, ...flags]) {
-    if (!id) die('uso: status-provisionar <listId|alias> [--aplicar]')
+    if (!id) die('uso: status-provisionar <listId|alias> [--aplicar] [--substituir]')
     const listId = resolveId('LIST', id)
-    const l = await api('GET', `/list/${listId}`)
-    const existentes = (l.statuses || []).map((s) => s.status.toLowerCase())
+    const antes = await api('GET', `/list/${listId}`)
+    const existentes = (antes.statuses || []).map((s) => s.status.toLowerCase())
     const faltando = STATUS_CANONICOS.filter((s) => !existentes.includes(s.status))
 
-    linha(`lista: ${l.name} (${l.id})`)
+    linha(`lista: ${antes.name} (${antes.id})`)
     linha(`já tem: ${existentes.join(' · ') || '(nenhum)'}`)
     if (!faltando.length) return linha('nada a criar — os dez status já existem.')
-    linha(`vai criar: ${faltando.map((s) => s.status).join(' · ')}`)
-    // NUNCA renomear nem apagar status existente: pode haver tarefa nele.
+    linha(`falta:  ${faltando.map((s) => s.status).join(' · ')}`)
+
+    const herda = !antes.override_statuses
+    if (herda) {
+      linha('')
+      linha(`ATENÇÃO: esta lista HERDA os status da pasta "${antes.folder?.name}"`)
+      linha(`(espaço "${antes.space?.name}"). Para ela ter os status da esteira,`)
+      linha('é preciso ligar a substituição de status — e isso muda a lista:')
+      linha('ela deixa de acompanhar mudanças feitas na pasta.')
+      linha('')
+      linha('Se a esteira vai ocupar a pasta inteira, o certo é definir os status')
+      linha('na PASTA, não aqui. Isso é decisão de quem é dono do processo.')
+    }
+
+    // A substituição define o conjunto INTEIRO. Os status atuais são preservados
+    // para que nenhuma tarefa perca o lugar onde está — mas a lista precisa de
+    // exatamente um status de abertura e um de fechamento, então os tipos são
+    // normalizados e isso é dito em voz alta antes de escrever.
+    const preservados = (antes.statuses || [])
+      .filter((s) => !STATUS_CANONICOS.some((c) => c.status === s.status.toLowerCase()))
+      .map((s) => ({ status: s.status, type: 'custom' }))
+    const conjunto = [
+      { status: 'backlog', type: 'open' },
+      ...preservados,
+      ...STATUS_CANONICOS.filter((s) => s.status !== 'backlog' && s.status !== 'pronto')
+        .map((s) => ({ status: s.status, type: 'custom' })),
+      { status: 'pronto', type: 'closed' },
+    ].map((s, i) => ({ ...s, orderindex: i }))
+
+    linha('')
+    linha('a lista ficaria assim:')
+    for (const s of conjunto) linha(`  ${String(s.orderindex).padStart(2)}. ${s.status}  (${s.type})`)
+    const rebaixados = preservados.filter((s) =>
+      (antes.statuses || []).some((a) => a.status === s.status && a.type !== 'custom'))
+    if (rebaixados.length) {
+      linha('')
+      linha(`MUDA DE SIGNIFICADO: ${rebaixados.map((s) => s.status).join(', ')} deixa(m)`)
+      linha('de contar como aberto/fechado e vira(m) status do meio.')
+    }
+
     if (!flag(flags, 'aplicar')) {
       return linha('\nsimulação — nada foi escrito. Para criar de verdade: --aplicar')
     }
-    const base = (l.statuses || []).map((s, i) => ({
-      status: s.status, type: s.type, orderindex: i,
-    }))
-    await api('PUT', `/list/${listId}`, {
-      statuses: [...base, ...faltando.map((s, i) => ({
-        status: s.status, type: s.type, orderindex: base.length + i,
-      }))],
-    })
-    linha(`\n${faltando.length} status criado(s).`)
+    if (herda && !flag(flags, 'substituir')) {
+      die('\nPAREI: a lista herda os status. Releia o aviso acima e, se for isso\n'
+        + 'mesmo que você quer, repita com --substituir.')
+    }
+
+    await api('PUT', `/list/${listId}`, { override_statuses: true, statuses: conjunto })
+
+    // Conferir. A API já respondeu sucesso sem aplicar nada.
+    const depois = await api('GET', `/list/${listId}`)
+    const agora = (depois.statuses || []).map((s) => s.status.toLowerCase())
+    const ainda = STATUS_CANONICOS.filter((s) => !agora.includes(s.status))
+    linha('')
+    linha(`a lista tem agora: ${agora.join(' · ')}`)
+    if (ainda.length) {
+      die(`FALHOU: a API respondeu sucesso, mas ainda falta: `
+        + `${ainda.map((s) => s.status).join(' · ')}\n`
+        + 'Não confie na resposta dela; foi por isso que esta conferência existe.')
+    }
+    linha(`✓ os dez status da esteira estão na lista.`)
   },
 
   async lists([folder]) {

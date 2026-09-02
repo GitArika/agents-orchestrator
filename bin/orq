@@ -630,6 +630,16 @@ Se algum falhar, PARE e reporte: sem eles os portões falham por motivo errado.
 PORTÕES desta esteira (a partir de {worktree}/{work_sub}):
 {gates}
 {browser}{publish}
+A CERCA — há um guarda que roda antes de cada comando seu e pode barrar. Ele
+não é anulável e existe para conter engano, não para desconfiar de você. Não
+passa: publicar ou fundir fora do estágio de integração; publicar com força,
+espelho ou remoção de branch; elevar privilégio; publicar pacote; baixar e
+executar script da rede; apagar recursivamente fora desta worktree; ler ou
+escrever credencial de gente de verdade.
+
+Se você for barrado, a saída NÃO é contornar nem tentar outro jeito — é um dos
+três encerramentos abaixo. A mensagem da cerca diz o motivo e o que fazer.
+
 ENCERRAMENTO — toda sessão termina por UM destes três caminhos. Encerrar sem
 nenhum deles deixa a unidade parada num status de trabalho, e a esteira lê isso
 como sessão morta: ela reinicia o trabalho do zero e conta uma falta.

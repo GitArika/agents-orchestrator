@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Entrega um aviso a uma PESSOA.
+
+O motor chama assim:  orq-avisar "<título>" "<mensagem>"
+(e também põe ORQ_NOTIFY_TITLE / ORQ_NOTIFY_MSG no ambiente).
+
+Duas regras que este arquivo não pode quebrar:
+
+  * NUNCA derrubar quem chamou. O Claude Code trata saída diferente de zero num
+    gancho como erro do turno, e o laço do motor chama isto nos pontos terminais
+    — quarentena, reprovação, espera humana. Sai 0 sempre, aconteça o que
+    acontecer.
+  * Autoria correta. Usa o token PESSOAL do dono, o mesmo que assina os
+    comentários das tarefas. Uma mensagem que chega com o nome de outra pessoa é
+    pior do que mensagem nenhuma.
+
+Numa máquina sem tela, o aviso do sistema não existe e o registro em arquivo não
+é lido por ninguém: a espera humana só se descobria consultando o quadro à mão.
+Por isso os destinos são configuráveis.
+
+  ORQ_AVISO_DESTINO       clickup,macos,webhook  (lista separada por vírgula)
+  ORQ_AVISO_CANAL         id do canal de conversa do ClickUp
+  ORQ_AVISO_WORKSPACE     id do espaço de trabalho
+  ORQ_AVISO_MENCIONAR     id da pessoa a mencionar (opcional)
+  ORQ_AVISO_WEBHOOK       endereço que recebe um POST em JSON
+  ORQ_AVISO_RODAPE        uma linha dizendo onde a esteira mora
+"""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.request
+
+CREDENCIAIS = pathlib.Path.home() / ".config" / "orquestrador" / "credenciais.env"
+REGISTRO = pathlib.Path(os.environ.get(
+    "ORQ_LOG_DIR", pathlib.Path.home() / ".claude" / "orchestrator" / "state")) / "avisos.log"
+
+
+def token() -> str:
+    for linha in CREDENCIAIS.read_text().splitlines():
+        linha = linha.strip()
+        if linha.startswith("#") or "=" not in linha:
+            continue
+        chave, valor = linha.split("=", 1)
+        if chave.strip().upper() in ("CLICKUP_API_KEY", "API_TOKEN"):
+            return valor.strip().strip('"').strip("'")
+    raise RuntimeError(f"CLICKUP_API_KEY não está em {CREDENCIAIS}")
+
+
+def registrar(unidade, titulo, msg):
+    """O canal que sempre existe. Acontece antes de qualquer entrega."""
+    REGISTRO.parent.mkdir(parents=True, exist_ok=True)
+    with REGISTRO.open("a") as f:
+        import time
+        f.write(f"{time.strftime('%FT%TZ', time.gmtime())}\t{unidade}\t{titulo}\t"
+                f"{msg.replace(chr(10), ' ')}\n")
+
+
+def para_clickup(unidade, titulo, msg):
+    canal = os.environ.get("ORQ_AVISO_CANAL", "")
+    ws = os.environ.get("ORQ_AVISO_WORKSPACE", "")
+    if not (canal and ws):
+        raise RuntimeError("faltam ORQ_AVISO_CANAL e ORQ_AVISO_WORKSPACE")
+    quem = os.environ.get("ORQ_AVISO_MENCIONAR", "")
+    corpo = f"**{titulo}**\n\n{msg}"
+    if quem:
+        corpo = f"[@](#user_mention#{quem}) " + corpo
+    if unidade:
+        corpo += f"\n\n_sessão_: `{unidade}`"
+    rodape = os.environ.get("ORQ_AVISO_RODAPE", "")
+    if rodape:
+        corpo += f"\n\n_{rodape}_"
+    req = urllib.request.Request(
+        f"https://api.clickup.com/api/v3/workspaces/{ws}/chat/channels/{canal}/messages",
+        data=json.dumps({"type": "message", "content": corpo,
+                         "content_format": "text/md"}).encode(),
+        headers={"Authorization": token(), "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r).get("data", {}).get("id", "enviado")
+
+
+def para_macos(titulo, msg):
+    if not pathlib.Path("/usr/bin/osascript").exists():
+        raise RuntimeError("não é macOS")
+    limpo = lambda t: t.replace('"', "'")
+    subprocess.run(["/usr/bin/osascript", "-e",
+                    f'display notification "{limpo(msg)}" with title "{limpo(titulo)}" '
+                    f'sound name "Ping"'], capture_output=True, timeout=15)
+    return "notificação exibida"
+
+
+def para_webhook(unidade, titulo, msg):
+    url = os.environ.get("ORQ_AVISO_WEBHOOK", "")
+    if not url:
+        raise RuntimeError("falta ORQ_AVISO_WEBHOOK")
+    req = urllib.request.Request(
+        url, data=json.dumps({"unidade": unidade, "titulo": titulo,
+                              "texto": msg}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return f"HTTP {r.status}"
+
+
+def principal():
+    titulo = (sys.argv[1] if len(sys.argv) > 1
+              else os.environ.get("ORQ_NOTIFY_TITLE", "")).strip()
+    msg = (sys.argv[2] if len(sys.argv) > 2
+           else os.environ.get("ORQ_NOTIFY_MSG", "")).strip()
+    if not (titulo or msg):
+        return
+    unidade = os.environ.get("ORQ_UNIT", "")
+
+    try:
+        registrar(unidade, titulo, msg)
+    except Exception as e:
+        print(f"orq-avisar: nem o registro funcionou ({e})", file=sys.stderr)
+
+    destinos = [d.strip() for d in os.environ.get("ORQ_AVISO_DESTINO", "macos").split(",")
+                if d.strip()]
+    for d in destinos:
+        try:
+            if d == "clickup":
+                print(f"clickup: {para_clickup(unidade, titulo, msg)}")
+            elif d == "macos":
+                print(f"macos: {para_macos(titulo, msg)}")
+            elif d == "webhook":
+                print(f"webhook: {para_webhook(unidade, titulo, msg)}")
+            else:
+                print(f"orq-avisar: destino desconhecido '{d}'", file=sys.stderr)
+        except Exception as e:
+            # Entrega falha; registro já aconteceu. Nunca derruba quem chamou.
+            print(f"orq-avisar: não entreguei em '{d}' ({e})", file=sys.stderr)
+
+
+try:
+    principal()
+except Exception as e:
+    print(f"orq-avisar: {e}", file=sys.stderr)
+sys.exit(0)

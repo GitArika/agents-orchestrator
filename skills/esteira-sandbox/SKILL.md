@@ -96,5 +96,5 @@ lugar errado. Nomeie o log pela cópia de trabalho.
 
 ## Referência
 
-`referencia-exemplo.md`, ao lado deste arquivo: uma implementação real, com os números do
+`referencia-esteira-sandbox.md`, ao lado deste arquivo: uma implementação real, com os números do
 vazamento e o que cada decisão evitou.

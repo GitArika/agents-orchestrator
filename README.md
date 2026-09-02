@@ -16,8 +16,8 @@ descobre até perguntar.
 ## Os primeiros dez minutos
 
 ```bash
-git clone <endereço deste repositório> ~/truss/orquestrador
-cd ~/truss/orquestrador
+git clone <endereço deste repositório> ~/orquestrador
+cd ~/orquestrador
 ./instalar.sh                    # guiado; --simular mostra tudo sem escrever nada
 
 cd <o seu projeto>

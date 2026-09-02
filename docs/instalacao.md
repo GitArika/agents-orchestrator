@@ -1,8 +1,8 @@
 # Instalação
 
 ```bash
-git clone <endereço deste repositório> ~/truss/orquestrador
-cd ~/truss/orquestrador
+git clone <endereço deste repositório> ~/orquestrador
+cd ~/orquestrador
 ./instalar.sh
 ```
 
@@ -78,7 +78,7 @@ terminar. Sem o comando na PATH, elas não conseguem se despedir, e a unidade fi
 ## Atualizar
 
 ```bash
-cd ~/truss/orquestrador
+cd ~/orquestrador
 git pull
 ./instalar.sh
 ```
@@ -103,7 +103,7 @@ A troca é um passo consciente. Nada acontece sozinho.
 2. **Instale**, aceitando substituir:
 
    ```bash
-   cd ~/truss/orquestrador && ./instalar.sh --substituir-instalacao
+   cd ~/orquestrador && ./instalar.sh --substituir-instalacao
    ```
 
 3. **Mova a credencial**, se ela estava dentro de algum repositório:

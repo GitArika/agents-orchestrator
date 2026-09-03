@@ -89,5 +89,53 @@ class TetoPorEstagio(unittest.TestCase):
         self.assertEqual(orq.teto_do_estagio(self.cfg({"spec": 6}), None), 0)
 
 
+class AmbienteDaSessaoTmux(unittest.TestCase):
+    """O ambiente por unidade tem de viajar por `-e`, não por `env=`.
+
+    `subprocess.run(env=...)` só alcança o CLIENTE tmux. Quando o servidor já
+    está de pé — e ele fica de pé por dias, compartilhado por TODAS as esteiras
+    da máquina — a sessão nova herda o ambiente do SERVIDOR, congelado na
+    primeira sessão que o criou. Em 03/09/2026 isso pôs quatro sessões vivas
+    carregando o `ORQ_UNIT` de uma quinta, e sessões do app-exemplo nascendo com o
+    `ORQ_PIPELINE` de outro projeto — `orq show` respondia "unidade não está no
+    pipeline.toml" e havia risco real de escrever na lista do projeto errado.
+    Foi relatado três vezes antes de alguém ver a causa.
+    """
+
+    def args(self, ambiente=None, cmd=None):
+        if ambiente is None:
+            ambiente = {"ORQ_UNIT": "CAT-04-integrate"}
+        return orq.argumentos_new_session(
+            "s-1", "/tmp/wt", ambiente, cmd or ["claude", "oi"])
+
+    def test_cada_variavel_vai_por_e(self):
+        a = self.args({"ORQ_UNIT": "CAT-04-integrate", "ORQ_PIPELINE": "/p.toml"})
+        self.assertIn("-e", a)
+        self.assertIn("ORQ_UNIT=CAT-04-integrate", a)
+        self.assertIn("ORQ_PIPELINE=/p.toml", a)
+
+    def test_cada_e_precede_o_seu_valor(self):
+        a = self.args({"ORQ_UNIT": "X", "ORQ_PIPELINE": "/p.toml"})
+        for i, v in enumerate(a):
+            if v.startswith("ORQ_"):
+                self.assertEqual(a[i - 1], "-e", f"{v} sem o -e à frente")
+
+    def test_o_comando_vem_depois_das_opcoes(self):
+        # tmux trata o primeiro argumento livre como o comando do painel: uma
+        # opção depois dele viraria argumento do comando, em silêncio.
+        a = self.args(cmd=["claude", "--settings", "/s.json"])
+        self.assertEqual(a[-3:], ["claude", "--settings", "/s.json"])
+        self.assertNotIn("-e", a[a.index("claude"):])
+
+    def test_sessao_e_diretorio_declarados(self):
+        a = self.args()
+        self.assertEqual(a[:4], ["tmux", "new-session", "-d", "-s"])
+        self.assertEqual(a[4], "s-1")
+        self.assertEqual(a[a.index("-c") + 1], "/tmp/wt")
+
+    def test_sem_ambiente_nao_inventa_e(self):
+        self.assertNotIn("-e", self.args(ambiente={}))
+
+
 if __name__ == "__main__":
     unittest.main()

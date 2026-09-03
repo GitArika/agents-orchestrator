@@ -998,6 +998,33 @@ def ensure_worktree(cfg: Config, u: Unit) -> tuple:
     return wt, branch
 
 
+def argumentos_new_session(nome: str, wt, ambiente: dict, cmd: list) -> list:
+    """Monta o `tmux new-session` levando o ambiente da unidade por `-e`.
+
+    `subprocess.run(env=...)` só alcança o CLIENTE tmux. Quando o servidor já
+    está de pé, a sessão nova herda o ambiente do SERVIDOR — congelado na
+    primeira sessão que o criou — e o `env=` do cliente não chega a lugar
+    nenhum. O servidor fica de pé por dias e é COMPARTILHADO por todas as
+    esteiras da máquina, então isso não é caso de canto: é o caso comum.
+
+    O sintoma foi caro e mudo. Em 03/09/2026, quatro sessões vivas do app-exemplo
+    carregavam o `ORQ_UNIT` de uma quinta, e sessões nasciam com o
+    `ORQ_PIPELINE` de outro projeto: `orq show` respondia "unidade não está no
+    pipeline.toml" e havia risco real de a sessão escrever na lista do projeto
+    errado. Foi relatado em três sessões antes de alguém olhar para o servidor.
+
+    `-e` (tmux ≥ 3.2) põe a variável no ambiente da SESSÃO, que é o único escopo
+    por unidade que existe aqui. O pré-voo prova a versão; sem ela, o tmux
+    recusa a opção e a sessão não sobe — falha ALTA, que é o que se quer.
+    """
+    args = ["tmux", "new-session", "-d", "-s", nome, "-c", str(wt)]
+    for chave in sorted(ambiente):
+        args += ["-e", f"{chave}={ambiente[chave]}"]
+    # O comando por último, sempre: tmux trata o primeiro argumento livre como o
+    # comando do painel, e uma opção depois dele viraria argumento DELE, calado.
+    return args + list(cmd)
+
+
 def launch(cfg: Config, u: Unit, stage: Stage, attach: bool = False) -> str:
     STATE.mkdir(parents=True, exist_ok=True)
     wt, branch = ensure_worktree(cfg, u)
@@ -1019,12 +1046,15 @@ def launch(cfg: Config, u: Unit, stage: Stage, attach: bool = False) -> str:
     cmd += [f"Leia e siga integralmente o briefing em {brief}. "
             f"Ele é a sua única ordem de serviço."]
 
-    env = {**os.environ, "ORQ_UNIT": label, "ORQ_LOG_DIR": str(STATE),
-           "ORQ_PIPELINE": str(cfg.path)}
+    # O que a sessão precisa ver com o valor DESTA unidade. Vai por `-e` no tmux
+    # (ver argumentos_new_session) e por `env=` no caminho sem tmux.
+    ambiente_unidade = {"ORQ_UNIT": label, "ORQ_LOG_DIR": str(STATE),
+                        "ORQ_PIPELINE": str(cfg.path)}
+    env = {**os.environ, **ambiente_unidade}
     name = sess_name(cfg, u.id)
     if has_tmux():
         subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
-        subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(wt)] + cmd,
+        subprocess.run(argumentos_new_session(name, wt, ambiente_unidade, cmd),
                        env=env, check=True)
         subprocess.run(["tmux", "pipe-pane", "-t", name, "-o", f"cat >> {logf}"],
                        capture_output=True)
@@ -2254,12 +2284,25 @@ def _prova_git(cfg):
 
 def _prova_tmux():
     nome = f"orq-prova-{os.getpid()}"
-    r = subprocess.run(["tmux", "new-session", "-d", "-s", nome, "true"],
+    # Prova o `-e` junto, porque é dele que o lançador depende para dar a CADA
+    # sessão o seu próprio ORQ_UNIT/ORQ_PIPELINE (ver argumentos_new_session).
+    # Provar só "abre uma sessão" deixaria passar um tmux < 3.2, e o defeito
+    # apareceria lá na frente como sessão trabalhando na unidade errada.
+    r = subprocess.run(["tmux", "new-session", "-d", "-s", nome,
+                        "-e", "ORQ_PROVA=1", "true"],
                        capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip()[:160])
+        erro = r.stderr.strip()[:160]
+        if "-e" in erro or "usage" in erro.lower():
+            erro = f"{erro} — o lançador exige tmux >= 3.2 (aqui: {_versao_tmux()})"
+        raise RuntimeError(erro)
     subprocess.run(["tmux", "kill-session", "-t", nome], capture_output=True, timeout=20)
-    return "sessão aberta e encerrada"
+    return f"sessão aberta e encerrada, com ambiente por -e ({_versao_tmux()})"
+
+
+def _versao_tmux():
+    r = subprocess.run(["tmux", "-V"], capture_output=True, text=True, timeout=10)
+    return r.stdout.strip() or "versão desconhecida"
 
 
 def descobrir_projeto(raiz: Path) -> dict:

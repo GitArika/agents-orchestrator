@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""O medidor da esteira.
+
+A esteira deixa rastro farto em oito lugares que não conversam entre si. Este
+programa os lê e responde, por unidade de trabalho, quanto tempo levou, quantas
+vezes voltou, quanto esperou por uma pessoa, quantos tokens consumiu e quanto
+código produziu.
+
+Ele SÓ LÊ. Escreve exclusivamente no próprio armazém, nunca no estado da esteira,
+e nunca toca em sessão que ainda está em curso.
+
+Desenho: docs/especificacoes/2026-09-02-medicao-desenho.md
+"""
+import argparse
+import os
+import pathlib
+import sqlite3
+import sys
+
+ARMAZEM_PADRAO = pathlib.Path.home() / ".claude/orchestrator/state/medicao.db"
+
+# --------------------------------------------------------------------------- #
+# O esquema
+# --------------------------------------------------------------------------- #
+
+DDL = """
+CREATE TABLE IF NOT EXISTS maquina (
+  id    INTEGER PRIMARY KEY,
+  nome  TEXT NOT NULL UNIQUE,
+  papel TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS esteira (
+  id             INTEGER PRIMARY KEY,
+  nome           TEXT NOT NULL UNIQUE,
+  projeto        TEXT,
+  arquivo_config TEXT
+);
+
+CREATE TABLE IF NOT EXISTS unidade (
+  id         INTEGER PRIMARY KEY,
+  esteira_id INTEGER NOT NULL REFERENCES esteira(id),
+  codigo     TEXT NOT NULL,
+  tarefa     TEXT NOT NULL,
+  titulo     TEXT,
+  branch     TEXT,
+  UNIQUE (esteira_id, codigo)
+);
+
+CREATE TABLE IF NOT EXISTS sessao (
+  id              INTEGER PRIMARY KEY,
+  unidade_id      INTEGER NOT NULL REFERENCES unidade(id),
+  maquina_id      INTEGER NOT NULL REFERENCES maquina(id),
+  etapa           TEXT NOT NULL,
+  inicio          TEXT,
+  inicio_deduzido INTEGER NOT NULL DEFAULT 0,
+  fim             TEXT,
+  fim_deduzido    INTEGER NOT NULL DEFAULT 0,
+  desfecho        TEXT,
+  desfecho_bruto  TEXT,
+  status_final    TEXT,
+  pasta           TEXT,
+  chave           TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS consumo (
+  id                   INTEGER PRIMARY KEY,
+  sessao_id            INTEGER REFERENCES sessao(id),
+  unidade_id           INTEGER REFERENCES unidade(id),
+  transcricao          TEXT NOT NULL,
+  modelo               TEXT NOT NULL,
+  mensagens            INTEGER NOT NULL,
+  tokens_entrada       INTEGER NOT NULL,
+  tokens_saida         INTEGER NOT NULL,
+  tokens_cache_leitura INTEGER NOT NULL,
+  tokens_cache_escrita INTEGER NOT NULL,
+  primeiro_ts          TEXT,
+  ultimo_ts            TEXT,
+  UNIQUE (transcricao, modelo)
+);
+
+CREATE TABLE IF NOT EXISTS evento (
+  id         INTEGER PRIMARY KEY,
+  unidade_id INTEGER REFERENCES unidade(id),
+  sessao_id  INTEGER REFERENCES sessao(id),
+  maquina_id INTEGER REFERENCES maquina(id),
+  ts         TEXT NOT NULL,
+  origem     TEXT NOT NULL,
+  tipo       TEXT NOT NULL,
+  autor      TEXT,
+  texto      TEXT,
+  chave      TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS commit_unidade (
+  sha        TEXT PRIMARY KEY,
+  unidade_id INTEGER REFERENCES unidade(id),
+  ts         TEXT NOT NULL,
+  arquivos   INTEGER,
+  insercoes  INTEGER,
+  delecoes   INTEGER,
+  mensagem   TEXT
+);
+
+-- Nasce vazia de propósito. Preço é regra de negócio: enquanto ninguém a
+-- preencher, custo em dinheiro é desconhecido, jamais um número inventado.
+CREATE TABLE IF NOT EXISTS preco_modelo (
+  modelo                   TEXT NOT NULL,
+  vigencia_inicio          TEXT NOT NULL,
+  moeda                    TEXT NOT NULL,
+  entrada_por_milhao       REAL NOT NULL,
+  saida_por_milhao         REAL NOT NULL,
+  cache_leitura_por_milhao REAL NOT NULL,
+  cache_escrita_por_milhao REAL NOT NULL,
+  PRIMARY KEY (modelo, vigencia_inicio)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessao_unidade ON sessao(unidade_id);
+CREATE INDEX IF NOT EXISTS idx_evento_unidade ON evento(unidade_id);
+CREATE INDEX IF NOT EXISTS idx_evento_ts      ON evento(ts);
+"""
+
+
+def abrir(caminho=ARMAZEM_PADRAO):
+    """Abre o armazém, criando o esquema se faltar. Seguro repetir."""
+    caminho = pathlib.Path(caminho)
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(caminho)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    con.executescript(DDL)
+    con.commit()
+    return con
+
+
+# --------------------------------------------------------------------------- #
+# Identidade
+# --------------------------------------------------------------------------- #
+
+def chave_sessao(maquina, esteira, unidade, etapa, carimbo):
+    """A identidade de uma sessão.
+
+    É campo próprio, e não combinação de colunas, porque sessão recolhida sem
+    despacho não tem início — e coluna vazia não conta como repetida na
+    comparação do banco, o que faria cada coleta criar uma linha nova para a
+    mesma sessão, inflando a contagem sem ninguém notar.
+    """
+    partes = [str(p or "") for p in (maquina, esteira, unidade, etapa, carimbo)]
+    if not any(partes):
+        raise ValueError("chave de sessão não pode ser vazia")
+    return "|".join(partes)
+
+
+def chave_evento(maquina, origem, tipo, ts, alvo):
+    partes = [str(p or "") for p in (maquina, origem, tipo, ts, alvo)]
+    return "|".join(partes)
+
+
+# --------------------------------------------------------------------------- #
+# Linha de comando
+# --------------------------------------------------------------------------- #
+
+def cmd_esquema(args):
+    con = abrir(args.armazem)
+    tabelas = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    con.close()
+    print(f"armazém pronto: {args.armazem}")
+    print("tabelas: " + ", ".join(tabelas))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="orq-medir",
+        description="Mede a esteira a partir do rastro que ela já deixa.")
+    p.add_argument("--armazem", default=str(ARMAZEM_PADRAO),
+                   help="onde fica o armazém (padrão: %(default)s)")
+    sub = p.add_subparsers(dest="comando", required=True)
+
+    s = sub.add_parser("esquema", help="cria ou atualiza o armazém")
+    s.set_defaults(func=cmd_esquema)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

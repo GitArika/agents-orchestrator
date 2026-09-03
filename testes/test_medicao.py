@@ -159,5 +159,56 @@ class Casamento(unittest.TestCase):
         self.assertTrue(fechada["inicio_deduzido"])
 
 
+class TarefaDoBranch(unittest.TestCase):
+    def test_extrai_o_id(self):
+        self.assertEqual(
+            medir.tarefa_do_branch("CU-868kyu9v4-ligar-o-otimizador-automatic"),
+            "868kyu9v4")
+
+    def test_branch_de_fora_da_esteira(self):
+        self.assertIsNone(medir.tarefa_do_branch("homol"))
+        self.assertIsNone(medir.tarefa_do_branch(None))
+
+
+class Consumo(unittest.TestCase):
+    def test_soma_por_modelo(self):
+        linhas = medir.consumo_de_transcricao(MATERIAL / "transcricao-curta.jsonl")
+        self.assertEqual(len(linhas), 1)
+        c = linhas[0]
+        self.assertEqual(c["modelo"], "claude-opus-5")
+        self.assertEqual(c["mensagens"], 2)
+        self.assertEqual(c["tokens_saida"], 30)
+        self.assertEqual(c["tokens_cache_leitura"], 300)
+        self.assertEqual(c["tokens_entrada"], 8)
+        self.assertEqual(c["tarefa"], "868kyu9v4")
+        self.assertEqual(c["primeiro_ts"], "2026-08-31T20:10:00Z")
+        self.assertEqual(c["ultimo_ts"], "2026-08-31T20:11:00Z")
+
+    def test_linha_truncada_nao_derruba_a_leitura(self):
+        # Transcricao de sessao que morreu no meio termina numa linha partida.
+        # Se isso derrubar a leitura, perde-se a sessao inteira em silencio.
+        linhas = medir.consumo_de_transcricao(MATERIAL / "transcricao-curta.jsonl")
+        self.assertTrue(linhas)
+
+
+class JanelaDaSessao(unittest.TestCase):
+    SESSOES = [
+        {"id": 1, "inicio": "2026-08-31T20:00:00Z", "fim": "2026-08-31T20:30:00Z"},
+        {"id": 2, "inicio": "2026-08-31T21:00:00Z", "fim": "2026-08-31T21:30:00Z"},
+    ]
+
+    def test_escolhe_a_janela_que_contem(self):
+        self.assertEqual(medir.sessao_da_janela(self.SESSOES, "2026-08-31T20:10:00Z")["id"], 1)
+        self.assertEqual(medir.sessao_da_janela(self.SESSOES, "2026-08-31T21:05:00Z")["id"], 2)
+
+    def test_fora_de_qualquer_janela_nao_inventa(self):
+        self.assertIsNone(medir.sessao_da_janela(self.SESSOES, "2026-08-31T20:45:00Z"))
+        self.assertIsNone(medir.sessao_da_janela(self.SESSOES, None))
+
+    def test_sessao_sem_fim_nao_engole_tudo(self):
+        abertas = [{"id": 3, "inicio": "2026-08-31T20:00:00Z", "fim": None}]
+        self.assertIsNone(medir.sessao_da_janela(abertas, "2026-09-05T00:00:00Z"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

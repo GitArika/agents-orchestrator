@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import sys
 
@@ -362,14 +363,158 @@ def gravar_sessoes(con, maquina, papel, sessoes):
     return n
 
 
+# --------------------------------------------------------------------------- #
+# O consumo
+# --------------------------------------------------------------------------- #
+
+RE_TAREFA = re.compile(r"^CU-([0-9A-Za-z]+)-")
+
+
+def tarefa_do_branch(branch):
+    """O id da tarefa mora no nome do branch que a esteira criou."""
+    if not branch:
+        return None
+    m = RE_TAREFA.match(str(branch))
+    return m.group(1) if m else None
+
+
+def _iso(ts):
+    """Carimbo em ISO 8601 UTC, sem fração de segundo, sempre terminando em Z."""
+    if not ts:
+        return None
+    ts = str(ts)
+    if "." in ts:
+        return ts.split(".", 1)[0] + "Z"
+    if ts.endswith("+00:00"):
+        return ts[:-6] + "Z"
+    return ts if ts.endswith("Z") else ts + "Z"
+
+
+def consumo_de_transcricao(caminho):
+    """Soma tokens por modelo numa transcrição.
+
+    Linha que não decodifica é pulada em silêncio: transcrição de sessão que
+    morreu no meio termina numa linha partida, e deixar isso derrubar a leitura
+    perderia a sessão inteira sem ninguém perceber.
+    """
+    caminho = pathlib.Path(caminho)
+    por_modelo = {}
+    tarefa = None
+    try:
+        texto = caminho.read_text(errors="replace")
+    except OSError:
+        return []
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            d = json.loads(linha)
+        except json.JSONDecodeError:
+            continue
+        if not tarefa:
+            tarefa = (tarefa_do_branch(d.get("gitBranch"))
+                      or tarefa_do_branch(pathlib.Path(d.get("cwd") or "").name))
+        m = d.get("message") or {}
+        u = m.get("usage")
+        if not u:
+            continue
+        modelo = m.get("model") or "(desconhecido)"
+        c = por_modelo.setdefault(modelo, {
+            "transcricao": str(caminho), "modelo": modelo, "mensagens": 0,
+            "tokens_entrada": 0, "tokens_saida": 0,
+            "tokens_cache_leitura": 0, "tokens_cache_escrita": 0,
+            "primeiro_ts": None, "ultimo_ts": None, "tarefa": None,
+        })
+        c["mensagens"] += 1
+        c["tokens_entrada"] += u.get("input_tokens") or 0
+        c["tokens_saida"] += u.get("output_tokens") or 0
+        c["tokens_cache_leitura"] += u.get("cache_read_input_tokens") or 0
+        c["tokens_cache_escrita"] += u.get("cache_creation_input_tokens") or 0
+        ts = _iso(d.get("timestamp"))
+        if ts:
+            if not c["primeiro_ts"] or ts < c["primeiro_ts"]:
+                c["primeiro_ts"] = ts
+            if not c["ultimo_ts"] or ts > c["ultimo_ts"]:
+                c["ultimo_ts"] = ts
+    for c in por_modelo.values():
+        c["tarefa"] = tarefa
+    return list(por_modelo.values())
+
+
+def sessao_da_janela(sessoes, ts):
+    """A sessão cuja janela de tempo contém o carimbo.
+
+    Sessão sem fim registrado fica de fora: sem fronteira de cima ela engoliria
+    qualquer coisa posterior, inclusive de outra corrida.
+    """
+    if not ts:
+        return None
+    for s in sessoes:
+        inicio, fim = s.get("inicio"), s.get("fim")
+        if not inicio or not fim:
+            continue
+        if inicio <= ts <= fim:
+            return s
+    return None
+
+
+def gravar_consumo(con, linhas):
+    """Liga cada transcrição à unidade e, quando a janela permite, à sessão."""
+    n = 0
+    for c in linhas:
+        if not c.get("tarefa"):
+            continue
+        u = con.execute("SELECT id FROM unidade WHERE tarefa=?", (c["tarefa"],)).fetchone()
+        if not u:
+            continue
+        unidade_id = u[0]
+        sessoes = [dict(r) for r in con.execute(
+            "SELECT id, inicio, fim FROM sessao WHERE unidade_id=?", (unidade_id,))]
+        alvo = sessao_da_janela(sessoes, c.get("primeiro_ts"))
+        con.execute(
+            "INSERT INTO consumo (sessao_id, unidade_id, transcricao, modelo, mensagens,"
+            " tokens_entrada, tokens_saida, tokens_cache_leitura, tokens_cache_escrita,"
+            " primeiro_ts, ultimo_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT (transcricao, modelo) DO UPDATE SET"
+            "  sessao_id=excluded.sessao_id, unidade_id=excluded.unidade_id,"
+            "  mensagens=excluded.mensagens, tokens_entrada=excluded.tokens_entrada,"
+            "  tokens_saida=excluded.tokens_saida,"
+            "  tokens_cache_leitura=excluded.tokens_cache_leitura,"
+            "  tokens_cache_escrita=excluded.tokens_cache_escrita,"
+            "  primeiro_ts=excluded.primeiro_ts, ultimo_ts=excluded.ultimo_ts",
+            (alvo["id"] if alvo else None, unidade_id, c["transcricao"], c["modelo"],
+             c["mensagens"], c["tokens_entrada"], c["tokens_saida"],
+             c["tokens_cache_leitura"], c["tokens_cache_escrita"],
+             c.get("primeiro_ts"), c.get("ultimo_ts")))
+        n += 1
+    con.commit()
+    return n
+
+
+def transcricoes(raiz):
+    """As transcrições das cópias de trabalho da esteira, e só elas."""
+    raiz = pathlib.Path(raiz)
+    if not raiz.exists():
+        return []
+    fora = []
+    for pasta in sorted(raiz.glob("*worktrees-CU-*")):
+        if pasta.is_dir():
+            fora.extend(sorted(pasta.rglob("*.jsonl")))
+    return fora
+
+
 # As duas fontes de rastro: a máquina onde a esteira roda agora, e a história
 # copiada da máquina anterior. Cada linha guarda de onde veio.
 FONTES = (
     ("servidor", "corrente",
-     pathlib.Path.home() / ".claude/orchestrator/state"),
+     pathlib.Path.home() / ".claude/orchestrator/state",
+     pathlib.Path.home() / ".claude/projects"),
     ("historico-mac", "historico",
-     pathlib.Path.home() / ".claude/orchestrator/historico-mac/state"),
+     pathlib.Path.home() / ".claude/orchestrator/historico-mac/state",
+     pathlib.Path.home() / ".claude/orchestrator/historico-mac/projects"),
 )
+
 
 # --------------------------------------------------------------------------- #
 # Linha de comando
@@ -388,7 +533,7 @@ def cmd_esquema(args):
 def cmd_coletar(args):
     con = abrir(args.armazem)
     total = 0
-    for maquina, papel, raiz in FONTES:
+    for maquina, papel, raiz, raiz_projetos in FONTES:
         if not raiz.exists():
             print(f"{maquina}: sem rastro em {raiz} — pulando")
             continue
@@ -399,15 +544,25 @@ def cmd_coletar(args):
         total += n
         print(f"{maquina}: {len(arquivadas)} pastas arquivadas, "
               f"{len(lista)} despachos, {n} sessões gravadas")
+
+        arquivos = transcricoes(raiz_projetos)
+        linhas = []
+        for a in arquivos:
+            linhas.extend(consumo_de_transcricao(a))
+        m = gravar_consumo(con, linhas)
+        print(f"{maquina}: {len(arquivos)} transcrições, {m} linhas de consumo")
     con.close()
     print(f"total de sessões gravadas: {total}")
     return 0
 
 
+def _milhar(n):
+    return f"{n:,}".replace(",", ".")
+
+
 def cmd_resumo(args):
     con = abrir(args.armazem)
-    linha = con.execute("SELECT count(*) FROM sessao").fetchone()[0]
-    print(f"sessões: {linha}")
+    print(f"sessões: {con.execute('SELECT count(*) FROM sessao').fetchone()[0]}")
 
     print("\npor desfecho:")
     for r in con.execute(
@@ -419,13 +574,28 @@ def cmd_resumo(args):
     for r in con.execute(
             "SELECT etapa, COALESCE(desfecho,'(sem desfecho)') AS d, count(*) AS n"
             " FROM sessao GROUP BY etapa, d ORDER BY etapa, n DESC"):
-        print(f"  {r['n']:4d}  {r['etapa']:<10} {r['d']}")
+        print(f"  {r['n']:4d}  {r['etapa']:<12} {r['d']}")
 
     print("\npor máquina:")
     for r in con.execute(
-            "SELECT m.nome, count(*) AS n FROM sessao s"
+            "SELECT m.nome AS nome, count(*) AS n FROM sessao s"
             " JOIN maquina m ON m.id = s.maquina_id GROUP BY m.nome ORDER BY n DESC"):
         print(f"  {r['n']:4d}  {r['nome']}")
+
+    print("\ntokens por modelo:")
+    for r in con.execute(
+            "SELECT modelo, sum(mensagens) AS msg, sum(tokens_entrada) AS ent,"
+            " sum(tokens_saida) AS sai, sum(tokens_cache_leitura) AS cl,"
+            " sum(tokens_cache_escrita) AS ce FROM consumo GROUP BY modelo"
+            " ORDER BY sai DESC"):
+        print(f"  {r['modelo']}")
+        print(f"      mensagens {_milhar(r['msg'])} · "
+              f"entrada {_milhar(r['ent'])} · saída {_milhar(r['sai'])}")
+        print(f"      cache lido {_milhar(r['cl'])} · "
+              f"cache escrito {_milhar(r['ce'])}")
+
+    if not con.execute("SELECT count(*) FROM preco_modelo").fetchone()[0]:
+        print("\ncusto em dinheiro: não calculado — nenhum preço cadastrado.")
 
     deduzidas = con.execute(
         "SELECT count(*) FROM sessao WHERE inicio_deduzido = 1").fetchone()[0]
@@ -433,8 +603,14 @@ def cmd_resumo(args):
         print(f"\naviso: {deduzidas} sessões com início deduzido, não medido "
               "(não havia despacho correspondente no registro)")
 
-    unidades = con.execute("SELECT count(*) FROM unidade").fetchone()[0]
-    print(f"\nunidades de trabalho: {unidades}")
+    soltas = con.execute(
+        "SELECT count(*) FROM consumo WHERE sessao_id IS NULL").fetchone()[0]
+    if soltas:
+        print(f"aviso: {soltas} transcrições não caíram na janela de nenhuma "
+              "sessão; ficaram ligadas só à unidade")
+
+    print(f"\nunidades de trabalho: "
+          f"{con.execute('SELECT count(*) FROM unidade').fetchone()[0]}")
     con.close()
     return 0
 

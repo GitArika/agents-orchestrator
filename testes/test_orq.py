@@ -55,5 +55,39 @@ class PressaoDeMemoriaDaApple(unittest.TestCase):
         self.assertIsNone(orq._pressao_livre_pct("outra coisa"))
 
 
+class TetoPorEstagio(unittest.TestCase):
+    """A forma da esteira: quantas sessões de CADA estágio cabem ao mesmo tempo.
+
+    O teto global não exprime isso — ele deixaria todas as vagas irem para um
+    estágio só.
+    """
+
+    def cfg(self, tetos=None, serial=None):
+        return orq.Config(path=Path("/tmp/x.toml"), raw={
+            "pipeline": {"name": "t", "list_id": "1", "repo": "/tmp"},
+            "session": {"max_por_estagio": tetos or {}},
+            "loop": {"serial_stages": serial or []},
+        })
+
+    def test_sem_teto(self):
+        self.assertEqual(orq.teto_do_estagio(self.cfg(), "spec"), 0)
+
+    def test_teto_declarado(self):
+        self.assertEqual(orq.teto_do_estagio(self.cfg({"spec": 6}), "spec"), 6)
+
+    def test_serial_vale_um(self):
+        c = self.cfg(serial=["integrate"])
+        self.assertEqual(orq.teto_do_estagio(c, "integrate"), 1)
+
+    def test_serial_vence_teto_maior(self):
+        # Ligar um nunca pode AFROUXAR o outro: duas integrações simultâneas
+        # correriam uma contra a outra no branch de publicação.
+        c = self.cfg({"integrate": 6}, serial=["integrate"])
+        self.assertEqual(orq.teto_do_estagio(c, "integrate"), 1)
+
+    def test_estagio_nulo(self):
+        self.assertEqual(orq.teto_do_estagio(self.cfg({"spec": 6}), None), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

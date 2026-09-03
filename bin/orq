@@ -497,6 +497,46 @@ def session_rss_gb(cfg: Config) -> dict:
     return out
 
 
+def sessoes_por_estagio(cfg: Config) -> dict:
+    """Quantas sessões vivas há em cada estágio.
+
+    O estágio de uma sessão viva não está gravado em lugar nenhum — é derivado do
+    nome do briefing que `launch` escreve por (unidade, estágio). Derivar a cada
+    chamada é barato e evita uma segunda contabilidade, que envelheceria e
+    mentiria depois de um travamento — o mesmo motivo pelo qual "o que está vivo"
+    sai dos processos, nunca de disco.
+    """
+    sl = slugify(cfg.name, 16)
+    fora: dict = {}
+    for uid in running_sessions(cfg):
+        for f in STATE.glob(f"{sl}-{uid}-*.brief.md"):
+            k = f.stem.rsplit("-", 1)[-1].replace(".brief", "")
+            fora[k] = fora.get(k, 0) + 1
+    return fora
+
+
+def teto_do_estagio(cfg: Config, stage_key: str | None) -> int:
+    """Teto de sessões simultâneas DAQUELE estágio. 0 = sem teto próprio.
+
+    A forma da esteira é decisão de quem é dono do processo: "seis de
+    especificação e uma de integração" não é exprimível só com o teto global —
+    ele deixaria dezenove sessões do MESMO estágio subirem, e a esteira ficaria
+    com uma etapa inchada e as outras vazias.
+
+    `serial_stages` continua valendo e é o caso particular "teto 1". Quando os
+    dois falam do mesmo estágio vence o menor, para que ligar um nunca afrouxe
+    o outro.
+    """
+    if not stage_key:
+        return 0
+    tetos = cfg.sess("max_por_estagio", {}) or {}
+    teto = int(tetos.get(stage_key, 0) or 0)
+    serial = set(cfg.raw.get("loop", {}).get("serial_stages", []) or [])
+    if stage_key in serial:
+        teto = 1 if teto <= 0 else min(teto, 1)
+    return teto
+
+
 def stage_ram(cfg: Config, stage_key: str | None) -> float:
     table = cfg.sess("ram_per_stage_gb", {}) or {}
     if stage_key and stage_key in table:
@@ -505,7 +545,7 @@ def stage_ram(cfg: Config, stage_key: str | None) -> float:
 
 
 def capacity(cfg: Config, stage_key: str | None = None, extra_live: int = 0,
-             extra_ram: float = 0.0) -> dict:
+             extra_ram: float = 0.0, extra_no_estagio: int = 0) -> dict:
     """Quantas sessões A MAIS deste estágio cabem agora.
 
     Duas correções que custaram caro para aparecer:
@@ -535,6 +575,10 @@ def capacity(cfg: Config, stage_key: str | None = None, extra_live: int = 0,
     by_load = max(0, load_ceiling - nlive)
     hard = int(cfg.sess("max_concurrent", 0) or 0)
     by_hard = max(0, hard - nlive) if hard else 10**6
+    teto_est = teto_do_estagio(cfg, stage_key)
+    vivas_est = sessoes_por_estagio(cfg).get(stage_key, 0) if stage_key else 0
+    by_stage = (max(0, teto_est - vivas_est - extra_no_estagio)
+                if teto_est else 10**6)
 
     return {"logical_cpus": logical, "total_ram_gb": round(total, 1),
             "free_ram_gb": round(free, 1), "load1": round(load1, 2),
@@ -542,7 +586,9 @@ def capacity(cfg: Config, stage_key: str | None = None, extra_live: int = 0,
             "stage": stage_key or "-", "live": nlive,
             "by_ram": by_ram, "by_cpu": by_cpu, "by_load": by_load,
             "cpu_ceiling": cpu_ceiling, "load_ceiling": load_ceiling,
-            "hard_cap": hard, "slots_free": min(by_ram, by_cpu, by_load, by_hard)}
+            "hard_cap": hard, "stage_cap": teto_est, "live_stage": vivas_est,
+            "by_stage": by_stage,
+            "slots_free": min(by_ram, by_cpu, by_load, by_hard, by_stage)}
 
 
 # ---------------------------------------------------------------- sessões
@@ -1338,6 +1384,17 @@ def cmd_capacity(cfg, args):
         print(f"  {k:<26} {v}")
     print(f"  {C['b']}{'vagas':<26} {c['slots_free']}{C['r']}  "
           f"{C['d']}(vivas: {len(live)}, orçamento {c['ram_per_session_gb']}GB){C['r']}")
+    tetos = cfg.sess("max_por_estagio", {}) or {}
+    if tetos:
+        vivas = sessoes_por_estagio(cfg)
+        print(f"\n{C['b']}Teto por estágio{C['r']}")
+        for st in cfg.stages:
+            t = teto_do_estagio(cfg, st.key)
+            if not t:
+                continue
+            v = vivas.get(st.key, 0)
+            print(f"  {st.key:<12}  {v}/{t} vivas" +
+                  (f"  {C['yel']}(no teto){C['r']}" if v >= t else ""))
     table = cfg.sess("ram_per_stage_gb", {}) or {}
     if table:
         print(f"\n{C['b']}Orçamento por estágio{C['r']}")
@@ -1997,6 +2054,10 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
     busy_serial = {r2.stage.key for r2 in rows
                    if r2.state == "running" and r2.stage and r2.stage.key in serial}
     started, committed = 0, 0.0   # committed = RAM já comprometida NESTE ciclo
+    # Lançadas NESTE ciclo, por estágio. As sessões ainda não aparecem em
+    # `running_sessions` quando a próxima da fila é avaliada; sem isto o teto por
+    # estágio seria furado dentro do mesmo tick.
+    novas_no_estagio: dict = {}
     for r in q:
         if r.stage.key in serial and r.stage.key in busy_serial:
             continue
@@ -2004,7 +2065,8 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
             break
         if r.unit.mode in skip_modes:
             continue
-        cap = capacity(cfg, r.stage.key, extra_live=started, extra_ram=committed)
+        cap = capacity(cfg, r.stage.key, extra_live=started, extra_ram=committed,
+                       extra_no_estagio=novas_no_estagio.get(r.stage.key, 0))
         if cap["slots_free"] <= 0:
             continue
         try:
@@ -2013,6 +2075,7 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
             out["dispatched"].append(f"{r.unit.key}·{r.stage.key}")
             started += 1
             committed += stage_ram(cfg, r.stage.key)
+            novas_no_estagio[r.stage.key] = novas_no_estagio.get(r.stage.key, 0) + 1
             if r.stage.key in serial:
                 busy_serial.add(r.stage.key)
             st["dispatched"] += 1

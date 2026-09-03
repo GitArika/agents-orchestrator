@@ -164,6 +164,47 @@ SELECT u.codigo, u.titulo, count(*) AS commits,
        sum(k.delecoes) AS delecoes
   FROM unidade u JOIN commit_unidade k ON k.unidade_id = u.id
  GROUP BY u.id;
+
+CREATE VIEW IF NOT EXISTS v_sessao AS
+SELECT s.id, u.codigo AS unidade, u.tarefa, u.titulo, m.nome AS maquina,
+       s.etapa, s.inicio, s.fim, s.inicio_deduzido, s.desfecho, s.desfecho_bruto,
+       s.status_final, s.pasta,
+       round((julianday(s.fim) - julianday(s.inicio)) * 1440, 1) AS minutos,
+       (SELECT round((julianday(max(c.ultimo_ts)) - julianday(min(c.primeiro_ts)))
+                     * 1440, 1)
+          FROM consumo c WHERE c.sessao_id = s.id)          AS minutos_transcricao,
+       (SELECT sum(c.mensagens)            FROM consumo c WHERE c.sessao_id = s.id) AS mensagens,
+       (SELECT sum(c.tokens_saida)         FROM consumo c WHERE c.sessao_id = s.id) AS tokens_saida,
+       (SELECT sum(c.tokens_entrada)       FROM consumo c WHERE c.sessao_id = s.id) AS tokens_entrada,
+       (SELECT sum(c.tokens_cache_leitura) FROM consumo c WHERE c.sessao_id = s.id) AS cache_lido,
+       (SELECT sum(c.tokens_cache_escrita) FROM consumo c WHERE c.sessao_id = s.id) AS cache_escrito
+  FROM sessao s
+  JOIN unidade u ON u.id = s.unidade_id
+  JOIN maquina m ON m.id = s.maquina_id;
+
+-- Só sessão com início MEDIDO entra: misturar deduzido com medido produziria
+-- uma média que ninguém pode defender.
+CREATE VIEW IF NOT EXISTS v_tempo_por_etapa AS
+SELECT etapa,
+       count(*)                 AS sessoes,
+       round(avg(minutos), 1)   AS media_min,
+       round(min(minutos), 1)   AS menor_min,
+       round(max(minutos), 1)   AS maior_min,
+       round(sum(minutos), 1)   AS total_min
+  FROM v_sessao
+ WHERE minutos IS NOT NULL AND inicio_deduzido = 0
+ GROUP BY etapa;
+
+CREATE VIEW IF NOT EXISTS v_consumo_por_etapa AS
+SELECT s.etapa,
+       count(DISTINCT s.id)          AS sessoes,
+       sum(c.mensagens)              AS mensagens,
+       sum(c.tokens_saida)           AS tokens_saida,
+       sum(c.tokens_entrada)         AS tokens_entrada,
+       sum(c.tokens_cache_leitura)   AS cache_lido,
+       sum(c.tokens_cache_escrita)   AS cache_escrito
+  FROM sessao s JOIN consumo c ON c.sessao_id = s.id
+ GROUP BY s.etapa;
 """
 
 
@@ -1070,6 +1111,64 @@ def cmd_resumo(args):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# A exportação
+# --------------------------------------------------------------------------- #
+
+# O que este dado NÃO diz. Viaja junto com ele, sempre: número sem a ressalva
+# vira decisão errada, e quem abre o arquivo daqui a seis meses não vai lembrar.
+LIMITES = (
+    "Memoria por sessao ou por etapa NAO existe. O motor sabe medir o consumo "
+    "real de cada sessao viva, mas nao grava; o unico registro de memoria e da "
+    "maquina inteira, com tres amostras de 02/09/2026.",
+    "Duracao e DEDUZIDA, nao medida: e o intervalo entre o despacho e o "
+    "arquivamento. As sessoes sem despacho correspondente vem com "
+    "inicio_deduzido=1 e ficam fora das medias de tempo.",
+    "Resultado de portao nao foi extraido: ele so existe dentro da captura de "
+    "terminal, em texto corrido com codigos de cor.",
+    "Custo em dinheiro nao e calculado enquanto a tabela preco_modelo estiver "
+    "vazia. Tokens estao contados.",
+    "Nada anterior a 31/08/2026 tem rastro: a esteira so passou a arquivar "
+    "sessao a partir dali.",
+    "Retrabalho e quarentena vem do estado do laco, que e uma fotografia do "
+    "momento da coleta e nao um historico; por isso nao tem hora.",
+)
+
+
+def exportar(con):
+    """Tudo o que o armazém sabe, em estruturas simples."""
+    nomes = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        " AND name NOT LIKE 'sqlite_%' ORDER BY type DESC, name")]
+    tabelas = {}
+    for nome in nomes:
+        tabelas[nome] = [dict(r) for r in con.execute(f"SELECT * FROM {nome}")]
+    return {
+        "gerado_em": datetime.datetime.now(datetime.UTC)
+                     .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limites": list(LIMITES),
+        "tabelas": tabelas,
+    }
+
+
+def cmd_exportar(args):
+    con = abrir(args.armazem)
+    dados = exportar(con)
+    con.close()
+    texto = json.dumps(dados, ensure_ascii=False, indent=2)
+    if args.saida == "-":
+        print(texto)
+    else:
+        alvo = pathlib.Path(args.saida)
+        alvo.write_text(texto)
+        tamanho = alvo.stat().st_size / 1024
+        print(f"{alvo} — {tamanho:.0f} KB")
+        for nome, linhas in dados["tabelas"].items():
+            print(f"  {len(linhas):5d}  {nome}")
+    return 0
+
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="orq-medir",
@@ -1088,6 +1187,10 @@ def main(argv=None):
 
     s = sub.add_parser("resumo", help="imprime os números principais")
     s.set_defaults(func=cmd_resumo)
+
+    s = sub.add_parser("exportar", help="o JSON bruto de tudo")
+    s.add_argument("--saida", default="-", help="arquivo de destino (padrão: a tela)")
+    s.set_defaults(func=cmd_exportar)
 
     args = p.parse_args(argv)
     return args.func(args)

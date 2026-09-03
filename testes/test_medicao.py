@@ -6,6 +6,7 @@ código erra em silêncio: o casamento entre despacho e arquivo quando a mesma
 unidade repete a etapa, a sessão que morreu sem se despedir, e a transcrição que
 termina no meio de uma linha.
 """
+import json
 import importlib.machinery
 import importlib.util
 import pathlib
@@ -370,6 +371,31 @@ class BranchDoMerge(unittest.TestCase):
         self.assertIsNone(medir.branch_do_merge("Merge branch 'main' into homol"))
         self.assertIsNone(medir.branch_do_merge("feat: qualquer coisa"))
         self.assertIsNone(medir.branch_do_merge(None))
+
+
+class Exportacao(unittest.TestCase):
+    def test_traz_tabelas_e_vistas_e_serializa(self):
+        with tempfile.TemporaryDirectory() as d:
+            con = medir.abrir(pathlib.Path(d) / "m.db")
+            dados = medir.exportar(con)
+            con.close()
+        for chave in ("maquina", "esteira", "unidade", "sessao", "consumo",
+                      "evento", "commit_unidade", "preco_modelo",
+                      "v_sessao", "v_retrabalho", "v_tempo_por_etapa"):
+            self.assertIn(chave, dados["tabelas"])
+        self.assertIn("gerado_em", dados)
+        self.assertIn("limites", dados)
+        json.dumps(dados)     # tem de serializar sozinho, sem conversor
+
+    def test_declara_os_limites_do_proprio_dado(self):
+        # Um numero sem a ressalva vira decisao errada. Os limites viajam junto.
+        with tempfile.TemporaryDirectory() as d:
+            con = medir.abrir(pathlib.Path(d) / "m.db")
+            lim = medir.exportar(con)["limites"]
+            con.close()
+        texto = " ".join(lim).lower()
+        self.assertIn("memoria", texto)
+        self.assertIn("deduzid", texto)
 
 
 if __name__ == "__main__":

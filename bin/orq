@@ -828,7 +828,6 @@ Procedimento:
        git push -u origin {branch}
        gh pr create --base {base} --head {branch} --title "<tipo(escopo): assunto>" --body "<...>"
        gh pr merge --merge                        # SEM --delete-branch, veja abaixo
-       git push origin --delete {branch}          # apague o remoto assim
    Execute o merge. Não peça confirmação: a decisão é sua desde que a revisão
    tenha aprovado, o rebase tenha passado e os portões estejam verdes na árvore
    fundida — as três coisas que o passo 4 acabou de estabelecer. Veja o aviso de
@@ -838,9 +837,15 @@ Procedimento:
    como engenheiro, sem rodapé de ferramenta.
    A estratégia de merge pode ser fixada por esteira no aviso de publicação; se
    ele disser outra coisa, ele vence esta linha.
-   `--delete-branch` tenta trocar para o branch padrão do repositório (`main`),
-   que não existe nesta cópia local, e falha deixando o remoto para trás. Por
-   isso a remoção é explícita.
+   O BRANCH REMOTO FICA, e isso é decidido, não esquecido. `--delete-branch`
+   tenta trocar para o branch padrão do repositório, que não está nesta cópia
+   local, e falha deixando o remoto para trás; e `git push --delete` a cerca
+   proíbe, porque um push que apaga referência remota não se distingue de um
+   push destrutivo. Antes esta linha mandava apagar assim mesmo: três sessões
+   seguidas cumpriram cinco passos, bateram na cerca no sexto e relataram como
+   pendência o que era ordem impossível. Ordem que a cerca proíbe não é ordem.
+   Quem remove branch fundido é o ajuste do repositório ("automatically delete
+   head branches") ou uma pessoa. Não tente, e não relate como pendência sua.
    O PR não terá verificação automática: este repositório não tem workflow em
    `pull_request`. Os portões que VOCÊ rodou no passo 4 são a única prova.
 

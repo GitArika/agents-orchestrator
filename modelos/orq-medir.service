@@ -1,0 +1,11 @@
+[Unit]
+Description=Mede a esteira a partir do rastro que ela já deixa
+Documentation=file:///%h/orquestrador/docs/medicao.md
+
+[Service]
+Type=oneshot
+# Prioridade baixa de propósito: o medidor nunca disputa processador nem disco
+# com as sessões da esteira. Ele só lê o que já terminou.
+Nice=19
+IOSchedulingClass=idle
+ExecStart=%h/orquestrador/bin/orq-medir coletar

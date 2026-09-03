@@ -78,7 +78,7 @@ esac
 # ── 3. executáveis na PATH ──────────────────────────────────────────────────
 titulo "Executáveis"
 CONFLITO=""
-for exe in orq orq-clickup orq-avisar orq-ram; do
+for exe in orq orq-clickup orq-avisar orq-ram orq-medir; do
   atual="$(command -v "$exe" 2>/dev/null || true)"
   if [ -n "$atual" ]; then
     destino="$(readlink -f "$atual" 2>/dev/null || echo "$atual")"
@@ -96,7 +96,7 @@ if [ -n "$CONFLITO" ] && [ "$SUBSTITUIR" != 1 ]; then
 fi
 
 if ! faria "mkdir -p $BIN_DIR"; then mkdir -p "$BIN_DIR"; fi
-for exe in orq orq-clickup orq-avisar orq-ram; do
+for exe in orq orq-clickup orq-avisar orq-ram orq-medir; do
   if faria "ln -sf $AQUI/bin/$exe $BIN_DIR/$exe"; then continue; fi
   ln -sf "$AQUI/bin/$exe" "$BIN_DIR/$exe" && ok "$exe → $BIN_DIR/$exe"
 done

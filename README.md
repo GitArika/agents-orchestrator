@@ -34,7 +34,7 @@ comentado, para você revisar — nada é decidido às escondidas.
 
 | Pasta | O que é |
 | --- | --- |
-| `bin/` | Os quatro executáveis: o motor, o cliente do ClickUp, o avisador e o vigia de memória |
+| `bin/` | Os cinco executáveis: o motor, o cliente do ClickUp, o avisador, o vigia de memória e o medidor |
 | `skills/` | Oito habilidades que um agente aciona — operar, diagnosticar, construir ambiente, instalar |
 | `modelos/` | O modelo comentado da esteira e o exemplo de credenciais |
 | `hooks/` | A cerca de permissões e o aviso |
@@ -52,7 +52,8 @@ comentado, para você revisar — nada é decidido às escondidas.
 | [Para quem chega](docs/para-quem-chega.md) | Entrou num projeto que já usa isto? Comece por aqui |
 | [Segurança](docs/seguranca.md) | A cerca, o que ela cobre e o que ela não cobre |
 | [Host Linux](docs/host-linux.md) | Rodar sozinho num servidor |
-| **[Aprendizados](docs/aprendizados.md)** | **Vinte coisas que custaram tempo descobrir** |
+| [Medição](docs/medicao.md) | O que a esteira produziu: sessões, retrabalho, espera humana, tokens e código |
+| **[Aprendizados](docs/aprendizados.md)** | **Vinte e duas coisas que custaram tempo descobrir** |
 
 **Comece pelos aprendizados se quiser saber se isto vale a pena.** É a parte que não se
 inventa: cada item é um problema que já aconteceu, com o número exato, o comando que

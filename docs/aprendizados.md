@@ -1,6 +1,6 @@
 # Aprendizados
 
-Vinte coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
+Vinte e duas coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
 parecia ser, o que era, o comando que confirma, e como não repetir.
 
 Não é lista de dicas. É o que já deu errado, com os números.
@@ -385,3 +385,55 @@ um arquivo direto do fornecedor.
 ferramenta antes de acusar o projeto**. Vale também para o navegador de teste: ele fica
 **fora** do repositório, porque acrescentá-lo às dependências quebraria a instalação
 congelada de toda cópia de trabalho em voo.
+
+---
+
+## 21. O quadro não vende o relógio, mas dá ele de graça em outro lugar
+
+**O sintoma.** Para medir quanto tempo cada tarefa passou em cada etapa, o caminho óbvio era
+pedir o tempo em status ao quadro. A chamada respondeu
+`TIS_027 — Time In Status is not available on your plan`, e o endereço de histórico da
+tarefa devolveu `404 page not found`.
+
+**O que parecia ser.** Chamada errada, ou permissão faltando no token.
+
+**O que era.** Recurso pago. É a mesma família da armadilha do apontamento de hora (nº 19):
+a API responde com um código que não explica que aquilo se compra.
+
+**O comando que confirma.**
+
+```bash
+curl -s -H "Authorization: $CLICKUP_API_KEY" \
+  "https://api.clickup.com/api/v2/task/<id>/time_in_status"
+```
+
+**Como não repetir.** O relógio está nos **comentários**, que são gratuitos e melhores: cada
+transição de etapa deixou um comentário com hora, autor e o commit citado. Eles dizem
+também **o que** aconteceu, não só quando. Antes de assumir que falta um recurso, procure o
+mesmo fato num rastro que você já produz.
+
+---
+
+## 22. A base local envelhece sem avisar e faz a medição mentir
+
+**O sintoma.** A primeira medição de código produzido acusou 2.520 commits — mais do que o
+repositório inteiro tinha no período. Uma unidade apareceu sozinha com 147 commits e 91.270
+linhas acrescentadas.
+
+**O que parecia ser.** Erro de soma, ou commits contados duas vezes.
+
+**O que era.** A atribuição usava o intervalo `base..branch`, e a base **local** do servidor
+estava 179 commits atrás do remoto. Com a base atrasada, o intervalo de cada branch devolve
+o trabalho de todas as unidades que entraram desde então — e, como o commit tem chave única,
+a atribuição fica com a unidade que rodou por último. O número não é grande demais por
+acidente: ele é o trabalho de todo mundo, carimbado com o nome de um.
+
+**O comando que confirma.**
+
+```bash
+git rev-list --count homol..origin/homol      # quanto a base local está atrasada
+```
+
+**Como não repetir.** Atribuir pelo **merge**, que diz de qual branch veio o que entrou, e
+não pelo intervalo. E, sempre que houver referência remota, preferir a remota à local: a
+local só anda quando alguém puxa.

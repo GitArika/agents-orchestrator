@@ -1,0 +1,12 @@
+[Unit]
+Description=Coleta as métricas da esteira de hora em hora
+
+[Timer]
+OnCalendar=hourly
+# Persistent recupera a coleta perdida enquanto a máquina esteve fora do ar.
+Persistent=true
+# Espalha o disparo para não cair junto com o pico da esteira.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

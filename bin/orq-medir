@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import sys
 import tomllib
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -126,6 +127,16 @@ CREATE INDEX IF NOT EXISTS idx_sessao_unidade ON sessao(unidade_id);
 CREATE INDEX IF NOT EXISTS idx_evento_unidade ON evento(unidade_id);
 CREATE INDEX IF NOT EXISTS idx_evento_ts      ON evento(ts);
 
+CREATE TABLE IF NOT EXISTS amostra_memoria (
+  id         INTEGER PRIMARY KEY,
+  ts         TEXT NOT NULL,
+  unidade_id INTEGER REFERENCES unidade(id),
+  tarefa     TEXT,
+  etapa      TEXT,
+  rss_mb     REAL NOT NULL,
+  chave      TEXT NOT NULL UNIQUE
+);
+
 CREATE VIEW IF NOT EXISTS v_ciclo_por_unidade AS
 SELECT u.codigo, u.tarefa, u.titulo,
        min(s.inicio) AS comeco, max(s.fim) AS termino,
@@ -164,6 +175,17 @@ SELECT u.codigo, u.titulo, count(*) AS commits,
        sum(k.delecoes) AS delecoes
   FROM unidade u JOIN commit_unidade k ON k.unidade_id = u.id
  GROUP BY u.id;
+
+-- Memoria por etapa so existe daqui para a frente: o rastro antigo nao guarda
+-- consumo por sessao, e nenhum esforco recupera o que nunca foi escrito.
+CREATE VIEW IF NOT EXISTS v_memoria_por_etapa AS
+SELECT COALESCE(etapa, '(sem etapa)') AS etapa,
+       count(*)                    AS amostras,
+       count(DISTINCT tarefa)      AS unidades,
+       round(avg(rss_mb), 0)       AS media_mb,
+       round(max(rss_mb), 0)       AS maior_mb
+  FROM amostra_memoria
+ GROUP BY COALESCE(etapa, '(sem etapa)');
 
 CREATE VIEW IF NOT EXISTS v_sessao AS
 SELECT s.id, u.codigo AS unidade, u.tarefa, u.titulo, m.nome AS maquina,
@@ -1011,6 +1033,11 @@ def cmd_coletar(args):
             k = coletar_producao(con, cfg["repo"], cfg.get("base") or "homol")
             print(f"{maquina}: {k} commits atribuídos a uma unidade")
 
+    estado = estado_vivo(con, FONTES[0][2], _nome_da_esteira(con))
+    n_mem = gravar_amostras(con, estado["sessoes"])
+    print(f"vivo: {len(estado['sessoes'])} sessões rodando, {n_mem} amostras de memória, "
+          f"{len(estado['esperas'])} esperando decisão")
+
     if not args.sem_rede:
         token = token_clickup()
         if not token:
@@ -1112,6 +1139,156 @@ def cmd_resumo(args):
 
 
 # --------------------------------------------------------------------------- #
+# O que está vivo agora
+# --------------------------------------------------------------------------- #
+#
+# Tudo aqui lê só a máquina local: as sessões do tmux e o estado do laço. Nada
+# de rede, para o painel poder atualizar de segundo em segundo sem gastar
+# chamada de API nem disputar nada com a esteira.
+
+RE_BRIEF = re.compile(r"^[^/]*?-([0-9A-Za-z]+)-(spec|implement|review|integrate)\.brief\.md$")
+
+
+def tarefa_da_sessao(nome, prefixo):
+    """O id da tarefa mora no fim do nome da sessão. O laço tem nome próprio e
+    não é uma sessão de trabalho — por isso a checagem contra 'loop-'."""
+    if not nome or not nome.startswith(prefixo):
+        return None
+    resto = nome[len(prefixo):]
+    return resto if resto and "-" not in resto else None
+
+
+def etapa_do_brief(arquivos, tarefa):
+    """A etapa não está no nome da sessão; está no da ordem de serviço."""
+    for a in arquivos:
+        m = RE_BRIEF.match(a)
+        if m and m.group(1) == tarefa:
+            return m.group(2)
+    return None
+
+
+def soma_rss_kb(saida):
+    """`ps -o rss= -g <pid>` devolve uma linha por processo do grupo, em kB."""
+    return sum(int(x) for x in (saida or "").split() if x.isdigit())
+
+
+def chave_amostra(ts, tarefa):
+    """Uma amostra por tarefa por minuto: coletar de novo no mesmo minuto
+    atualiza a linha em vez de criar outra."""
+    return f"{(ts or '')[:16]}|{tarefa or ''}"
+
+
+def _tmux(args):
+    try:
+        r = subprocess.run(["tmux"] + args, capture_output=True, text=True, timeout=10)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def prefixo_da_esteira(nome, tamanho=16):
+    """Espelha o que o motor faz para nomear a sessão."""
+    s = unicodedata.normalize("NFKD", nome or "").encode("ascii", "ignore").decode()
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).strip("-").lower()
+    return "orq-" + s[:tamanho].strip("-") + "-"
+
+
+def sessoes_vivas(prefixo, raiz_estado):
+    """As sessões de trabalho vivas agora, com a memória que cada uma ocupa."""
+    arquivos = [p.name for p in pathlib.Path(raiz_estado).glob("*.brief.md")]
+    fora = []
+    for nome in _tmux(["list-sessions", "-F",
+                       "#{session_name}\t#{session_created}"]).splitlines():
+        partes = nome.split("\t")
+        tarefa = tarefa_da_sessao(partes[0], prefixo)
+        if not tarefa:
+            continue
+        rss = 0
+        for pane in _tmux(["list-panes", "-t", partes[0], "-F", "#{pane_pid}"]).split():
+            rss += soma_rss_kb(_tmux_ps(pane))
+        criada = None
+        if len(partes) > 1 and partes[1].isdigit():
+            criada = datetime.datetime.fromtimestamp(
+                int(partes[1]), datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fora.append({"tmux": partes[0], "tarefa": tarefa,
+                     "etapa": etapa_do_brief(arquivos, tarefa),
+                     "criada_em": criada, "rss_mb": round(rss / 1024, 1)})
+    return fora
+
+
+def _tmux_ps(pane_pid):
+    try:
+        r = subprocess.run(["ps", "-o", "rss=", "-g", pane_pid],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def gravar_amostras(con, vivas):
+    """Grava a memória das sessões vivas.
+
+    O motor sabe medir isto e não grava. Amostrar por fora é aditivo: não toca
+    numa linha do motor, e a partir da primeira coleta passa a existir memória
+    por etapa — que retroativamente nao existe e nunca vai existir.
+    """
+    agora = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    n = 0
+    for v in vivas:
+        if not v.get("rss_mb"):
+            continue
+        r = con.execute("SELECT id FROM unidade WHERE tarefa=?", (v["tarefa"],)).fetchone()
+        con.execute(
+            "INSERT INTO amostra_memoria (ts, unidade_id, tarefa, etapa, rss_mb, chave)"
+            " VALUES (?,?,?,?,?,?) ON CONFLICT (chave) DO UPDATE SET"
+            "  rss_mb = max(amostra_memoria.rss_mb, excluded.rss_mb),"
+            "  etapa = COALESCE(excluded.etapa, amostra_memoria.etapa)",
+            (agora, r[0] if r else None, v["tarefa"], v.get("etapa"), v["rss_mb"],
+             chave_amostra(agora, v["tarefa"])))
+        n += 1
+    con.commit()
+    return n
+
+
+def estado_vivo(con, raiz_estado, nome_esteira):
+    """A fotografia do agora, para o painel. Só leitura local."""
+    raiz = pathlib.Path(raiz_estado)
+    vivas = sessoes_vivas(prefixo_da_esteira(nome_esteira), raiz)
+    for v in vivas:
+        r = con.execute("SELECT codigo, titulo FROM unidade WHERE tarefa=?",
+                        (v["tarefa"],)).fetchone()
+        v["unidade"] = r["codigo"] if r else v["tarefa"]
+        v["titulo"] = r["titulo"] if r else None
+
+    esperas, quarentena, ticks, despachos = [], [], None, None
+    for laco in sorted(raiz.glob("loop-*.json")):
+        try:
+            d = json.loads(laco.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        ticks, despachos = d.get("ticks"), d.get("dispatched")
+        for tarefa, h in (d.get("hold") or {}).items():
+            r = con.execute("SELECT codigo, titulo FROM unidade WHERE tarefa=?",
+                            (tarefa,)).fetchone()
+            esperas.append({"tarefa": tarefa, "unidade": r["codigo"] if r else tarefa,
+                            "titulo": r["titulo"] if r else None,
+                            "desde": h.get("at"), "status": h.get("status"),
+                            "motivo": (h.get("reason") or "")[:400]})
+        quarentena += list(d.get("quarantine") or [])
+
+    laco_vivo = any(l.startswith("orq-loop-")
+                    for l in _tmux(["list-sessions", "-F", "#{session_name}"]).splitlines())
+    return {
+        "agora": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "laco_rodando": laco_vivo,
+        "sessoes": vivas,
+        "esperas": sorted(esperas, key=lambda e: e.get("desde") or ""),
+        "quarentena": quarentena,
+        "ticks": ticks, "despachos": despachos,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # A exportação
 # --------------------------------------------------------------------------- #
 
@@ -1169,6 +1346,126 @@ def cmd_exportar(args):
 
 
 
+# --------------------------------------------------------------------------- #
+# O painel
+# --------------------------------------------------------------------------- #
+
+MODELO_PAINEL = pathlib.Path(__file__).resolve().parent.parent / "modelos" / "painel.html"
+
+
+def dados_do_painel(con):
+    """A forma achatada que a página consome. O texto do comentário vem
+    aparado: o painel não precisa dele inteiro, e o bruto continua completo em
+    `orq-medir exportar`."""
+    def ler(nome):
+        return [dict(r) for r in con.execute(f"SELECT * FROM {nome}")]
+
+    eventos = ler("evento")
+    for e in eventos:
+        if e.get("texto") and len(e["texto"]) > 240:
+            e["texto"] = e["texto"][:240] + "…"
+
+    return {
+        "gerado_em": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limites": list(LIMITES),
+        "unidade": ler("unidade"), "maquina": ler("maquina"), "esteira": ler("esteira"),
+        "sessao": ler("v_sessao"), "evento": eventos, "commit": ler("commit_unidade"),
+        "consumo": ler("consumo"),
+        "tempo_etapa": ler("v_tempo_por_etapa"), "consumo_etapa": ler("v_consumo_por_etapa"),
+        "memoria": ler("v_memoria_por_etapa"),
+        "retrabalho": ler("v_retrabalho"), "ciclo": ler("v_ciclo_por_unidade"),
+        "producao": ler("v_producao_por_unidade"), "espera": ler("v_espera_humana"),
+    }
+
+
+def _nome_da_esteira(con):
+    r = con.execute("SELECT nome FROM esteira ORDER BY id LIMIT 1").fetchone()
+    return r[0] if r else ""
+
+
+def cmd_painel(args):
+    alvo = pathlib.Path(args.saida)
+    alvo.mkdir(parents=True, exist_ok=True)
+    if not MODELO_PAINEL.exists():
+        print(f"modelo não encontrado: {MODELO_PAINEL}")
+        return 1
+    con = abrir(args.armazem)
+    (alvo / "painel.html").write_text(MODELO_PAINEL.read_text())
+    (alvo / "dados.json").write_text(
+        json.dumps(dados_do_painel(con), ensure_ascii=False, separators=(",", ":")))
+    (alvo / "vivo.json").write_text(
+        json.dumps(estado_vivo(con, FONTES[0][2], _nome_da_esteira(con)),
+                   ensure_ascii=False, separators=(",", ":")))
+    con.close()
+    for f in ("painel.html", "dados.json", "vivo.json"):
+        print(f"  {(alvo/f).stat().st_size/1024:8.0f} KB  {alvo/f}")
+    print("\nAbrir o painel exige servi-lo — abrir o arquivo direto não funciona:")
+    print(f"  orq-medir servir")
+    return 0
+
+
+def cmd_servir(args):
+    """Servidor mínimo, preso ao endereço local.
+
+    Nunca ouve fora do laço de retorno: o painel carrega título de tarefa e texto
+    de comentário do projeto, e expor isso na internet seria uma decisão de outra
+    natureza. O acesso de fora se faz por túnel.
+    """
+    import http.server
+
+    modelo = MODELO_PAINEL.read_text()
+    armazem = args.armazem
+
+    class Mao(http.server.BaseHTTPRequestHandler):
+        def _envia(self, corpo, tipo):
+            dados = corpo.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", tipo + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(dados)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(dados)
+
+        def do_GET(self):
+            caminho = self.path.split("?")[0]
+            try:
+                if caminho in ("/", "/painel.html"):
+                    return self._envia(modelo, "text/html")
+                if caminho == "/dados.json":
+                    con = abrir(armazem)
+                    try:
+                        return self._envia(json.dumps(dados_do_painel(con), ensure_ascii=False),
+                                           "application/json")
+                    finally:
+                        con.close()
+                if caminho == "/vivo.json":
+                    con = abrir(armazem)
+                    try:
+                        estado = estado_vivo(con, FONTES[0][2], _nome_da_esteira(con))
+                        gravar_amostras(con, estado["sessoes"])
+                        return self._envia(json.dumps(estado, ensure_ascii=False),
+                                           "application/json")
+                    finally:
+                        con.close()
+            except Exception as erro:                       # noqa: BLE001
+                self.send_error(500, str(erro)[:200])
+                return
+            self.send_error(404)
+
+        def log_message(self, *_):
+            pass                                            # o diário do sistema já registra
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.porta), Mao)
+    print(f"painel em http://127.0.0.1:{args.porta} (só endereço local)")
+    print("de outra máquina, abra um túnel:")
+    print(f"  ssh -N -L {args.porta}:127.0.0.1:{args.porta} {os.environ.get('USER','orq')}@<endereço da vps>")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="orq-medir",
@@ -1191,6 +1488,15 @@ def main(argv=None):
     s = sub.add_parser("exportar", help="o JSON bruto de tudo")
     s.add_argument("--saida", default="-", help="arquivo de destino (padrão: a tela)")
     s.set_defaults(func=cmd_exportar)
+
+    s = sub.add_parser("painel", help="gera a página e os dados num diretório")
+    s.add_argument("--saida", default=str(pathlib.Path.home() / ".claude/orchestrator/painel"),
+                   help="diretório de destino (padrão: %(default)s)")
+    s.set_defaults(func=cmd_painel)
+
+    s = sub.add_parser("servir", help="serve o painel no endereço local")
+    s.add_argument("--porta", type=int, default=8787, help="porta (padrão: %(default)s)")
+    s.set_defaults(func=cmd_servir)
 
     args = p.parse_args(argv)
     return args.func(args)

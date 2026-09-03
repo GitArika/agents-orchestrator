@@ -1,0 +1,885 @@
+<title>Esteira Medida</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  color-scheme: light;
+  --page:#f2f4f5; --panel:#fbfcfc; --panel-2:#eef1f3; --line:#dde3e6; --line-2:#c8d1d6;
+  --ink-1:#111619; --ink-2:#525f66; --ink-3:#7d8990;
+  --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100; --s0:#7d8990;
+  --good:#0ca30c; --warn:#fab219; --serious:#ec835a; --crit:#d03b3b;
+  --ramp:42,120,214;
+  --shadow:0 1px 2px rgba(17,22,25,.05), 0 1px 1px rgba(17,22,25,.04);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --page:#12161a; --panel:#1a1f23; --panel-2:#232a2f; --line:#2c343a; --line-2:#3c464d;
+    --ink-1:#eef2f4; --ink-2:#a3aeb5; --ink-3:#79848b;
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s0:#79848b;
+    --ramp:57,135,229;
+    --shadow:0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --page:#12161a; --panel:#1a1f23; --panel-2:#232a2f; --line:#2c343a; --line-2:#3c464d;
+  --ink-1:#eef2f4; --ink-2:#a3aeb5; --ink-3:#79848b;
+  --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500; --s0:#79848b;
+  --ramp:57,135,229;
+  --shadow:0 1px 2px rgba(0,0,0,.4);
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--page); color:var(--ink-1);
+  font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:15px; line-height:1.55; margin:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1180px; margin:0 auto; padding:28px 20px 72px}
+h1,h2,h3{font-family:Archivo,"IBM Plex Sans",system-ui,sans-serif; text-wrap:balance; margin:0}
+h1{font-size:clamp(26px,4vw,38px); font-weight:700; letter-spacing:-.02em; line-height:1.1}
+h2{font-size:19px; font-weight:600; letter-spacing:-.01em}
+h3{font-size:14px; font-weight:600}
+p{margin:0}
+.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums}
+.eyebrow{
+  font-family:"IBM Plex Mono",monospace; font-size:11px; font-weight:500;
+  letter-spacing:.13em; text-transform:uppercase; color:var(--ink-3);
+}
+
+/* ---------- cabeçalho ---------- */
+header{display:flex; flex-wrap:wrap; gap:18px; align-items:flex-end; justify-content:space-between;
+  padding-bottom:20px; border-bottom:1px solid var(--line-2)}
+header .lede{max-width:60ch; color:var(--ink-2); font-size:15px; margin-top:10px}
+.meta{font-size:12px; color:var(--ink-3); text-align:right}
+
+/* ---------- controles ---------- */
+.controles{display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:20px 0 24px}
+.grupo{display:flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line);
+  border-radius:7px; padding:4px 6px; box-shadow:var(--shadow)}
+.grupo > span{font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:.1em;
+  text-transform:uppercase; color:var(--ink-3); padding:0 4px}
+button.seg{
+  font:inherit; font-size:13px; border:0; background:transparent; color:var(--ink-2);
+  padding:5px 11px; border-radius:5px; cursor:pointer; white-space:nowrap;
+}
+button.seg:hover{background:var(--panel-2); color:var(--ink-1)}
+button.seg[aria-pressed="true"]{background:var(--ink-1); color:var(--panel); font-weight:500}
+:focus-visible{outline:2px solid var(--ink-1); outline-offset:2px; border-radius:4px}
+select{
+  font:inherit; font-size:13px; color:var(--ink-1); background:var(--panel);
+  border:1px solid var(--line-2); border-radius:6px; padding:5px 8px;
+}
+
+/* ---------- indicadores ---------- */
+.tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:12px; margin-bottom:26px}
+.tile{background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:14px 15px 13px;
+  box-shadow:var(--shadow)}
+.tile .n{font-family:Archivo,sans-serif; font-weight:700; font-size:29px; line-height:1.05;
+  letter-spacing:-.02em; font-variant-numeric:tabular-nums; margin:6px 0 2px}
+.tile .sub{font-size:12px; color:var(--ink-3); line-height:1.35}
+
+/* ---------- painéis ---------- */
+section{margin-bottom:30px}
+.painel{background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:20px;
+  box-shadow:var(--shadow)}
+.cab{display:flex; flex-wrap:wrap; gap:10px; align-items:baseline; justify-content:space-between; margin-bottom:4px}
+.nota{font-size:13px; color:var(--ink-2); max-width:72ch; margin:6px 0 18px}
+.dupla{display:grid; grid-template-columns:1fr 1fr; gap:18px}
+@media (max-width:820px){ .dupla{grid-template-columns:1fr} }
+
+/* ---------- legenda ---------- */
+.legenda{display:flex; flex-wrap:wrap; gap:6px 16px; margin:0 0 14px}
+.chip{display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--ink-2)}
+.swatch{width:11px; height:11px; border-radius:3px; flex:none}
+
+/* ---------- gráficos ---------- */
+.rolagem{overflow-x:auto}
+svg{display:block; max-width:100%}
+svg text{font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums}
+.gridline{stroke:var(--line); stroke-width:1}
+.axis{fill:var(--ink-3); font-size:10.5px}
+.rotulo{fill:var(--ink-1); font-size:11px; font-weight:500}
+.rotulo-fraco{fill:var(--ink-2); font-size:10.5px}
+.marca{cursor:default}
+.marca:hover{opacity:.82}
+
+/* ---------- barras em lista ---------- */
+.linhas{display:flex; flex-direction:column; gap:9px}
+.linha{display:grid; grid-template-columns:118px 1fr auto; gap:12px; align-items:center; font-size:13px}
+.linha .cod{font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-2);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.trilho{background:var(--panel-2); border-radius:4px; height:19px; position:relative; overflow:hidden}
+.barra{height:100%; border-radius:4px 0 0 4px}
+.linha .val{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--ink-1); min-width:62px; text-align:right}
+
+/* ---------- cruzador ---------- */
+.cruz{overflow-x:auto}
+table{border-collapse:separate; border-spacing:0; width:100%; font-size:13px}
+th,td{padding:7px 10px; text-align:right; white-space:nowrap}
+th{font-family:"IBM Plex Mono",monospace; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--ink-3); font-weight:500; border-bottom:1px solid var(--line-2); position:sticky; top:0;
+  background:var(--panel)}
+th:first-child, td:first-child{text-align:left}
+td{border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums}
+tbody tr:hover td{background:var(--panel-2)}
+td.cel{position:relative; color:var(--ink-1)}
+.total{font-weight:600}
+
+/* ---------- espera / limites ---------- */
+.cartoes{display:grid; grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); gap:12px}
+.cartao{border:1px solid var(--line); border-left:3px solid var(--warn); border-radius:8px;
+  padding:12px 14px; background:var(--panel-2)}
+.cartao .quem{font-weight:600; font-size:13.5px; margin-bottom:2px}
+.cartao .quando{font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--ink-3)}
+.cartao .porque{font-size:12.5px; color:var(--ink-2); margin-top:7px; line-height:1.45}
+ol.limites{margin:0; padding-left:20px; display:flex; flex-direction:column; gap:9px;
+  font-size:13.5px; color:var(--ink-2); max-width:74ch}
+ol.limites strong{color:var(--ink-1); font-weight:600}
+
+/* ---------- tabela completa ---------- */
+.busca{font:inherit; font-size:13px; padding:6px 10px; border:1px solid var(--line-2);
+  border-radius:6px; background:var(--panel); color:var(--ink-1); min-width:210px}
+.tabela-alta{max-height:520px; overflow:auto; border:1px solid var(--line); border-radius:8px}
+.pill{display:inline-flex; align-items:center; gap:5px; font-size:11.5px; padding:1px 7px;
+  border-radius:20px; border:1px solid var(--line-2); color:var(--ink-2); white-space:nowrap}
+.pill i{width:7px; height:7px; border-radius:50%; flex:none; font-style:normal}
+.dedu{color:var(--ink-3); font-size:11px}
+
+footer{margin-top:38px; padding-top:18px; border-top:1px solid var(--line);
+  font-size:12.5px; color:var(--ink-3); display:flex; flex-wrap:wrap; gap:8px 20px; justify-content:space-between}
+
+/* dica */
+#dica{position:fixed; pointer-events:none; z-index:50; opacity:0; transition:opacity .1s;
+  background:var(--ink-1); color:var(--page); font-size:12px; line-height:1.45;
+  padding:7px 10px; border-radius:6px; max-width:270px; box-shadow:0 4px 14px rgba(0,0,0,.22)}
+#dica.on{opacity:1}
+#dica .t{font-family:"IBM Plex Mono",monospace; font-size:11px; opacity:.75; display:block}
+@media (prefers-reduced-motion:reduce){ *{transition:none !important; animation:none !important} }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <p class="eyebrow">Qualidade do Front-end · orquestrador</p>
+      <h1>A esteira, medida</h1>
+      <p class="lede">Duzentas e quarenta e nove sessões de IA governadas, do primeiro despacho até o
+      último merge, reconstruídas a partir do rastro que a esteira já deixava em seis lugares que não
+      conversavam entre si.</p>
+    </div>
+    <div class="meta mono" id="meta"></div>
+  </header>
+
+  <div class="controles">
+    <div class="grupo" role="group" aria-label="Máquina">
+      <span>Máquina</span>
+      <button class="seg" data-maq="" aria-pressed="true">Todas</button>
+      <button class="seg" data-maq="servidor" aria-pressed="false">Servidor</button>
+      <button class="seg" data-maq="historico-mac" aria-pressed="false">Histórico</button>
+    </div>
+    <div class="grupo" role="group" aria-label="Tema">
+      <span>Tema</span>
+      <button class="seg" id="tema" aria-pressed="false">Alternar</button>
+    </div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <div class="painel" id="p-vivo">
+      <div class="cab"><h2>Agora</h2><span class="eyebrow" id="vivo-quando">conectando…</span></div>
+      <div id="g-vivo"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab"><h2>Como as sessões terminaram, etapa por etapa</h2></div>
+      <p class="nota">Cada sessão termina de um jeito só. <strong>Avançar</strong> é o caminho bom;
+      <strong>travar</strong> quer dizer que a sessão parou e chamou uma pessoa; <strong>reprovar</strong>
+      é a revisão devolvendo trabalho. As duas últimas não são a mesma coisa e não devem ser somadas.</p>
+      <div id="leg-desfecho" class="legenda"></div>
+      <div class="rolagem"><div id="g-desfecho"></div></div>
+    </div>
+  </section>
+
+  <section class="dupla">
+    <div class="painel">
+      <div class="cab"><h2>Quanto tempo cada etapa leva</h2></div>
+      <p class="nota">Do despacho até o arquivamento. Só entram sessões com início medido — misturar
+      com início deduzido daria uma média indefensável.</p>
+      <div class="rolagem"><div id="g-tempo"></div></div>
+    </div>
+    <div class="painel">
+      <div class="cab"><h2>Quanto cada etapa consome</h2></div>
+      <p class="nota">Tokens gerados pelo modelo, por etapa. É a fatia do custo que cada parte do
+      processo puxa.</p>
+      <div class="rolagem"><div id="g-consumo"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab"><h2>Memória por etapa</h2></div>
+      <p class="nota">Medida das sessões vivas a cada coleta. <strong>Só existe daqui para a
+      frente:</strong> o rastro antigo nunca guardou consumo por sessão, e nada recupera o que
+      jamais foi escrito.</p>
+      <div id="g-memoria"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab">
+        <h2>Cruzamentos</h2>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+          <label class="eyebrow" for="dim-l">Linhas</label>
+          <select id="dim-l"></select>
+          <label class="eyebrow" for="dim-c">Colunas</label>
+          <select id="dim-c"></select>
+          <label class="eyebrow" for="medida">Medida</label>
+          <select id="medida"></select>
+        </div>
+      </div>
+      <p class="nota">Escolha duas dimensões e uma medida. A intensidade do azul mostra onde o valor
+      se concentra; o número está sempre escrito, então a cor nunca é a única informação.</p>
+      <div class="cruz"><div id="g-cruz"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab"><h2>A corrida, unidade por unidade</h2></div>
+      <p class="nota">Cada faixa é uma unidade de trabalho; cada bloco, uma sessão, posicionada na hora
+      em que aconteceu. A letra dentro do bloco repete a etapa, para a cor nunca ser a única pista.</p>
+      <div id="leg-etapa" class="legenda"></div>
+      <div class="rolagem"><div id="g-linha"></div></div>
+    </div>
+  </section>
+
+  <section class="dupla">
+    <div class="painel">
+      <div class="cab"><h2>Onde houve mais retrabalho</h2></div>
+      <p class="nota">Reprovações na revisão, por unidade. Só aparecem as que voltaram ao menos uma vez.</p>
+      <div id="g-retrabalho" class="linhas"></div>
+    </div>
+    <div class="painel">
+      <div class="cab"><h2>Quanto código saiu</h2></div>
+      <p class="nota">Linhas acrescentadas e removidas, por unidade, atribuídas pelo merge que integrou
+      cada branch.</p>
+      <div class="rolagem"><div id="g-producao"></div></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab"><h2>Esperando uma pessoa</h2></div>
+      <p class="nota">Unidades paradas porque a sessão chegou a um ponto que ela não decide sozinha.</p>
+      <div id="g-espera" class="cartoes"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab">
+        <h2>Todas as sessões</h2>
+        <input class="busca" id="busca" type="search" placeholder="filtrar por unidade, etapa, desfecho…"
+               aria-label="Filtrar sessões">
+      </div>
+      <p class="nota">A tabela inteira, para conferir qualquer número acima. Clique num cabeçalho para
+      ordenar.</p>
+      <div class="tabela-alta"><table id="t-sessoes"><thead></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="painel">
+      <div class="cab"><h2>O que estes números não dizem</h2></div>
+      <p class="nota">Todo número aqui carrega uma ressalva. Elas viajam junto com os dados, porque
+      quem abrir isto daqui a seis meses não vai lembrar.</p>
+      <ol class="limites" id="g-limites"></ol>
+    </div>
+  </section>
+
+  <footer>
+    <span id="rodape-1"></span>
+    <span class="mono" id="rodape-2"></span>
+  </footer>
+</div>
+
+<div id="dica" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+let D = null, V = null;
+
+/* ---------------- vocabulário ---------------- */
+const ETAPAS = ["spec", "implement", "review", "integrate"];
+const ETAPA_NOME = {
+  spec: "Especificação", implement: "Implementação",
+  review: "Revisão", integrate: "Integração", "sem-estagio": "Sem etapa"
+};
+const ETAPA_LETRA = { spec:"E", implement:"I", review:"R", integrate:"N", "sem-estagio":"·" };
+const ETAPA_COR = {
+  spec:"var(--s1)", implement:"var(--s2)", review:"var(--s3)",
+  integrate:"var(--s4)", "sem-estagio":"var(--s0)"
+};
+const DESFECHOS = ["avancou","travou","reprovou","orfa","reiniciou","retomada","recolhida","(sem registro)"];
+const DESFECHO_NOME = {
+  avancou:"Avançou", travou:"Travou esperando pessoa", reprovou:"Reprovada na revisão",
+  orfa:"Morreu sem se despedir", reiniciou:"Reiniciada", retomada:"Retomada após espera",
+  recolhida:"Recolhida pela varredura", "(sem registro)":"Fim não registrado"
+};
+const DESFECHO_COR = {
+  avancou:"var(--good)", travou:"var(--warn)", reprovou:"var(--serious)",
+  orfa:"var(--crit)", reiniciou:"var(--s1)", retomada:"var(--s3)",
+  recolhida:"var(--s0)", "(sem registro)":"var(--ink-3)"
+};
+
+/* ---------------- utilidades ---------------- */
+const num = n => (n == null ? "—" : Math.round(n).toLocaleString("pt-BR"));
+const dec = (n, c=1) => (n == null ? "—" : n.toLocaleString("pt-BR", {minimumFractionDigits:c, maximumFractionDigits:c}));
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[m]));
+const dur = m => m == null ? "—" : (m < 90 ? dec(m,0)+" min" : dec(m/60,1)+" h");
+const mediana = a => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y), i=s.length>>1;
+  return s.length%2 ? s[i] : (s[i-1]+s[i])/2; };
+const quantil = (a,q) => { if(!a.length) return null; const s=[...a].sort((x,y)=>x-y);
+  return s[Math.min(s.length-1, Math.floor(s.length*q))]; };
+const dataCurta = t => t ? t.slice(8,10)+"/"+t.slice(5,7)+" "+t.slice(11,16) : "—";
+
+const UNI = new Map();
+const desf = s => s.desfecho || "(sem registro)";
+
+/* ---------------- estado ---------------- */
+let maquina = "";
+const sessoes = () => D.sessao.filter(s => !maquina || s.maquina === maquina);
+
+/* ---------------- dica ---------------- */
+const dica = document.getElementById("dica");
+function ligarDica(el, html){
+  el.addEventListener("mouseenter", e => { dica.innerHTML = html; dica.classList.add("on"); mover(e); });
+  el.addEventListener("mousemove", mover);
+  el.addEventListener("mouseleave", () => dica.classList.remove("on"));
+}
+function mover(e){
+  const r = dica.getBoundingClientRect();
+  let x = e.clientX + 14, y = e.clientY + 16;
+  if (x + r.width > innerWidth - 8) x = e.clientX - r.width - 12;
+  if (y + r.height > innerHeight - 8) y = e.clientY - r.height - 12;
+  dica.style.left = x + "px"; dica.style.top = y + "px";
+}
+
+/* ---------------- indicadores ---------------- */
+function tiles(){
+  const S = sessoes();
+  const avanc = S.filter(s => s.desfecho === "avancou").length;
+  const idsU = new Set(S.map(s => s.unidade));
+  const commits = D.commit.filter(c => idsU.has((UNI.get(c.unidade_id)||{}).codigo));
+  const ins = commits.reduce((a,c) => a + (c.insercoes||0), 0);
+  const del = commits.reduce((a,c) => a + (c.delecoes||0), 0);
+  const tok = S.reduce((a,s) => a + (s.tokens_saida||0), 0);
+  const cache = S.reduce((a,s) => a + (s.cache_lido||0), 0);
+  const mins = S.filter(s => s.minutos != null && !s.inicio_deduzido).reduce((a,s)=>a+s.minutos,0);
+
+  const dados = [
+    ["Sessões governadas", num(S.length), idsU.size + " unidades de trabalho"],
+    ["Terminaram avançando", dec(avanc/S.length*100,1).replace(".",",") + "%", num(avanc) + " de " + num(S.length)],
+    ["Tempo de sessão somado", dec(mins/60,0) + " h", "só o que foi medido"],
+    ["Código integrado", "+" + num(ins), num(del) + " linhas removidas · " + num(commits.length) + " commits"],
+    ["Tokens gerados", dec(tok/1e6,1) + " mi", dec(cache/1e9,1) + " bi lidos de cache"],
+  ];
+  document.getElementById("tiles").innerHTML = dados.map(([t,n,s]) =>
+    `<div class="tile"><p class="eyebrow">${esc(t)}</p><p class="n">${esc(n)}</p><p class="sub">${esc(s)}</p></div>`
+  ).join("");
+}
+
+/* ---------------- etapa × desfecho ---------------- */
+function gDesfecho(){
+  const S = sessoes();
+  const etapas = ETAPAS.filter(e => S.some(s => s.etapa === e));
+  const outras = [...new Set(S.map(s=>s.etapa))].filter(e => !ETAPAS.includes(e));
+  const eixo = [...etapas, ...outras];
+  const usados = DESFECHOS.filter(d => S.some(s => desf(s) === d));
+
+  document.getElementById("leg-desfecho").innerHTML = usados.map(d =>
+    `<span class="chip"><span class="swatch" style="background:${DESFECHO_COR[d]}"></span>${esc(DESFECHO_NOME[d])}</span>`
+  ).join("");
+
+  const L=176, R=16, alturaBarra=30, gap=16, T=22;
+  const larg = Math.max(560, document.querySelector(".wrap").clientWidth - 84);
+  const w = larg - L - R;
+  const max = Math.max(...eixo.map(e => S.filter(s => s.etapa === e).length));
+  const h = T + eixo.length*(alturaBarra+gap);
+
+  let svg = `<svg viewBox="0 0 ${larg} ${h}" width="${larg}" height="${h}" role="img"
+    aria-label="Sessões por etapa e desfecho">`;
+  for (let i=0; i<=4; i++){
+    const x = L + w*i/4;
+    svg += `<line class="gridline" x1="${x}" y1="${T-8}" x2="${x}" y2="${h-6}"/>
+      <text class="axis" x="${x}" y="${T-14}" text-anchor="middle">${Math.round(max*i/4)}</text>`;
+  }
+  eixo.forEach((e, i) => {
+    const linhas = S.filter(s => s.etapa === e);
+    const y = T + i*(alturaBarra+gap);
+    svg += `<text class="rotulo" x="0" y="${y+13}">${esc(ETAPA_NOME[e]||e)}</text>
+      <text class="rotulo-fraco" x="0" y="${y+27}">${linhas.length} sessões</text>`;
+    let x = L;
+    usados.forEach(d => {
+      const n = linhas.filter(s => desf(s) === d).length;
+      if (!n) return;
+      const largura = n/max*w;
+      const rot = largura > 26 ? `<text x="${x+largura/2}" y="${y+alturaBarra/2+4}" text-anchor="middle"
+        style="fill:var(--panel); font-size:11px; font-weight:600">${n}</text>` : "";
+      svg += `<g class="marca" data-dica="${esc(ETAPA_NOME[e]||e)}|${esc(DESFECHO_NOME[d])}: ${n} sessões">
+        <rect x="${x}" y="${y}" width="${Math.max(largura-2,1)}" height="${alturaBarra}" rx="3"
+          fill="${DESFECHO_COR[d]}"/>${rot}</g>`;
+      x += largura;
+    });
+  });
+  svg += `</svg>`;
+  const alvo = document.getElementById("g-desfecho");
+  alvo.innerHTML = svg;
+  alvo.querySelectorAll("[data-dica]").forEach(g => {
+    const [t, c] = g.dataset.dica.split("|");
+    ligarDica(g, `<span class="t">${esc(t)}</span>${esc(c)}`);
+  });
+}
+
+/* ---------------- tempo por etapa ---------------- */
+function gTempo(){
+  const S = sessoes().filter(s => s.minutos != null && !s.inicio_deduzido);
+  const etapas = ETAPAS.filter(e => S.some(s => s.etapa === e));
+  const larg = 520, L = 116, R = 54, T = 26, linha = 46;
+  const w = larg - L - R, h = T + etapas.length*linha + 8;
+  const topo = Math.max(...S.map(s => s.minutos));
+  const x = v => L + v/topo*w;
+
+  let svg = `<svg viewBox="0 0 ${larg} ${h}" width="${larg}" height="${h}" role="img"
+    aria-label="Distribuição de tempo por etapa">`;
+  [0,.25,.5,.75,1].forEach(f => {
+    svg += `<line class="gridline" x1="${x(topo*f)}" y1="${T-8}" x2="${x(topo*f)}" y2="${h-14}"/>
+      <text class="axis" x="${x(topo*f)}" y="${T-14}" text-anchor="middle">${Math.round(topo*f)}m</text>`;
+  });
+  etapas.forEach((e, i) => {
+    const v = S.filter(s => s.etapa === e).map(s => s.minutos);
+    const y = T + i*linha + 14;
+    const med = mediana(v), p90 = quantil(v,.9), mn = Math.min(...v), mx = Math.max(...v);
+    svg += `<text class="rotulo" x="0" y="${y+4}">${esc(ETAPA_NOME[e])}</text>
+      <text class="rotulo-fraco" x="0" y="${y+18}">${v.length} sessões</text>
+      <line x1="${x(mn)}" y1="${y}" x2="${x(mx)}" y2="${y}" stroke="var(--line-2)" stroke-width="2"/>
+      <rect x="${x(med)}" y="${y-8}" width="${Math.max(x(p90)-x(med),3)}" height="16" rx="3"
+        fill="${ETAPA_COR[e]}" opacity=".28"/>
+      <circle cx="${x(med)}" cy="${y}" r="5.5" fill="${ETAPA_COR[e]}"/>
+      <text class="rotulo" x="${Math.min(x(med)+11, larg-R+2)}" y="${y+4}">${dec(med,0)}m</text>`;
+    svg += `<g class="marca" data-dica="${esc(ETAPA_NOME[e])}|mediana ${dec(med,0)} min · 90% abaixo de ${dec(p90,0)} min · mais longa ${dur(mx)}">
+      <rect x="${L}" y="${y-16}" width="${w}" height="32" fill="transparent"/></g>`;
+  });
+  svg += `<text class="axis" x="${L}" y="${h-2}">mediana · faixa até o percentil 90 · mínimo e máximo</text></svg>`;
+  const alvo = document.getElementById("g-tempo");
+  alvo.innerHTML = svg;
+  alvo.querySelectorAll("[data-dica]").forEach(g => {
+    const [t, c] = g.dataset.dica.split("|");
+    ligarDica(g, `<span class="t">${esc(t)}</span>${esc(c)}`);
+  });
+}
+
+/* ---------------- consumo por etapa ---------------- */
+function gConsumo(){
+  const S = sessoes();
+  const etapas = ETAPAS.filter(e => S.some(s => s.etapa === e));
+  const val = e => S.filter(s => s.etapa === e).reduce((a,s) => a + (s.tokens_saida||0), 0);
+  const max = Math.max(...etapas.map(val)) || 1;
+  const larg = 520, L = 116, R = 78, T = 10, linha = 46;
+  const w = larg - L - R, h = T + etapas.length*linha;
+
+  let svg = `<svg viewBox="0 0 ${larg} ${h}" width="${larg}" height="${h}" role="img"
+    aria-label="Tokens gerados por etapa">`;
+  etapas.forEach((e, i) => {
+    const v = val(e), y = T + i*linha;
+    const ses = S.filter(s => s.etapa === e && s.tokens_saida);
+    const porSessao = ses.length ? v/ses.length : 0;
+    svg += `<text class="rotulo" x="0" y="${y+17}">${esc(ETAPA_NOME[e])}</text>
+      <text class="rotulo-fraco" x="0" y="${y+31}">${num(porSessao/1000)} mil por sessão</text>
+      <g class="marca" data-dica="${esc(ETAPA_NOME[e])}|${num(v)} tokens gerados em ${ses.length} sessões">
+      <rect x="${L}" y="${y+4}" width="${Math.max(v/max*w,2)}" height="24" rx="3" fill="${ETAPA_COR[e]}"/></g>
+      <text class="rotulo" x="${L + v/max*w + 8}" y="${y+21}">${dec(v/1e6,2)} mi</text>`;
+  });
+  svg += `</svg>`;
+  const alvo = document.getElementById("g-consumo");
+  alvo.innerHTML = svg;
+  alvo.querySelectorAll("[data-dica]").forEach(g => {
+    const [t, c] = g.dataset.dica.split("|");
+    ligarDica(g, `<span class="t">${esc(t)}</span>${esc(c)}`);
+  });
+}
+
+/* ---------------- cruzador ---------------- */
+const DIMS = {
+  etapa:    { rot:"Etapa",    val: s => ETAPA_NOME[s.etapa] || s.etapa },
+  desfecho: { rot:"Desfecho", val: s => DESFECHO_NOME[desf(s)] },
+  maquina:  { rot:"Máquina",  val: s => s.maquina === "servidor" ? "Servidor" : "Histórico" },
+  unidade:  { rot:"Unidade",  val: s => s.unidade },
+  dia:      { rot:"Dia",      val: s => s.fim ? s.fim.slice(8,10)+"/"+s.fim.slice(5,7) : "sem data" },
+  inicio:   { rot:"Origem do início", val: s => s.inicio_deduzido ? "Deduzido" : "Medido" },
+};
+const MEDIDAS = {
+  sessoes:  { rot:"Sessões",           f: L => L.length,                              fmt:num },
+  minutos:  { rot:"Minutos (medidos)", f: L => L.filter(s=>!s.inicio_deduzido && s.minutos!=null).reduce((a,s)=>a+s.minutos,0), fmt:v=>dec(v,0) },
+  tokens:   { rot:"Tokens gerados",    f: L => L.reduce((a,s)=>a+(s.tokens_saida||0),0), fmt:num },
+  cache:    { rot:"Cache lido",        f: L => L.reduce((a,s)=>a+(s.cache_lido||0),0),   fmt:num },
+  mensagens:{ rot:"Mensagens",         f: L => L.reduce((a,s)=>a+(s.mensagens||0),0),    fmt:num },
+};
+
+// Um seletor sem valor conhecido derrubaria a pagina inteira, e nao so este
+// painel. Cai para o padrao em vez de quebrar.
+function escolha(id, mapa, padrao){
+  const v = (document.getElementById(id) || {}).value;
+  return mapa[v] ? v : padrao;
+}
+function gCruz(){
+  const dl = escolha("dim-l", DIMS, "etapa");
+  const dc = escolha("dim-c", DIMS, "desfecho");
+  const md = escolha("medida", MEDIDAS, "sessoes");
+  const S = sessoes();
+  const linhas = [...new Set(S.map(DIMS[dl].val))].sort();
+  const cols  = [...new Set(S.map(DIMS[dc].val))].sort();
+  const cel = {};
+  let max = 0;
+  linhas.forEach(l => cols.forEach(c => {
+    const sub = S.filter(s => DIMS[dl].val(s) === l && DIMS[dc].val(s) === c);
+    const v = sub.length ? MEDIDAS[md].f(sub) : 0;
+    cel[l+" "+c] = v;
+    if (v > max) max = v;
+  }));
+
+  let t = `<table><thead><tr><th>${esc(DIMS[dl].rot)}</th>`
+    + cols.map(c => `<th>${esc(c)}</th>`).join("") + `<th>Total</th></tr></thead><tbody>`;
+  linhas.forEach(l => {
+    const sub = S.filter(s => DIMS[dl].val(s) === l);
+    t += `<tr><td>${esc(l)}</td>` + cols.map(c => {
+      const v = cel[l+" "+c];
+      const a = max ? (v/max)*0.78 : 0;
+      return `<td class="cel" style="background:rgba(var(--ramp),${a.toFixed(3)})">${v ? MEDIDAS[md].fmt(v) : "·"}</td>`;
+    }).join("") + `<td class="total">${MEDIDAS[md].fmt(MEDIDAS[md].f(sub))}</td></tr>`;
+  });
+  t += `<tr><td class="total">Total</td>` + cols.map(c => {
+    const sub = S.filter(s => DIMS[dc].val(s) === c);
+    return `<td class="total">${MEDIDAS[md].fmt(MEDIDAS[md].f(sub))}</td>`;
+  }).join("") + `<td class="total">${MEDIDAS[md].fmt(MEDIDAS[md].f(S))}</td></tr>`;
+  t += `</tbody></table>`;
+  document.getElementById("g-cruz").innerHTML = t;
+}
+
+/* ---------------- linha do tempo ---------------- */
+function gLinha(){
+  const S = sessoes().filter(s => s.inicio && s.fim);
+  document.getElementById("leg-etapa").innerHTML = ETAPAS.map(e =>
+    `<span class="chip"><span class="swatch" style="background:${ETAPA_COR[e]}"></span>
+     <span class="mono" style="font-size:11px">${ETAPA_LETRA[e]}</span> ${esc(ETAPA_NOME[e])}</span>`
+  ).join("");
+  if (!S.length){ document.getElementById("g-linha").innerHTML = ""; return; }
+
+  const t0 = Math.min(...S.map(s => Date.parse(s.inicio)));
+  const t1 = Math.max(...S.map(s => Date.parse(s.fim)));
+  const unidades = [...new Set(S.map(s => s.unidade))]
+    .sort((a,b) => Math.min(...S.filter(s=>s.unidade===a).map(s=>Date.parse(s.inicio)))
+                 - Math.min(...S.filter(s=>s.unidade===b).map(s=>Date.parse(s.inicio))));
+  const L = 84, R = 12, T = 26, linha = 20;
+  const larg = Math.max(680, document.querySelector(".wrap").clientWidth - 84);
+  const w = larg - L - R, h = T + unidades.length*linha + 6;
+  const x = ms => L + (ms - t0)/(t1 - t0)*w;
+
+  let svg = `<svg viewBox="0 0 ${larg} ${h}" width="${larg}" height="${h}" role="img"
+    aria-label="Linha do tempo das sessões por unidade">`;
+  const dias = [];
+  for (let d = new Date(t0); d <= new Date(t1); d.setUTCHours(24,0,0,0)) dias.push(new Date(d).getTime());
+  dias.forEach(d => {
+    svg += `<line class="gridline" x1="${x(d)}" y1="${T-10}" x2="${x(d)}" y2="${h-4}"/>
+      <text class="axis" x="${x(d)+4}" y="${T-14}">${new Date(d).toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit"})}</text>`;
+  });
+  unidades.forEach((u, i) => {
+    const y = T + i*linha;
+    svg += `<text class="rotulo-fraco" x="0" y="${y+13}">${esc(u)}</text>`;
+    S.filter(s => s.unidade === u).forEach(s => {
+      const a = x(Date.parse(s.inicio)), b = Math.max(x(Date.parse(s.fim)), a + 3);
+      const larguraBloco = b - a;
+      const letra = larguraBloco > 11
+        ? `<text x="${a+larguraBloco/2}" y="${y+11.5}" text-anchor="middle"
+             style="fill:var(--panel); font-size:9.5px; font-weight:600">${ETAPA_LETRA[s.etapa]||"·"}</text>` : "";
+      svg += `<g class="marca" data-dica="${esc(u)} · ${esc(ETAPA_NOME[s.etapa]||s.etapa)}|${esc(DESFECHO_NOME[desf(s)])} · ${dur(s.minutos)} · ${esc(dataCurta(s.inicio))}${s.inicio_deduzido ? " · início deduzido" : ""}">
+        <rect x="${a}" y="${y+2}" width="${larguraBloco}" height="14" rx="2.5"
+          fill="${ETAPA_COR[s.etapa]||"var(--s0)"}" ${s.inicio_deduzido ? 'opacity=".5"' : ""}/>${letra}</g>`;
+    });
+  });
+  svg += `</svg>`;
+  const alvo = document.getElementById("g-linha");
+  alvo.innerHTML = svg;
+  alvo.querySelectorAll("[data-dica]").forEach(g => {
+    const [t, c] = g.dataset.dica.split("|");
+    ligarDica(g, `<span class="t">${esc(t)}</span>${esc(c)}`);
+  });
+}
+
+/* ---------------- retrabalho ---------------- */
+function gRetrabalho(){
+  const S = sessoes();
+  const por = {};
+  S.forEach(s => {
+    const u = por[s.unidade] || (por[s.unidade] = {rep:0, orfa:0, trav:0, titulo:""});
+    if (s.desfecho === "reprovou") u.rep++;
+    if (s.desfecho === "orfa") u.orfa++;
+    if (s.desfecho === "travou") u.trav++;
+    u.titulo = s.titulo || u.titulo;
+  });
+  const lista = Object.entries(por).filter(([,v]) => v.rep + v.orfa > 0)
+    .sort((a,b) => (b[1].rep+b[1].orfa) - (a[1].rep+a[1].orfa)).slice(0,10);
+  const max = Math.max(1, ...lista.map(([,v]) => v.rep + v.orfa));
+  document.getElementById("g-retrabalho").innerHTML = lista.length ? lista.map(([cod,v]) => `
+    <div class="linha" title="${esc(v.titulo)}">
+      <span class="cod">${esc(cod)}</span>
+      <span class="trilho">
+        <span class="barra" style="width:${(v.rep/max*100).toFixed(1)}%; background:var(--serious)"></span>
+        <span class="barra" style="width:${(v.orfa/max*100).toFixed(1)}%; background:var(--crit);
+          position:absolute; left:${(v.rep/max*100).toFixed(1)}%; border-radius:0 4px 4px 0"></span>
+      </span>
+      <span class="val">${v.rep} rep${v.orfa ? " · " + v.orfa + " órf" : ""}</span>
+    </div>`).join("")
+    : `<p class="nota">Nenhuma unidade voltou nesta seleção.</p>`;
+}
+
+/* ---------------- produção ---------------- */
+function gProducao(){
+  const idsU = new Set(sessoes().map(s => s.unidade));
+  const por = {};
+  D.commit.forEach(c => {
+    const u = UNI.get(c.unidade_id); if (!u || !idsU.has(u.codigo)) return;
+    const p = por[u.codigo] || (por[u.codigo] = {ins:0, del:0, n:0});
+    p.ins += c.insercoes||0; p.del += c.delecoes||0; p.n++;
+  });
+  const lista = Object.entries(por).sort((a,b) => (b[1].ins+b[1].del) - (a[1].ins+a[1].del)).slice(0,12);
+  if (!lista.length){ document.getElementById("g-producao").innerHTML =
+    `<p class="nota">Sem commits atribuídos nesta seleção.</p>`; return; }
+  const max = Math.max(...lista.map(([,v]) => Math.max(v.ins, v.del)));
+  const larg = 520, L = 74, meio = L + (larg-L-10)/2, semi = (larg-L-10)/2 - 10;
+  const linha = 22, T = 24, h = T + lista.length*linha + 14;
+
+  let svg = `<svg viewBox="0 0 ${larg} ${h}" width="${larg}" height="${h}" role="img"
+    aria-label="Linhas acrescentadas e removidas por unidade">
+    <text class="axis" x="${meio-8}" y="${T-12}" text-anchor="end">removidas</text>
+    <text class="axis" x="${meio+8}" y="${T-12}">acrescentadas</text>
+    <line class="gridline" x1="${meio}" y1="${T-6}" x2="${meio}" y2="${h-10}"/>`;
+  lista.forEach(([cod,v], i) => {
+    const y = T + i*linha;
+    const li = v.ins/max*semi, ld = v.del/max*semi;
+    svg += `<text class="rotulo-fraco" x="0" y="${y+12}">${esc(cod)}</text>
+      <g class="marca" data-dica="${esc(cod)}|+${num(v.ins)} / −${num(v.del)} linhas em ${v.n} commits">
+        <rect x="${meio-ld}" y="${y+3}" width="${Math.max(ld,1)}" height="12" rx="2" fill="var(--s2)"/>
+        <rect x="${meio+2}" y="${y+3}" width="${Math.max(li,1)}" height="12" rx="2" fill="var(--s1)"/>
+      </g>
+      <text class="rotulo-fraco" x="${meio+li+7}" y="${y+13}">${num(v.ins)}</text>`;
+  });
+  svg += `</svg>`;
+  const alvo = document.getElementById("g-producao");
+  alvo.innerHTML = svg;
+  alvo.querySelectorAll("[data-dica]").forEach(g => {
+    const [t, c] = g.dataset.dica.split("|");
+    ligarDica(g, `<span class="t">${esc(t)}</span>${esc(c)}`);
+  });
+}
+
+/* ---------------- espera humana ---------------- */
+function gEspera(){
+  const el = document.getElementById("g-espera");
+  const lista = (V && V.esperas) ? V.esperas.map(e => ({
+    codigo:e.unidade, titulo:e.titulo, ts:e.desde, texto:e.motivo })) : D.espera;
+  if (!lista.length){ el.innerHTML = `<p class="nota">Ninguém está esperando você agora.</p>`; return; }
+  el.innerHTML = lista.map(e => `
+    <div class="cartao">
+      <p class="quem">${esc(e.titulo || e.codigo)}</p>
+      <p class="quando">${esc(e.codigo)} · desde ${esc(dataCurta(e.ts))}</p>
+      <p class="porque">${esc((e.texto||"").slice(0,240))}${(e.texto||"").length>240 ? "…" : ""}</p>
+    </div>`).join("");
+}
+
+/* ---------------- tabela ---------------- */
+let ordem = {campo:"inicio", desc:true};
+const COLS = [
+  ["unidade","Unidade"], ["etapa","Etapa"], ["desfecho","Desfecho"], ["maquina","Máquina"],
+  ["inicio","Início"], ["minutos","Duração"], ["mensagens","Mens."],
+  ["tokens_saida","Tokens"], ["cache_lido","Cache lido"],
+];
+function tabela(){
+  const busca = document.getElementById("busca").value.trim().toLowerCase();
+  let L = sessoes();
+  if (busca) L = L.filter(s => [s.unidade, ETAPA_NOME[s.etapa]||s.etapa, DESFECHO_NOME[desf(s)],
+    s.titulo, s.maquina].join(" ").toLowerCase().includes(busca));
+  L = [...L].sort((a,b) => {
+    let x = a[ordem.campo], y = b[ordem.campo];
+    if (ordem.campo === "desfecho"){ x = desf(a); y = desf(b); }
+    if (x == null) x = ordem.desc ? -Infinity : Infinity;
+    if (y == null) y = ordem.desc ? -Infinity : Infinity;
+    const c = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y),"pt-BR");
+    return ordem.desc ? -c : c;
+  });
+  const t = document.getElementById("t-sessoes");
+  t.querySelector("thead").innerHTML = "<tr>" + COLS.map(([c,r]) =>
+    `<th><button class="seg" data-col="${c}" style="padding:2px 6px; font-size:10.5px;
+      font-family:'IBM Plex Mono',monospace; letter-spacing:.08em; text-transform:uppercase"
+      aria-pressed="${ordem.campo===c}">${esc(r)}${ordem.campo===c ? (ordem.desc?" ↓":" ↑") : ""}</button></th>`
+  ).join("") + "</tr>";
+  t.querySelector("tbody").innerHTML = L.map(s => `<tr>
+      <td title="${esc(s.titulo||"")}">${esc(s.unidade)}</td>
+      <td><span class="pill"><i style="background:${ETAPA_COR[s.etapa]||"var(--s0)"}"></i>${esc(ETAPA_NOME[s.etapa]||s.etapa)}</span></td>
+      <td><span class="pill"><i style="background:${DESFECHO_COR[desf(s)]}"></i>${esc(DESFECHO_NOME[desf(s)])}</span></td>
+      <td>${s.maquina === "servidor" ? "Servidor" : "Histórico"}</td>
+      <td>${esc(dataCurta(s.inicio))}${s.inicio_deduzido ? ' <span class="dedu">deduzido</span>' : ""}</td>
+      <td>${dur(s.minutos)}</td><td>${num(s.mensagens)}</td>
+      <td>${num(s.tokens_saida)}</td><td>${num(s.cache_lido)}</td></tr>`).join("");
+  t.querySelectorAll("[data-col]").forEach(b => b.onclick = () => {
+    const c = b.dataset.col;
+    ordem = {campo:c, desc: ordem.campo === c ? !ordem.desc : true};
+    tabela();
+  });
+}
+
+/* ---------------- limites e rodapé ---------------- */
+function estaticos(){
+  document.getElementById("g-limites").innerHTML = D.limites.map(l => {
+    const [cabeca, ...resto] = l.split(/(?<=[.:]) /);
+    return `<li><strong>${esc(cabeca)}</strong> ${esc(resto.join(" "))}</li>`;
+  }).join("");
+  const g = D.gerado_em;
+  document.getElementById("meta").innerHTML =
+    `coletado em ${esc(dataCurta(g))} UTC<br>${num(D.sessao.length)} sessões · ${num(D.evento.length)} eventos`;
+  document.getElementById("rodape-1").textContent =
+    "Medido pelo orquestrador com orq-medir. O dado bruto sai por: orq-medir exportar";
+  document.getElementById("rodape-2").textContent = "esteira Qualidade do Front-end";
+}
+
+
+/* ---------------- o agora ---------------- */
+function idade(desde){
+  if (!desde) return "—";
+  const m = (Date.now() - Date.parse(desde)) / 60000;
+  if (m < 1) return "agora";
+  return m < 90 ? dec(m,0) + " min" : dec(m/60,1) + " h";
+}
+function gVivo(){
+  const q = document.getElementById("vivo-quando");
+  const el = document.getElementById("g-vivo");
+  if (!V){
+    q.textContent = "sem contato com o servidor";
+    el.innerHTML = `<p class="nota">O painel não conseguiu ler o estado da máquina. Os números
+      históricos abaixo continuam válidos.</p>`;
+    return;
+  }
+  q.textContent = "lido há " + idade(V.agora) + (V.laco_rodando ? " · laço rodando" : " · laço parado");
+  const ses = V.sessoes || [];
+  let html = "";
+  if (!ses.length){
+    html += `<p class="nota" style="margin-bottom:14px">Nenhuma sessão trabalhando neste momento.
+      ${V.laco_rodando ? "O laço está de pé e vai despachar quando houver o que fazer."
+        : "O laço está parado — nada será despachado até alguém ligá-lo."}</p>`;
+  } else {
+    html += `<div class="cartoes" style="margin-bottom:14px">` + ses.map(s => `
+      <div class="cartao" style="border-left-color:${ETAPA_COR[s.etapa]||"var(--s0)"}">
+        <p class="quem">${esc(s.unidade)} · ${esc(ETAPA_NOME[s.etapa]||"etapa desconhecida")}</p>
+        <p class="quando">rodando há ${idade(s.criada_em)} · ${dec(s.rss_mb,0)} MB</p>
+        ${s.titulo ? `<p class="porque">${esc(s.titulo)}</p>` : ""}
+      </div>`).join("") + `</div>`;
+  }
+  const esp = V.esperas || [];
+  html += `<p class="eyebrow" style="margin-bottom:8px">Esperando decisão sua: ${esp.length}</p>`;
+  if (V.quarentena && V.quarentena.length)
+    html += `<p class="nota" style="margin:0">Em quarentena depois de falhar duas vezes:
+      <span class="mono">${esc(V.quarentena.join(", "))}</span></p>`;
+  el.innerHTML = html;
+}
+
+/* ---------------- memória por etapa ---------------- */
+function gMemoria(){
+  const el = document.getElementById("g-memoria");
+  const M = (D.memoria || []).filter(m => m.amostras);
+  if (!M.length){
+    el.innerHTML = `<p class="nota" style="margin:0">Nenhuma amostra ainda. A primeira aparece na
+      próxima coleta em que houver sessão viva.</p>`;
+    return;
+  }
+  const max = Math.max(...M.map(m => m.maior_mb || 0)) || 1;
+  el.innerHTML = `<div class="linhas">` + M.map(m => `
+    <div class="linha">
+      <span class="cod">${esc(ETAPA_NOME[m.etapa] || m.etapa)}</span>
+      <span class="trilho">
+        <span class="barra" style="width:${((m.media_mb||0)/max*100).toFixed(1)}%;
+          background:${ETAPA_COR[m.etapa]||"var(--s0)"}"></span>
+      </span>
+      <span class="val">${num(m.media_mb)} MB</span>
+    </div>`).join("") + `</div>
+    <p class="nota" style="margin:14px 0 0">Média por sessão viva; a maior amostra chegou a
+    ${num(max)} MB. ${num(M.reduce((a,m)=>a+m.amostras,0))} amostras até agora.</p>`;
+}
+
+/* ---------------- montagem ---------------- */
+function tudo(){ tiles(); gVivo(); gMemoria(); gDesfecho(); gTempo(); gConsumo(); gCruz(); gLinha();
+  gRetrabalho(); gProducao(); gEspera(); tabela(); }
+
+async function buscar(url){
+  const r = await fetch(url + "?t=" + Date.now(), {cache:"no-store"});
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+async function recarregar(){
+  const novo = await buscar("dados.json");
+  D = novo;
+  UNI.clear(); D.unidade.forEach(u => UNI.set(u.id, u));
+}
+async function recarregarVivo(){
+  try { V = await buscar("vivo.json"); } catch(e){ V = null; }
+}
+
+(async function inicio(){
+  const sl = (id, obj, sel) => {
+    const e = document.getElementById(id);
+    e.innerHTML = Object.entries(obj).map(([k,v]) =>
+      `<option value="${k}"${k===sel?" selected":""}>${esc(v.rot)}</option>`).join("");
+    e.onchange = gCruz;
+  };
+  sl("dim-l", DIMS, "etapa"); sl("dim-c", DIMS, "desfecho"); sl("medida", MEDIDAS, "sessoes");
+
+  document.querySelectorAll("[data-maq]").forEach(b => b.onclick = () => {
+    maquina = b.dataset.maq;
+    document.querySelectorAll("[data-maq]").forEach(o =>
+      o.setAttribute("aria-pressed", String(o === b)));
+    tudo();
+  });
+  document.getElementById("busca").oninput = tabela;
+  document.getElementById("tema").onclick = function(){
+    const escuro = document.documentElement.getAttribute("data-theme") === "dark"
+      || (!document.documentElement.getAttribute("data-theme")
+          && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", escuro ? "light" : "dark");
+    this.setAttribute("aria-pressed", String(!escuro));
+    tudo();
+  };
+  let t; addEventListener("resize", () => { clearTimeout(t); t = setTimeout(() => { gDesfecho(); gLinha(); }, 160); });
+
+  try { await recarregar(); } catch(e){
+    document.getElementById("g-vivo").innerHTML =
+      `<p class="nota">Não consegui carregar os dados. O painel precisa ser servido por
+       <span class="mono">orq-medir servir</span> — abrir o arquivo direto não funciona.</p>`;
+    return;
+  }
+  await recarregarVivo();
+  estaticos(); tudo();
+
+  // O agora muda a cada minuto; o histórico, a cada coleta. Cadências diferentes
+  // de propósito: recarregar o histórico de 10 em 10 segundos seria desperdício.
+  setInterval(async () => { await recarregarVivo(); gVivo(); gEspera(); }, 15000);
+  setInterval(async () => {
+    try { await recarregar(); tudo(); } catch(e){ /* servidor fora do ar: mantém a tela */ }
+  }, 60000);
+})();
+</script>

@@ -1,0 +1,14 @@
+[Unit]
+Description=Serve o painel de medicao da esteira no endereco local
+Documentation=file:///%h/orquestrador/docs/medicao.md
+
+[Service]
+# Preso ao laco de retorno de proposito: o painel carrega titulo de tarefa e
+# texto de comentario do projeto. O acesso de fora se faz por tunel.
+ExecStart=%h/orquestrador/bin/orq-medir servir --porta 8791
+Restart=on-failure
+RestartSec=5
+Nice=19
+
+[Install]
+WantedBy=default.target

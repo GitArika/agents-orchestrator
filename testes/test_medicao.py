@@ -398,5 +398,45 @@ class Exportacao(unittest.TestCase):
         self.assertIn("deduzid", texto)
 
 
+class SessaoViva(unittest.TestCase):
+    PREFIXO = "orq-qualidade-do-fro-"
+
+    def test_tira_a_tarefa_do_nome_da_sessao(self):
+        self.assertEqual(
+            medir.tarefa_da_sessao(self.PREFIXO + "868kyu71z", self.PREFIXO), "868kyu71z")
+
+    def test_ignora_sessao_de_fora_da_esteira(self):
+        self.assertIsNone(medir.tarefa_da_sessao("sessao-claude", self.PREFIXO))
+        self.assertIsNone(medir.tarefa_da_sessao("orq-loop-qualidade-do-front", self.PREFIXO))
+
+    def test_etapa_vem_do_arquivo_de_ordem_de_servico(self):
+        arquivos = ["qualidade-do-fro-868kyu71z-integrate.brief.md",
+                    "qualidade-do-fro-868kyugkg-review.brief.md",
+                    "runs.jsonl"]
+        self.assertEqual(medir.etapa_do_brief(arquivos, "868kyu71z"), "integrate")
+        self.assertEqual(medir.etapa_do_brief(arquivos, "868kyugkg"), "review")
+
+    def test_sem_ordem_de_servico_nao_inventa_etapa(self):
+        self.assertIsNone(medir.etapa_do_brief(["runs.jsonl"], "868kyu71z"))
+
+
+class MemoriaDaSessao(unittest.TestCase):
+    def test_soma_o_grupo_de_processos(self):
+        # ps -o rss= devolve uma linha por processo do grupo, em kB
+        self.assertEqual(medir.soma_rss_kb(" 128400\n  95220\n   4100\n"), 227720)
+
+    def test_saida_vazia_ou_suja_vira_zero(self):
+        self.assertEqual(medir.soma_rss_kb(""), 0)
+        self.assertEqual(medir.soma_rss_kb("RSS\nnada\n"), 0)
+
+    def test_amostra_tem_chave_estavel_por_minuto(self):
+        # Duas coletas no mesmo minuto nao podem virar duas amostras.
+        a = medir.chave_amostra("2026-09-03T12:34:56Z", "868kyu71z")
+        b = medir.chave_amostra("2026-09-03T12:34:12Z", "868kyu71z")
+        self.assertEqual(a, b)
+        c = medir.chave_amostra("2026-09-03T12:35:01Z", "868kyu71z")
+        self.assertNotEqual(a, c)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

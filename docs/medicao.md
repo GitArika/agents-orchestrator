@@ -3,18 +3,59 @@
 A esteira rodou uma corrida inteira e não sabia dizer quanto produziu. O rastro
 existia — em seis lugares que não conversavam. Isto junta.
 
-## Os três comandos
+## Os cinco comandos
 
 ```bash
 orq-medir esquema     # cria ou atualiza o armazém
 orq-medir coletar     # varre tudo e preenche; seguro repetir à vontade
 orq-medir resumo      # os números na tela
+orq-medir exportar    # o JSON bruto de tudo
+orq-medir servir      # o painel, no endereço local
 ```
 
 Comece pelo `resumo`. Ele responde "o que esta esteira produziu até agora".
 
 `coletar --sem-rede` pula a consulta ao quadro, quando você quiser rodar sem
 internet ou sem gastar chamada.
+
+## O painel
+
+Um serviço serve o painel de dentro da máquina, e a coleta roda a cada cinco
+minutos. A página se atualiza sozinha: o quadro do agora a cada 15 segundos, os
+números históricos a cada minuto.
+
+**Ele escuta só no endereço local, e isso é decisão de segurança, não descuido.**
+O painel carrega título de tarefa, texto de comentário e nome de branch — coisa
+interna do projeto. Para abrir de outra máquina, faça um túnel:
+
+```bash
+ssh -N -L 8791:127.0.0.1:8791 orq@<endereço da vps>
+```
+
+e abra `http://127.0.0.1:8791`. A porta está registrada em
+`~/.claude/orchestrator/state/painel.porta`; troque se ela já estiver ocupada
+por outra coisa na máquina.
+
+```bash
+systemctl --user status orq-medir-painel.service    # o servidor
+systemctl --user list-timers orq-medir.timer        # a próxima coleta
+```
+
+Abrir o arquivo do painel direto no navegador **não funciona**: ele busca os
+dados por HTTP, de propósito, para não precisar ser regerado a cada mudança.
+
+## Memória por sessão e por etapa
+
+A coleta lê o consumo real de cada sessão viva — pelo tmux, somando o grupo de
+processos — e guarda uma amostra por tarefa por minuto.
+
+**Isto só existe daqui para a frente.** O rastro antigo nunca guardou consumo por
+sessão, e nada recupera o que jamais foi escrito. A vista
+`v_memoria_por_etapa` fica vazia até a primeira coleta com sessão rodando.
+
+Vale registrar por que foi feito assim: o motor **sabe** medir isso e não grava.
+Medir por fora, a partir do tmux, é aditivo — não toca numa linha do motor, e
+por isso pôde ser feito com a esteira em voo.
 
 ## O que ele mede
 
@@ -39,7 +80,7 @@ Cinco vistas prontas: `v_ciclo_por_unidade`, `v_retrabalho`, `v_espera_humana`,
 
 ## A coleta automática
 
-Um temporizador do sistema roda de hora em hora, em prioridade baixa:
+Um temporizador do sistema roda a cada cinco minutos, em prioridade baixa:
 
 ```bash
 systemctl --user list-timers orq-medir.timer     # quando roda de novo

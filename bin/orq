@@ -986,6 +986,29 @@ def ensure_worktree(cfg: Config, u: Unit) -> tuple:
     branch = cfg.branch_for(u)
     wt = cfg.worktree_root / branch
     if wt.exists():
+        # A cópia de trabalho é REUSADA entre estágios e entre relançamentos, e
+        # sem isto ela congela na base de quando nasceu. O que envelhece não é só
+        # o código: são as SKILLS, os settings e os hooks que o projeto versiona
+        # em `.claude/`. Uma unidade relançada depois de a base andar recebia a
+        # ordem de serviço nova e a skill velha, e ia fazer à mão o que já tinha
+        # comando — foi assim que uma integração bateu duas vezes na mesma parede
+        # em 03/09/2026 e precisou de `git merge --ff-only` manual.
+        #
+        # `--ff-only` é a garantia: se o branch tem trabalho que a base não tem,
+        # o comando falha e a cópia fica como está. Não existe caso em que isto
+        # perca commit — ou avança em linha reta, ou não avança.
+        #
+        # Contra `origin/<base>`, não contra a base local: o laço nunca faz pull,
+        # então a base local pode estar dias atrás do que as integrações já
+        # publicaram. Sem remoto (repositório só local), cai na base mesmo.
+        subprocess.run(["git", "-C", str(cfg.repo), "fetch", "--quiet", "origin"],
+                       capture_output=True, text=True, timeout=120)
+        remoto = f"origin/{cfg.base_branch}"
+        tem_remoto = subprocess.run(["git", "-C", str(wt), "rev-parse", "--verify", remoto],
+                                    capture_output=True).returncode == 0
+        subprocess.run(["git", "-C", str(wt), "merge", "--ff-only",
+                        remoto if tem_remoto else cfg.base_branch],
+                       capture_output=True, text=True, timeout=120)
         return wt, branch
     wt.parent.mkdir(parents=True, exist_ok=True)
     exists = subprocess.run(["git", "-C", str(cfg.repo), "rev-parse", "--verify", branch],

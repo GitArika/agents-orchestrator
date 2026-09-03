@@ -12,6 +12,7 @@ e nunca toca em sessão que ainda está em curso.
 Desenho: docs/especificacoes/2026-09-02-medicao-desenho.md
 """
 import argparse
+import json
 import os
 import pathlib
 import sqlite3
@@ -157,6 +158,220 @@ def chave_evento(maquina, origem, tipo, ts, alvo):
 
 
 # --------------------------------------------------------------------------- #
+# As sessões
+# --------------------------------------------------------------------------- #
+
+# Ordem importa: "loop-reset:1" tem de casar com "loop-reset" antes de chegar
+# perto de "reset", que significa outra coisa.
+DESFECHOS = (
+    ("advanced:", "avancou"),
+    ("rejected->", "reprovou"),
+    ("loop-reset", "orfa"),
+    ("release-requeue", "retomada"),
+    ("hold", "travou"),
+    ("reset", "reiniciou"),
+)
+
+
+def normalizar_desfecho(bruto):
+    """Traduz o desfecho gravado pelo motor.
+
+    Devolve None para o que não conhece. Desfecho novo tem de aparecer como
+    desconhecido e ser investigado, nunca ser encaixado no balde mais parecido.
+    """
+    if not bruto:
+        return None
+    # A varredura nao e um desfecho: e a rede de seguranca que arquiva o
+    # artefato de uma sessao que terminou sem chamar o encerramento. O que vale
+    # e o estado em que a unidade estava na hora.
+    if bruto.startswith("sweep:"):
+        estado = bruto.split(":", 1)[1]
+        if estado == "stalled":
+            return "orfa"
+        if estado in ("done", "ready"):
+            return "recolhida"
+        return None
+    for prefixo, nome in DESFECHOS:
+        if bruto.startswith(prefixo):
+            return nome
+    return None
+
+
+def sessoes_arquivadas(raiz):
+    """Lê as pastas de sessão já arquivadas. Elas são a autoridade sobre desfecho.
+
+    O carimbo no nome da pasta é hora LOCAL de arquivamento; o campo archived_at
+    é a mesma hora em UTC, e é ele que vale.
+    """
+    raiz = pathlib.Path(raiz)
+    fora = []
+    if not raiz.exists():
+        return fora
+    for meta in sorted(raiz.glob("*/*/meta.json")):
+        try:
+            d = json.loads(meta.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        bruto = d.get("outcome")
+        fora.append({
+            "esteira": d.get("pipeline"),
+            "unidade": d.get("unit"),
+            "tarefa": d.get("id"),
+            "etapa": d.get("stage"),
+            "fim": d.get("archived_at"),
+            "fim_deduzido": False,
+            "desfecho": normalizar_desfecho(bruto),
+            "desfecho_bruto": bruto,
+            "status_final": d.get("status_final"),
+            "pasta": str(meta.parent),
+        })
+    return fora
+
+
+def despachos(caminho):
+    """Lê o registro de despachos. Ele diz que a sessão nasceu, não como morreu."""
+    caminho = pathlib.Path(caminho)
+    fora = []
+    if not caminho.exists():
+        return fora
+    for linha in caminho.read_text(errors="replace").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            fora.append(json.loads(linha))
+        except json.JSONDecodeError:
+            continue
+    return fora
+
+
+def casar(sessoes, lista_despachos):
+    """Casa cada sessão arquivada com o despacho que a originou.
+
+    A mesma unidade repete a mesma etapa — uma delas teve quatro implementações
+    — então o casamento é cronológico dentro do grupo (esteira, unidade, etapa)
+    e cada despacho serve a uma sessão só.
+
+    Sobra dos dois lados é registrada, não descartada: sessão sem despacho fica
+    com início deduzido e marcado; despacho sem sessão vira sessão que nasceu e
+    cujo fim não foi registrado. Rastro incompleto é informação sobre a esteira.
+    """
+    def grupo_sessao(s):
+        return (s.get("esteira"), s.get("unidade"), s.get("etapa"))
+
+    def grupo_despacho(d):
+        return (d.get("pipeline"), d.get("unit"), d.get("stage"))
+
+    por_grupo = {}
+    for d in lista_despachos:
+        por_grupo.setdefault(grupo_despacho(d), []).append({"d": dict(d), "usado": False})
+    for lista in por_grupo.values():
+        lista.sort(key=lambda e: e["d"].get("ts") or "")
+
+    fora = []
+    for s in sorted(sessoes, key=lambda s: s.get("fim") or ""):
+        s = dict(s)
+        escolhido = None
+        for e in por_grupo.get(grupo_sessao(s), []):
+            ts = e["d"].get("ts") or ""
+            if e["usado"] or not ts or ts > (s.get("fim") or ""):
+                continue
+            escolhido = e                      # o mais recente ainda livre
+        if escolhido is not None:
+            escolhido["usado"] = True
+            s["inicio"] = escolhido["d"].get("ts")
+            s["inicio_deduzido"] = False
+            s["branch"] = escolhido["d"].get("branch")
+            if not s.get("tarefa"):
+                s["tarefa"] = escolhido["d"].get("id")
+        else:
+            s["inicio"] = s.get("fim")
+            s["inicio_deduzido"] = True
+            s.setdefault("branch", None)
+        fora.append(s)
+
+    for lista in por_grupo.values():
+        for e in lista:
+            if e["usado"]:
+                continue
+            d = e["d"]
+            fora.append({
+                "esteira": d.get("pipeline"), "unidade": d.get("unit"),
+                "tarefa": d.get("id"), "etapa": d.get("stage"),
+                "branch": d.get("branch"),
+                "inicio": d.get("ts"), "inicio_deduzido": False,
+                "fim": None, "fim_deduzido": False,
+                "desfecho": None, "desfecho_bruto": None,
+                "status_final": None, "pasta": None,
+            })
+    return fora
+
+
+# --------------------------------------------------------------------------- #
+# Gravação
+# --------------------------------------------------------------------------- #
+
+def _id_maquina(con, nome, papel):
+    con.execute("INSERT OR IGNORE INTO maquina (nome, papel) VALUES (?,?)", (nome, papel))
+    return con.execute("SELECT id FROM maquina WHERE nome=?", (nome,)).fetchone()[0]
+
+
+def _id_esteira(con, nome):
+    con.execute("INSERT OR IGNORE INTO esteira (nome) VALUES (?)", (nome,))
+    return con.execute("SELECT id FROM esteira WHERE nome=?", (nome,)).fetchone()[0]
+
+
+def _id_unidade(con, esteira_id, codigo, tarefa, branch=None):
+    con.execute(
+        "INSERT INTO unidade (esteira_id, codigo, tarefa, branch) VALUES (?,?,?,?) "
+        "ON CONFLICT (esteira_id, codigo) DO UPDATE SET "
+        "  tarefa = COALESCE(excluded.tarefa, unidade.tarefa), "
+        "  branch = COALESCE(excluded.branch, unidade.branch)",
+        (esteira_id, codigo, tarefa, branch))
+    return con.execute("SELECT id FROM unidade WHERE esteira_id=? AND codigo=?",
+                       (esteira_id, codigo)).fetchone()[0]
+
+
+def gravar_sessoes(con, maquina, papel, sessoes):
+    """Grava por acréscimo com substituição. Repetir não duplica."""
+    maquina_id = _id_maquina(con, maquina, papel)
+    n = 0
+    for s in sessoes:
+        if not (s.get("esteira") and s.get("unidade") and s.get("etapa")):
+            continue
+        esteira_id = _id_esteira(con, s["esteira"])
+        unidade_id = _id_unidade(con, esteira_id, s["unidade"], s.get("tarefa"),
+                                 s.get("branch"))
+        carimbo = s.get("fim") or s.get("inicio")
+        chave = chave_sessao(maquina, s["esteira"], s["unidade"], s["etapa"], carimbo)
+        con.execute(
+            "INSERT INTO sessao (unidade_id, maquina_id, etapa, inicio, inicio_deduzido,"
+            " fim, fim_deduzido, desfecho, desfecho_bruto, status_final, pasta, chave)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT (chave) DO UPDATE SET"
+            "  inicio=excluded.inicio, inicio_deduzido=excluded.inicio_deduzido,"
+            "  fim=excluded.fim, fim_deduzido=excluded.fim_deduzido,"
+            "  desfecho=excluded.desfecho, desfecho_bruto=excluded.desfecho_bruto,"
+            "  status_final=excluded.status_final, pasta=excluded.pasta",
+            (unidade_id, maquina_id, s["etapa"], s.get("inicio"),
+             1 if s.get("inicio_deduzido") else 0, s.get("fim"),
+             1 if s.get("fim_deduzido") else 0, s.get("desfecho"),
+             s.get("desfecho_bruto"), s.get("status_final"), s.get("pasta"), chave))
+        n += 1
+    con.commit()
+    return n
+
+
+# As duas fontes de rastro: a máquina onde a esteira roda agora, e a história
+# copiada da máquina anterior. Cada linha guarda de onde veio.
+FONTES = (
+    ("servidor", "corrente",
+     pathlib.Path.home() / ".claude/orchestrator/state"),
+    ("historico-mac", "historico",
+     pathlib.Path.home() / ".claude/orchestrator/historico-mac/state"),
+)
+
+# --------------------------------------------------------------------------- #
 # Linha de comando
 # --------------------------------------------------------------------------- #
 
@@ -170,6 +385,60 @@ def cmd_esquema(args):
     return 0
 
 
+def cmd_coletar(args):
+    con = abrir(args.armazem)
+    total = 0
+    for maquina, papel, raiz in FONTES:
+        if not raiz.exists():
+            print(f"{maquina}: sem rastro em {raiz} — pulando")
+            continue
+        arquivadas = sessoes_arquivadas(raiz / "archive")
+        lista = despachos(raiz / "runs.jsonl")
+        casadas = casar(arquivadas, lista)
+        n = gravar_sessoes(con, maquina, papel, casadas)
+        total += n
+        print(f"{maquina}: {len(arquivadas)} pastas arquivadas, "
+              f"{len(lista)} despachos, {n} sessões gravadas")
+    con.close()
+    print(f"total de sessões gravadas: {total}")
+    return 0
+
+
+def cmd_resumo(args):
+    con = abrir(args.armazem)
+    linha = con.execute("SELECT count(*) FROM sessao").fetchone()[0]
+    print(f"sessões: {linha}")
+
+    print("\npor desfecho:")
+    for r in con.execute(
+            "SELECT COALESCE(desfecho,'(sem desfecho registrado)') AS d, count(*) AS n"
+            " FROM sessao GROUP BY d ORDER BY n DESC"):
+        print(f"  {r['n']:4d}  {r['d']}")
+
+    print("\npor etapa e desfecho:")
+    for r in con.execute(
+            "SELECT etapa, COALESCE(desfecho,'(sem desfecho)') AS d, count(*) AS n"
+            " FROM sessao GROUP BY etapa, d ORDER BY etapa, n DESC"):
+        print(f"  {r['n']:4d}  {r['etapa']:<10} {r['d']}")
+
+    print("\npor máquina:")
+    for r in con.execute(
+            "SELECT m.nome, count(*) AS n FROM sessao s"
+            " JOIN maquina m ON m.id = s.maquina_id GROUP BY m.nome ORDER BY n DESC"):
+        print(f"  {r['n']:4d}  {r['nome']}")
+
+    deduzidas = con.execute(
+        "SELECT count(*) FROM sessao WHERE inicio_deduzido = 1").fetchone()[0]
+    if deduzidas:
+        print(f"\naviso: {deduzidas} sessões com início deduzido, não medido "
+              "(não havia despacho correspondente no registro)")
+
+    unidades = con.execute("SELECT count(*) FROM unidade").fetchone()[0]
+    print(f"\nunidades de trabalho: {unidades}")
+    con.close()
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="orq-medir",
@@ -180,6 +449,12 @@ def main(argv=None):
 
     s = sub.add_parser("esquema", help="cria ou atualiza o armazém")
     s.set_defaults(func=cmd_esquema)
+
+    s = sub.add_parser("coletar", help="varre as fontes e preenche; seguro repetir")
+    s.set_defaults(func=cmd_coletar)
+
+    s = sub.add_parser("resumo", help="imprime os números principais")
+    s.set_defaults(func=cmd_resumo)
 
     args = p.parse_args(argv)
     return args.func(args)

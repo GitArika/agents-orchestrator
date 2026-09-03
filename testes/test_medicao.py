@@ -210,5 +210,167 @@ class JanelaDaSessao(unittest.TestCase):
         self.assertIsNone(medir.sessao_da_janela(abertas, "2026-09-05T00:00:00Z"))
 
 
+class EventosDoLaco(unittest.TestCase):
+    ESTADO = {
+        "ticks": 366, "dispatched": 85,
+        "quarantine": ["868kyu8ec"],
+        "rework": {"868kyu71z": 1, "868kyu8ec": 2},
+        "hold": {"868kyugea": {"reason": "falta decidir a altura do botão",
+                               "at": "2026-09-01T03:44:10Z",
+                               "status": "em progresso"}},
+    }
+
+    def test_retrabalho_vira_evento_por_tarefa(self):
+        ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
+        r = [e for e in ev if e["tipo"] == "retrabalho"]
+        self.assertEqual({e["tarefa"] for e in r}, {"868kyu71z", "868kyu8ec"})
+
+    def test_espera_humana_carrega_hora_e_motivo(self):
+        ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
+        h = [e for e in ev if e["tipo"] == "espera_humana"][0]
+        self.assertEqual(h["ts"], "2026-09-01T03:44:10Z")
+        self.assertIn("altura do botão", h["texto"])
+        self.assertEqual(h["tarefa"], "868kyugea")
+
+    def test_quarentena(self):
+        ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
+        q = [e for e in ev if e["tipo"] == "quarentena"]
+        self.assertEqual(len(q), 1)
+
+    def test_toda_chave_e_unica(self):
+        ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
+        self.assertEqual(len({e["chave"] for e in ev}), len(ev))
+
+
+class EventosDeGancho(unittest.TestCase):
+    LINHAS = ("2026-09-01T02:32:08Z\tstop\tConfira o board: orq status\n"
+              "2026-09-01T02:33:08Z\tnotification\tClaude is waiting for your input\n"
+              "\n")
+
+    def test_le_hora_tipo_e_texto(self):
+        ev = medir.eventos_de_gancho(self.LINHAS, "FE-01", "servidor")
+        self.assertEqual(len(ev), 2)
+        self.assertEqual(ev[0]["tipo"], "stop")
+        self.assertEqual(ev[1]["ts"], "2026-09-01T02:33:08Z")
+        self.assertIn("waiting", ev[1]["texto"])
+
+
+class Comentarios(unittest.TestCase):
+    PAYLOAD = {"comments": [
+        {"id": "1", "date": "1788211481689",
+         "user": {"username": "Ariel Evangelista", "id": 1},
+         "comment_text": "INTEGRADO E PUBLICADO. merge-base ae43e34, commit c461c71."},
+        {"id": "2", "date": "1788200000000",
+         "user": {"username": "Ariel Evangelista", "id": 1},
+         "comment_text": "REPROVADO (retrabalho 1/2) - volta para spec pronta."},
+        {"id": "3", "date": "1788190000000",
+         "user": {"username": "Ariel Evangelista", "id": 1},
+         "comment_text": "Spec publicada: ponto de partida medido."},
+    ]}
+
+    def test_hora_em_utc_e_autor(self):
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")
+        self.assertTrue(all(e["ts"].endswith("Z") for e in ev))
+        self.assertTrue(all(e["autor"] == "Ariel Evangelista" for e in ev))
+        self.assertEqual(len(ev), 3)
+
+    def test_classifica_a_transicao(self):
+        tipos = {e["tipo"] for e in
+                 medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")}
+        self.assertIn("integrado", tipos)
+        self.assertIn("reprovado", tipos)
+        self.assertIn("spec_publicada", tipos)
+
+    def test_comentario_comum_nao_vira_transicao(self):
+        p = {"comments": [{"id": "9", "date": "1788190000000",
+                           "user": {"username": "Alguem"},
+                           "comment_text": "bom dia, alguma novidade?"}]}
+        ev = medir.eventos_de_comentarios(p, "868kyu71z", "servidor")
+        self.assertEqual(ev[0]["tipo"], "comentario")
+
+    def test_extrai_commits_citados(self):
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")
+        shas = {s for e in ev for s in e["commits"]}
+        self.assertIn("c461c71", shas)
+        self.assertIn("ae43e34", shas)
+
+    def test_nao_confunde_palavra_com_commit(self):
+        # "decidida" e "cadastro" sao hexadecimais? nao. Mas "acessada" tem 8
+        # letras e nenhuma fora de a-f seria um falso positivo classico.
+        p = {"comments": [{"id": "9", "date": "1788190000000",
+                           "user": {"username": "A"},
+                           "comment_text": "a decisao foi acessada e efetivada."}]}
+        ev = medir.eventos_de_comentarios(p, "868kyu71z", "servidor")
+        self.assertEqual(ev[0]["commits"], [])
+
+
+class UnidadesDeclaradas(unittest.TestCase):
+    TOML = """
+[pipeline]
+name        = "Qualidade do Front-end"
+repo        = "/home/orq/repos/app-exemplo"
+base_branch = "homol"
+
+[[task]]
+id = "868kyu71z"
+key = "FE-01"
+title = "Erro numa tela nao pode apagar o aplicativo inteiro"
+depends_on = []
+mode = "autonomous"
+
+[[task]]
+id = "868kyu92r"
+key = "FE-09"
+title = "Remover as bibliotecas que o produto carrega e nao usa"
+depends_on = ["FE-01"]
+mode = "hands-on"
+"""
+
+    def test_le_codigo_tarefa_e_titulo(self):
+        d = medir.tomllib.loads(self.TOML)
+        u = medir.unidades_do_toml(d)
+        self.assertEqual(len(u), 2)
+        self.assertEqual(u[0]["codigo"], "FE-01")
+        self.assertEqual(u[0]["tarefa"], "868kyu71z")
+        self.assertIn("Erro numa tela", u[0]["titulo"])
+
+    def test_le_a_configuracao_da_esteira(self):
+        d = medir.tomllib.loads(self.TOML)
+        c = medir.config_da_esteira(d)
+        self.assertEqual(c["nome"], "Qualidade do Front-end")
+        self.assertEqual(c["base"], "homol")
+        self.assertTrue(c["repo"].endswith("app-exemplo"))
+
+    def test_esteira_sem_tarefas_nao_explode(self):
+        u = medir.unidades_do_toml(medir.tomllib.loads('[pipeline]\nname = "X"\n'))
+        self.assertEqual(u, [])
+
+
+class BranchDoMerge(unittest.TestCase):
+    """A atribuicao de commit a unidade sai do merge, nao do intervalo.
+
+    O intervalo base..branch mente quando a base local esta atrasada: ele
+    devolve o trabalho de todas as unidades, e a chave primaria do commit faz a
+    atribuicao ficar com quem rodou por ultimo. Ja aconteceu: uma unidade
+    apareceu com 147 commits e 91 mil linhas que nao eram dela.
+    """
+
+    def test_merge_de_pedido_de_alteracao(self):
+        self.assertEqual(
+            medir.branch_do_merge(
+                "Merge pull request #35 from exemplo-org/CU-868abc009-escolher-entre-tabela-e-cart"),
+            "CU-868abc009-escolher-entre-tabela-e-cart")
+
+    def test_merge_de_branch_simples(self):
+        self.assertEqual(
+            medir.branch_do_merge("Merge branch 'CU-868kyu71z-erro-numa-tela' into homol"),
+            "CU-868kyu71z-erro-numa-tela")
+
+    def test_merge_que_nao_e_de_unidade(self):
+        self.assertIsNone(medir.branch_do_merge("Merge branch 'main' into homol"))
+        self.assertIsNone(medir.branch_do_merge("feat: qualquer coisa"))
+        self.assertIsNone(medir.branch_do_merge(None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

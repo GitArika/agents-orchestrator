@@ -12,12 +12,17 @@ e nunca toca em sessão que ainda está em curso.
 Desenho: docs/especificacoes/2026-09-02-medicao-desenho.md
 """
 import argparse
+import datetime
 import json
 import os
 import pathlib
 import re
 import sqlite3
+import subprocess
 import sys
+import tomllib
+import urllib.error
+import urllib.request
 
 ARMAZEM_PADRAO = pathlib.Path.home() / ".claude/orchestrator/state/medicao.db"
 
@@ -86,7 +91,7 @@ CREATE TABLE IF NOT EXISTS evento (
   unidade_id INTEGER REFERENCES unidade(id),
   sessao_id  INTEGER REFERENCES sessao(id),
   maquina_id INTEGER REFERENCES maquina(id),
-  ts         TEXT NOT NULL,
+  ts         TEXT,
   origem     TEXT NOT NULL,
   tipo       TEXT NOT NULL,
   autor      TEXT,
@@ -120,6 +125,45 @@ CREATE TABLE IF NOT EXISTS preco_modelo (
 CREATE INDEX IF NOT EXISTS idx_sessao_unidade ON sessao(unidade_id);
 CREATE INDEX IF NOT EXISTS idx_evento_unidade ON evento(unidade_id);
 CREATE INDEX IF NOT EXISTS idx_evento_ts      ON evento(ts);
+
+CREATE VIEW IF NOT EXISTS v_ciclo_por_unidade AS
+SELECT u.codigo, u.tarefa, u.titulo,
+       min(s.inicio) AS comeco, max(s.fim) AS termino,
+       count(*) AS sessoes,
+       sum(CASE WHEN s.inicio_deduzido = 1 THEN 1 ELSE 0 END) AS sessoes_deduzidas,
+       round((julianday(max(s.fim)) - julianday(min(s.inicio))) * 24, 2) AS horas
+  FROM unidade u JOIN sessao s ON s.unidade_id = u.id
+ GROUP BY u.id;
+
+CREATE VIEW IF NOT EXISTS v_retrabalho AS
+SELECT u.codigo, u.titulo,
+       sum(CASE WHEN s.desfecho = 'reprovou'  THEN 1 ELSE 0 END) AS reprovacoes,
+       sum(CASE WHEN s.desfecho = 'orfa'      THEN 1 ELSE 0 END) AS orfas,
+       sum(CASE WHEN s.desfecho = 'reiniciou' THEN 1 ELSE 0 END) AS reinicios,
+       sum(CASE WHEN s.desfecho = 'travou'    THEN 1 ELSE 0 END) AS travadas
+  FROM unidade u JOIN sessao s ON s.unidade_id = u.id
+ GROUP BY u.id;
+
+CREATE VIEW IF NOT EXISTS v_espera_humana AS
+SELECT u.codigo, u.titulo, e.ts, e.texto
+  FROM evento e JOIN unidade u ON u.id = e.unidade_id
+ WHERE e.tipo = 'espera_humana';
+
+CREATE VIEW IF NOT EXISTS v_consumo_por_unidade AS
+SELECT u.codigo, u.titulo, c.modelo,
+       sum(c.mensagens) AS mensagens,
+       sum(c.tokens_entrada) AS entrada, sum(c.tokens_saida) AS saida,
+       sum(c.tokens_cache_leitura) AS cache_lido,
+       sum(c.tokens_cache_escrita) AS cache_escrito
+  FROM unidade u JOIN consumo c ON c.unidade_id = u.id
+ GROUP BY u.id, c.modelo;
+
+CREATE VIEW IF NOT EXISTS v_producao_por_unidade AS
+SELECT u.codigo, u.titulo, count(*) AS commits,
+       sum(k.arquivos) AS arquivos, sum(k.insercoes) AS insercoes,
+       sum(k.delecoes) AS delecoes
+  FROM unidade u JOIN commit_unidade k ON k.unidade_id = u.id
+ GROUP BY u.id;
 """
 
 
@@ -517,17 +561,366 @@ FONTES = (
 
 
 # --------------------------------------------------------------------------- #
+# Os eventos
+# --------------------------------------------------------------------------- #
+
+def _chave(*partes):
+    return "|".join(str(p or "") for p in partes)
+
+
+def eventos_do_laco(estado, esteira, maquina):
+    """Retrabalho, quarentena e espera humana, a partir do estado do laço.
+
+    Retrabalho e quarentena são fatos SEM hora: o estado é uma fotografia, não um
+    histórico. A hora fica vazia em vez de receber um carimbo inventado — e a
+    identidade do evento não depende dela, para a próxima coleta atualizar a
+    mesma linha em vez de criar outra.
+    """
+    fora = []
+    for tarefa, n in (estado.get("rework") or {}).items():
+        fora.append({"tarefa": tarefa, "ts": None, "origem": "laco",
+                     "tipo": "retrabalho", "autor": None, "texto": str(n),
+                     "chave": _chave(maquina, esteira, "laco", "retrabalho", tarefa)})
+    for tarefa in (estado.get("quarantine") or []):
+        fora.append({"tarefa": tarefa, "ts": None, "origem": "laco",
+                     "tipo": "quarentena", "autor": None, "texto": None,
+                     "chave": _chave(maquina, esteira, "laco", "quarentena", tarefa)})
+    for tarefa, h in (estado.get("hold") or {}).items():
+        ts = h.get("at")
+        fora.append({"tarefa": tarefa, "ts": ts, "origem": "laco",
+                     "tipo": "espera_humana", "autor": None,
+                     "texto": h.get("reason"),
+                     "chave": _chave(maquina, esteira, "laco", "espera_humana",
+                                     tarefa, ts)})
+    return fora
+
+
+def eventos_de_gancho(texto, unidade, maquina):
+    """Os ganchos que a sessão dispara: parou, pediu atenção."""
+    fora = []
+    for linha in (texto or "").splitlines():
+        partes = linha.rstrip("\n").split("\t")
+        if len(partes) < 2 or not partes[0].strip():
+            continue
+        ts, tipo = partes[0].strip(), partes[1].strip()
+        corpo = "\t".join(partes[2:]).strip() or None
+        fora.append({"unidade": unidade, "ts": ts, "origem": "gancho",
+                     "tipo": tipo, "autor": None, "texto": corpo,
+                     "chave": _chave(maquina, "gancho", unidade, ts, tipo)})
+    return fora
+
+
+def eventos_de_aviso(texto, maquina):
+    """O registro de avisos entregues: hora, rótulo, assunto, mensagem."""
+    fora = []
+    for linha in (texto or "").splitlines():
+        partes = linha.rstrip("\n").split("\t")
+        if len(partes) < 2 or not partes[0].strip():
+            continue
+        ts = partes[0].strip()
+        corpo = " · ".join(p.strip() for p in partes[1:] if p.strip()) or None
+        fora.append({"unidade": None, "ts": ts, "origem": "aviso",
+                     "tipo": "aviso", "autor": None, "texto": corpo,
+                     "chave": _chave(maquina, "aviso", ts, corpo)})
+    return fora
+
+
+# Marcadores que a sessão escreve no começo do comentário. A ordem importa só
+# para leitura; nenhum é prefixo do outro.
+TRANSICOES = (
+    ("INTEGRADO", "integrado"),
+    ("REPROVADO", "reprovado"),
+    ("APROVADO", "aprovado"),
+    ("Spec publicada", "spec_publicada"),
+    ("ENTREGUE", "entregue"),
+    ("entregue no commit", "entregue"),
+    ("RETRABALHO", "entregue"),
+)
+
+# Sete a quarenta hexadecimais COM ao menos um dígito. Sem essa exigência,
+# palavras inteiramente formadas por a-f ("defaced") entram como commit.
+RE_SHA = re.compile(r"\b(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b")
+
+
+def classificar_comentario(texto):
+    cabeca = (texto or "")[:200]
+    for marcador, tipo in TRANSICOES:
+        if marcador in cabeca:
+            return tipo
+    return "comentario"
+
+
+def eventos_de_comentarios(payload, tarefa, maquina):
+    """Os comentários da tarefa são o relógio das transições.
+
+    O tempo em cada status é recurso pago do ClickUp e responde TIS_027; os
+    comentários dão a mesma linha do tempo de graça, e ainda dizem O QUE
+    aconteceu e quem assinou.
+    """
+    fora = []
+    for c in (payload or {}).get("comments", []):
+        bruto = c.get("date")
+        try:
+            ts = (datetime.datetime.fromtimestamp(int(bruto) / 1000, datetime.UTC)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            ts = None
+        texto = c.get("comment_text") or ""
+        fora.append({
+            "tarefa": tarefa, "ts": ts, "origem": "comentario",
+            "tipo": classificar_comentario(texto),
+            "autor": (c.get("user") or {}).get("username"),
+            "texto": texto[:4000],
+            "commits": sorted(set(RE_SHA.findall(texto))),
+            "chave": _chave(maquina, "comentario", tarefa, c.get("id")),
+        })
+    return fora
+
+
+def gravar_eventos(con, maquina, eventos):
+    """Grava por chave natural. Repetir atualiza a mesma linha."""
+    maquina_id = con.execute("SELECT id FROM maquina WHERE nome=?", (maquina,)).fetchone()
+    maquina_id = maquina_id[0] if maquina_id else None
+    n = 0
+    for e in eventos:
+        unidade_id = None
+        if e.get("tarefa"):
+            r = con.execute("SELECT id FROM unidade WHERE tarefa=?", (e["tarefa"],)).fetchone()
+            unidade_id = r[0] if r else None
+        elif e.get("unidade"):
+            r = con.execute("SELECT id FROM unidade WHERE codigo=?", (e["unidade"],)).fetchone()
+            unidade_id = r[0] if r else None
+        con.execute(
+            "INSERT INTO evento (unidade_id, maquina_id, ts, origem, tipo, autor, texto, chave)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT (chave) DO UPDATE SET"
+            "  unidade_id=excluded.unidade_id, ts=excluded.ts, autor=excluded.autor,"
+            "  texto=excluded.texto",
+            (unidade_id, maquina_id, e.get("ts"), e["origem"], e["tipo"],
+             e.get("autor"), e.get("texto"), e["chave"]))
+        n += 1
+    con.commit()
+    return n
+
+
+def _git(repo, args, tempo=120):
+    try:
+        r = subprocess.run(["git", "-C", str(repo)] + args,
+                           capture_output=True, text=True, timeout=tempo)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+RE_MERGE_PR = re.compile(r"Merge pull request #\d+ from [^/\s]+/(\S+)")
+RE_MERGE_BR = re.compile(r"Merge branch '([^']+)'")
+
+
+def branch_do_merge(assunto):
+    """De qual branch veio o que este merge integrou.
+
+    É daqui que sai a atribuição de commit a unidade. O intervalo base..branch
+    NÃO serve: quando a base local está atrasada — e a do servidor estava 179
+    commits atrás — ele devolve o trabalho de todas as unidades de uma vez, e a
+    chave primária do commit deixa a atribuição com quem rodou por último. Uma
+    unidade chegou a aparecer com 147 commits e 91 mil linhas que não eram dela.
+    """
+    if not assunto:
+        return None
+    for rx in (RE_MERGE_PR, RE_MERGE_BR):
+        m = rx.search(assunto)
+        if m and m.group(1).startswith("CU-"):
+            return m.group(1)
+    return None
+
+
+def _commits_do_intervalo(repo, de, ate):
+    saida = _git(repo, ["log", "--no-merges", "--format=%x01%H%x02%aI%x02%s",
+                        "--numstat", f"{de}..{ate}"])
+    fora, atual = [], None
+    for linha in saida.splitlines():
+        if linha.startswith("\x01"):
+            if atual:
+                fora.append(atual)
+            partes = (linha[1:].split("\x02") + ["", ""])[:3]
+            atual = {"sha": partes[0], "ts": _iso(partes[1]), "mensagem": partes[2],
+                     "arquivos": 0, "insercoes": 0, "delecoes": 0}
+            continue
+        p = linha.split("\t")
+        if atual and len(p) == 3 and p[0].isdigit() and p[1].isdigit():
+            atual["arquivos"] += 1
+            atual["insercoes"] += int(p[0])
+            atual["delecoes"] += int(p[1])
+    if atual:
+        fora.append(atual)
+    return fora
+
+
+def ref_de_base(repo, base):
+    """A base remota vence a local: a local envelhece sem avisar."""
+    if _git(repo, ["rev-parse", "--verify", "--quiet", f"origin/{base}"]).strip():
+        return f"origin/{base}"
+    return base
+
+
+def producao_por_merge(repo, ref):
+    """Os commits de cada branch, pelo merge que a integrou."""
+    fora = {}
+    for linha in _git(repo, ["log", "--merges", "--format=%H%x02%s", ref]).splitlines():
+        sha, _, assunto = linha.partition("\x02")
+        branch = branch_do_merge(assunto)
+        if not branch:
+            continue
+        fora.setdefault(branch, []).extend(
+            _commits_do_intervalo(repo, f"{sha}^1", f"{sha}^2"))
+    return fora
+
+
+def branches_de_unidade(repo):
+    saida = _git(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads/CU-*"])
+    return [b.strip() for b in saida.splitlines() if b.strip()]
+
+
+def commits_nao_integrados(repo, branch, ref):
+    """O que a branch tem e a base ainda não. Vazio se já foi integrada."""
+    base = _git(repo, ["merge-base", branch, ref]).strip()
+    if not base:
+        return []
+    return _commits_do_intervalo(repo, base, branch)
+
+
+def gravar_commits(con, unidade_id, commits):
+    for c in commits:
+        con.execute(
+            "INSERT INTO commit_unidade (sha, unidade_id, ts, arquivos, insercoes,"
+            " delecoes, mensagem) VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT (sha) DO UPDATE SET unidade_id=excluded.unidade_id,"
+            "  arquivos=excluded.arquivos, insercoes=excluded.insercoes,"
+            "  delecoes=excluded.delecoes",
+            (c["sha"], unidade_id, c["ts"], c["arquivos"], c["insercoes"],
+             c["delecoes"], c["mensagem"]))
+    return len(commits)
+
+
+def coletar_producao(con, repo, base):
+    ref = ref_de_base(repo, base)
+    por_branch = producao_por_merge(repo, ref)
+    for b in branches_de_unidade(repo):
+        if b not in por_branch:
+            por_branch[b] = commits_nao_integrados(repo, b, ref)
+    n = 0
+    for branch, commits in por_branch.items():
+        tarefa = tarefa_do_branch(branch)
+        if not (tarefa and commits):
+            continue
+        r = con.execute("SELECT id FROM unidade WHERE tarefa=?", (tarefa,)).fetchone()
+        if not r:
+            continue
+        con.execute("UPDATE unidade SET branch=COALESCE(branch,?) WHERE id=?",
+                    (branch, r[0]))
+        n += gravar_commits(con, r[0], commits)
+    con.commit()
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# A esteira declarada
+# --------------------------------------------------------------------------- #
+
+def config_da_esteira(dados):
+    """O que o arquivo da esteira diz sobre ela."""
+    p = (dados or {}).get("pipeline") or {}
+    return {"nome": p.get("name"), "repo": p.get("repo"),
+            "base": p.get("base_branch"), "lista": p.get("list_id"),
+            "worktrees": p.get("worktree_root"),
+            "modelo_branch": p.get("branch_template")}
+
+
+def unidades_do_toml(dados):
+    """As unidades declaradas. Tarefa que está no quadro e não está aqui nunca
+    foi executada pela esteira — e isso é proposital."""
+    fora = []
+    for t in (dados or {}).get("task") or []:
+        if not t.get("key"):
+            continue
+        fora.append({"codigo": t.get("key"), "tarefa": t.get("id"),
+                     "titulo": t.get("title"),
+                     "depende_de": list(t.get("depends_on") or [])})
+    return fora
+
+
+def token_clickup():
+    """A credencial vive fora de qualquer repositório. Dois nomes de chave
+    circulam nas máquinas; aceitamos os dois em vez de quebrar por detalhe."""
+    for caminho in (pathlib.Path.home() / ".config/orquestrador/credenciais.env",
+                    pathlib.Path.home() / ".env.clickup"):
+        if not caminho.exists():
+            continue
+        for linha in caminho.read_text().splitlines():
+            linha = linha.strip()
+            if not linha or linha.startswith("#") or "=" not in linha:
+                continue
+            chave, _, valor = linha.partition("=")
+            if chave.strip() in ("CLICKUP_API_KEY", "api_token"):
+                return valor.strip().strip("\"'")
+    return None
+
+
+def buscar_comentarios(tarefa, token, tempo=30):
+    """Uma chamada por tarefa. É a única parte que usa rede."""
+    req = urllib.request.Request(
+        f"https://api.clickup.com/api/v2/task/{tarefa}/comment",
+        headers={"Authorization": token})
+    try:
+        with urllib.request.urlopen(req, timeout=tempo) as r:
+            return json.loads(r.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # Linha de comando
 # --------------------------------------------------------------------------- #
 
 def cmd_esquema(args):
     con = abrir(args.armazem)
-    tabelas = [r[0] for r in con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    nomes = [r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")]
     con.close()
     print(f"armazém pronto: {args.armazem}")
-    print("tabelas: " + ", ".join(tabelas))
+    print("tabelas e vistas: " + ", ".join(nomes))
     return 0
+
+
+def _coletar_declaradas(con, raiz):
+    """As unidades declaradas no arquivo da esteira dão o título de cada uma."""
+    ponteiro = raiz / "last-pipeline"
+    if not ponteiro.exists():
+        return 0, None
+    caminho = pathlib.Path(ponteiro.read_text().strip())
+    if not caminho.exists():
+        return 0, None
+    try:
+        dados = tomllib.loads(caminho.read_text())
+    except (tomllib.TOMLDecodeError, OSError):
+        return 0, None
+    cfg = config_da_esteira(dados)
+    if not cfg["nome"]:
+        return 0, None
+    esteira_id = _id_esteira(con, cfg["nome"])
+    con.execute("UPDATE esteira SET projeto=?, arquivo_config=? WHERE id=?",
+                (cfg["repo"], str(caminho), esteira_id))
+    n = 0
+    for u in unidades_do_toml(dados):
+        con.execute(
+            "INSERT INTO unidade (esteira_id, codigo, tarefa, titulo) VALUES (?,?,?,?)"
+            " ON CONFLICT (esteira_id, codigo) DO UPDATE SET"
+            "  tarefa = COALESCE(excluded.tarefa, unidade.tarefa),"
+            "  titulo = COALESCE(excluded.titulo, unidade.titulo)",
+            (esteira_id, u["codigo"], u["tarefa"], u["titulo"]))
+        n += 1
+    con.commit()
+    return n, cfg
 
 
 def cmd_coletar(args):
@@ -537,27 +930,73 @@ def cmd_coletar(args):
         if not raiz.exists():
             print(f"{maquina}: sem rastro em {raiz} — pulando")
             continue
+
         arquivadas = sessoes_arquivadas(raiz / "archive")
         lista = despachos(raiz / "runs.jsonl")
-        casadas = casar(arquivadas, lista)
-        n = gravar_sessoes(con, maquina, papel, casadas)
+        n = gravar_sessoes(con, maquina, papel, casar(arquivadas, lista))
         total += n
-        print(f"{maquina}: {len(arquivadas)} pastas arquivadas, "
-              f"{len(lista)} despachos, {n} sessões gravadas")
+        print(f"{maquina}: {len(arquivadas)} arquivadas, {len(lista)} despachos, "
+              f"{n} sessões")
 
-        arquivos = transcricoes(raiz_projetos)
+        declaradas, cfg = _coletar_declaradas(con, raiz)
+        if declaradas:
+            print(f"{maquina}: {declaradas} unidades declaradas no arquivo da esteira")
+
         linhas = []
+        arquivos = transcricoes(raiz_projetos)
         for a in arquivos:
             linhas.extend(consumo_de_transcricao(a))
-        m = gravar_consumo(con, linhas)
-        print(f"{maquina}: {len(arquivos)} transcrições, {m} linhas de consumo")
+        print(f"{maquina}: {len(arquivos)} transcrições, "
+              f"{gravar_consumo(con, linhas)} linhas de consumo")
+
+        eventos = []
+        for laco in sorted((raiz).glob("loop-*.json")):
+            try:
+                eventos.extend(eventos_do_laco(json.loads(laco.read_text()),
+                                               laco.stem, maquina))
+            except (json.JSONDecodeError, OSError):
+                continue
+        for log in ("notify.log", "avisos.log"):
+            alvo = raiz / log
+            if alvo.exists():
+                eventos.extend(eventos_de_aviso(alvo.read_text(errors="replace"), maquina))
+        for ev in sorted((raiz / "archive").glob("*/*/*.events")):
+            unidade = ev.stem.rsplit("-", 1)[0]
+            eventos.extend(eventos_de_gancho(ev.read_text(errors="replace"),
+                                             unidade, maquina))
+        print(f"{maquina}: {gravar_eventos(con, maquina, eventos)} eventos internos")
+
+        if cfg and cfg.get("repo") and pathlib.Path(cfg["repo"]).exists():
+            k = coletar_producao(con, cfg["repo"], cfg.get("base") or "homol")
+            print(f"{maquina}: {k} commits atribuídos a uma unidade")
+
+    if not args.sem_rede:
+        token = token_clickup()
+        if not token:
+            print("ClickUp: sem credencial — comentários não coletados")
+        else:
+            eventos, tarefas = [], [r[0] for r in con.execute(
+                "SELECT DISTINCT tarefa FROM unidade WHERE tarefa IS NOT NULL")]
+            faltou = 0
+            for tarefa in tarefas:
+                payload = buscar_comentarios(tarefa, token)
+                if payload is None:
+                    faltou += 1
+                    continue
+                eventos.extend(eventos_de_comentarios(payload, tarefa, "clickup"))
+            _id_maquina(con, "clickup", "externa")
+            print(f"ClickUp: {len(tarefas) - faltou}/{len(tarefas)} tarefas lidas, "
+                  f"{gravar_eventos(con, 'clickup', eventos)} comentários")
+            if faltou:
+                print(f"ClickUp: {faltou} tarefas não responderam")
+
     con.close()
     print(f"total de sessões gravadas: {total}")
     return 0
 
 
 def _milhar(n):
-    return f"{n:,}".replace(",", ".")
+    return f"{n or 0:,}".replace(",", ".")
 
 
 def cmd_resumo(args):
@@ -576,38 +1015,54 @@ def cmd_resumo(args):
             " FROM sessao GROUP BY etapa, d ORDER BY etapa, n DESC"):
         print(f"  {r['n']:4d}  {r['etapa']:<12} {r['d']}")
 
-    print("\npor máquina:")
-    for r in con.execute(
-            "SELECT m.nome AS nome, count(*) AS n FROM sessao s"
-            " JOIN maquina m ON m.id = s.maquina_id GROUP BY m.nome ORDER BY n DESC"):
-        print(f"  {r['n']:4d}  {r['nome']}")
-
     print("\ntokens por modelo:")
     for r in con.execute(
             "SELECT modelo, sum(mensagens) AS msg, sum(tokens_entrada) AS ent,"
             " sum(tokens_saida) AS sai, sum(tokens_cache_leitura) AS cl,"
             " sum(tokens_cache_escrita) AS ce FROM consumo GROUP BY modelo"
             " ORDER BY sai DESC"):
-        print(f"  {r['modelo']}")
-        print(f"      mensagens {_milhar(r['msg'])} · "
-              f"entrada {_milhar(r['ent'])} · saída {_milhar(r['sai'])}")
-        print(f"      cache lido {_milhar(r['cl'])} · "
-              f"cache escrito {_milhar(r['ce'])}")
+        print(f"  {r['modelo']}: mensagens {_milhar(r['msg'])} · "
+              f"saída {_milhar(r['sai'])} · cache lido {_milhar(r['cl'])}")
 
     if not con.execute("SELECT count(*) FROM preco_modelo").fetchone()[0]:
-        print("\ncusto em dinheiro: não calculado — nenhum preço cadastrado.")
+        print("  custo em dinheiro: não calculado — nenhum preço cadastrado")
+
+    print("\nprodução:")
+    r = con.execute("SELECT count(*) AS c, sum(arquivos) AS a, sum(insercoes) AS i,"
+                    " sum(delecoes) AS d FROM commit_unidade").fetchone()
+    print(f"  {_milhar(r['c'])} commits · {_milhar(r['a'])} arquivos · "
+          f"+{_milhar(r['i'])} / -{_milhar(r['d'])} linhas")
+
+    print("\nesperando uma pessoa:")
+    esperas = list(con.execute(
+        "SELECT codigo, titulo, ts FROM v_espera_humana ORDER BY ts"))
+    if not esperas:
+        print("  nada")
+    for e in esperas:
+        print(f"  {e['codigo']:<7} {e['ts'] or '(sem hora)'}  "
+              f"{(e['titulo'] or '')[:56]}")
+
+    print("\nunidades com mais retrabalho:")
+    for r in con.execute(
+            "SELECT codigo, titulo, reprovacoes, travadas, orfas FROM v_retrabalho"
+            " WHERE reprovacoes + orfas > 0 ORDER BY reprovacoes DESC, orfas DESC"
+            " LIMIT 8"):
+        print(f"  {r['codigo']:<7} {r['reprovacoes']} reprovações, "
+              f"{r['orfas']} órfãs, {r['travadas']} travadas  "
+              f"{(r['titulo'] or '')[:44]}")
 
     deduzidas = con.execute(
         "SELECT count(*) FROM sessao WHERE inicio_deduzido = 1").fetchone()[0]
-    if deduzidas:
-        print(f"\naviso: {deduzidas} sessões com início deduzido, não medido "
-              "(não havia despacho correspondente no registro)")
-
     soltas = con.execute(
         "SELECT count(*) FROM consumo WHERE sessao_id IS NULL").fetchone()[0]
-    if soltas:
-        print(f"aviso: {soltas} transcrições não caíram na janela de nenhuma "
-              "sessão; ficaram ligadas só à unidade")
+    if deduzidas or soltas:
+        print("\navisos de qualidade do dado:")
+        if deduzidas:
+            print(f"  {deduzidas} sessões com início DEDUZIDO, não medido — não havia "
+                  "despacho correspondente")
+        if soltas:
+            print(f"  {soltas} transcrições fora da janela de qualquer sessão; "
+                  "ligadas só à unidade")
 
     print(f"\nunidades de trabalho: "
           f"{con.execute('SELECT count(*) FROM unidade').fetchone()[0]}")
@@ -627,6 +1082,8 @@ def main(argv=None):
     s.set_defaults(func=cmd_esquema)
 
     s = sub.add_parser("coletar", help="varre as fontes e preenche; seguro repetir")
+    s.add_argument("--sem-rede", action="store_true",
+                   help="não consulta o ClickUp")
     s.set_defaults(func=cmd_coletar)
 
     s = sub.add_parser("resumo", help="imprime os números principais")

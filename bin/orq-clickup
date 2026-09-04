@@ -16,6 +16,7 @@
 //   get         <taskId>                               status/tags/links by id -> {id,name,status,url,tags,linked}
 //   create-task <listId|alias> <name> [description]   create a task (auto-assigns API-key owner) -> {id,url}
 //   set-status  <taskId> <status>                     change a task's status -> {id,status,url}
+//   set-priority <taskId> <urgent|high|normal|low|none>  prioridade nativa -> {id,priority,url}
 //   set-desc    <taskId> <file.md|-> [--dry]           replace the description (markdown) -> {id,url,chars}
 //   fields      <taskId>                              all custom fields      -> {name:value,...}
 //   field       <taskId> <fieldName>                  one custom field value -> plain string
@@ -455,6 +456,17 @@ const commands = {
     out({ id: t.id, status: t.status?.status, url: t.url })
   },
 
+  // Prioridade NATIVA (nao e campo personalizado, entao `set-field` nao alcanca).
+  // A API fala em numero; quem escreve fala em palavra. `none` limpa.
+  async ['set-priority']([taskId, palavra]) {
+    if (!taskId || !palavra) die('usage: set-priority <taskId> <urgent|high|normal|low|none>')
+    const mapa = { urgent: 1, urgente: 1, high: 2, alta: 2, normal: 3, media: 3, low: 4, baixa: 4, none: null, nenhuma: null }
+    const chave = palavra.toLowerCase()
+    if (!(chave in mapa)) die(`prioridade desconhecida: ${palavra}. Use urgent|high|normal|low|none`)
+    const t = await api('PUT', `/task/${taskId}`, { priority: mapa[chave] })
+    out({ id: t.id, priority: t.priority?.priority || null, url: t.url })
+  },
+
   async get([taskId]) {
     if (!taskId) die('usage: get <taskId>')
     const t = await api('GET', `/task/${taskId}`)
@@ -801,6 +813,7 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   create-task <listId|alias> <name> [desc] [--tag=N --type=N|id --status=S] [--assignee=userId|--no-assign]
                                                         create a task (auto-assigned to the API-key owner) -> {id,url,assignees}
   set-status  <taskId> <status>                         change a task's status  -> {id,status,url}
+  set-priority <taskId> <urgent|high|normal|low|none>   prioridade NATIVA (set-field nao alcanca) -> {id,priority,url}
   set-desc    <taskId> <arquivo.md|-> [--dry]           substitui a descricao (markdown; - = stdin) -> {id,url,chars}
   set-field   <taskId> <fieldName> <value>             set a custom field by name -> {ok}
   tag         <taskId> <tagName>                        add a tag (e.g. backend) -> {ok}

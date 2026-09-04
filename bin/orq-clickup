@@ -30,7 +30,13 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const API = 'https://api.clickup.com/api/v2'
+// `CLICKUP_API_URL` existe para o teste do `attach` apontar para um servidor
+// falso em 127.0.0.1. O `attach` é o único verbo que não fala JSON — ele monta um
+// corpo multipart, e a parte que erra em silêncio (nome do campo, boundary)
+// devolve 200 do mesmo jeito quando está errada. Sem esta variável, provar que o
+// corpo sai certo exigiria anexar num cartão de verdade e deixar lixo num quadro
+// que outras pessoas leem.
+const API = process.env.CLICKUP_API_URL || 'https://api.clickup.com/api/v2'
 
 // --- carregador de credencial (zero dependências) --------------------------
 // A credencial vive FORA de qualquer repositório: um token dentro da árvore
@@ -533,6 +539,55 @@ const commands = {
     out({ task: taskId, comment_id: r.id })
   },
 
+  // Anexa arquivo ao cartão — captura de tela, relatório, o que for prova.
+  //
+  // Por que não dá para reusar o `api()`: ele carimba `Content-Type:
+  // application/json` e serializa o corpo. Aqui o corpo é multipart e o
+  // Content-Type PRECISA vir do próprio FormData, porque só ele conhece o
+  // boundary. Escrever o cabeçalho à mão apaga o boundary e o ClickUp responde
+  // 200 sem gravar anexo nenhum — falha que só aparece quando alguém abre o
+  // cartão e não acha a imagem.
+  //
+  // O campo se chama `attachment`, no singular, e a API aceita UM por
+  // requisição: três larguras de captura são três requisições, não uma com três
+  // partes.
+  async attach([taskId, ...arquivos]) {
+    if (!taskId || !arquivos.length) {
+      die('uso: attach <taskId> <arquivo> [arquivo...]   anexa arquivo(s) ao cartão -> NDJSON {id,title,url}')
+    }
+    if (!KEY) die(AJUDA_CREDENCIAL)
+
+    // Confere TODOS antes de subir QUALQUER um. Um `attach` de três capturas em
+    // que a segunda não existe não pode deixar a primeira publicada e morrer no
+    // meio: meio anexo num cartão é pior que nenhum, porque quem lê não sabe
+    // que falta.
+    const faltando = arquivos.filter((f) => !fs.existsSync(f))
+    if (faltando.length) die(`arquivo não encontrado: ${faltando.join(', ')}`)
+
+    for (const arquivo of arquivos) {
+      const corpo = new FormData()
+      corpo.append(
+        'attachment',
+        new Blob([fs.readFileSync(arquivo)]),
+        path.basename(arquivo),
+      )
+      const res = await fetch(`${API}/task/${taskId}/attachment`, {
+        method: 'POST',
+        // SEM Content-Type: quem o escreve é o FormData, com o boundary.
+        headers: { Authorization: KEY },
+        body: corpo,
+        // Teto mais folgado que os 15s do `api()`: ali trafega JSON, aqui uma
+        // captura de 1440px de largura.
+        signal: AbortSignal.timeout(120000),
+      })
+      const texto = await res.text()
+      if (!res.ok) die(`ClickUp API error ${res.status} ao anexar ${arquivo}: ${texto}`)
+      let dados
+      try { dados = JSON.parse(texto) } catch { dados = { raw: texto } }
+      out({ id: dados.id, title: dados.title, url: dados.url })
+    }
+  },
+
   // --- Sprints (multi-list) ---------------------------------------------------
   // List the sprint lists in the Sprints folder (id, name, dates) — find the active sprint fast.
   async sprints() {
@@ -820,6 +875,7 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   untag       <taskId> <tagName>                        remove a tag             -> {ok}
   relate      <taskId> <otherTaskId>                    epic<->task relation     -> {ok}
   comment     <taskId> <text>                           add a comment            -> {comment_id}
+  attach      <taskId> <arquivo> [arquivo...]           anexa prova ao cartao    -> NDJSON {id,title,url}
   dep         <taskId> <otherId> [--blocks]             cria bloqueio (padrao: taskId espera por otherId) -> {ok}
   undep       <taskId> <otherId> [--blocks]             remove o bloqueio        -> {ok}
  sprints

@@ -1,6 +1,6 @@
 # Aprendizados
 
-Vinte e três coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
+Vinte e quatro coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
 parecia ser, o que era, o comando que confirma, e como não repetir.
 
 Não é lista de dicas. É o que já deu errado, com os números.
@@ -480,3 +480,40 @@ processo: com `fork` falhando, TODA checagem que executa alguma coisa devolve o 
 última coisa que ela ia executar. E o remédio é o mesmo do teto de capacidade — parar de
 despachar por alguns minutos, não trocar credencial. Um laço que morre por isso é seguro de
 reerguer: ele reconsulta o ClickUp e reconhece a sessão viva em vez de duplicá-la.
+
+---
+
+## 24. O navegador de prova não pinta borrão, e a sessão mediu duas rodadas com o defeito desligado
+
+**O sintoma.** Um cartão dizia que a comparação de equipamentos lado a lado não funciona no
+Safari: a página fica borrada e a comparação não aparece. Duas rodadas de sessão mediram o
+mesmo roteiro nos dois motores do arnês e devolveram 38 medidas idênticas, 0 divergências,
+0 violações de acessibilidade, nenhum erro de página. O relato do usuário e o instrumento se
+contradiziam, e o instrumento parecia estar ganhando.
+
+**O que parecia ser.** Versão: o WebKit do arnês é 26.5 e o Safari relatado era 26.6.2 — quase
+o mesmo motor, então "não reproduz" parecia significar "o defeito não existe mais" ou "está
+na camada da Apple, fora do motor".
+
+**O que era.** O WebKit headless **não pinta `backdrop-filter`**. A terceira rodada mediu a
+nitidez do fundo com o borrão ligado e desligado: **29,1 nos dois casos**, e as duas capturas
+saíram byte a byte idênticas. No Chromium a mesma medida dá **1,6 borrado contra 27,4 nítido**.
+O sintoma relatado *começa* por "a página inteira fica borrada" — ou seja, o instrumento não
+produzia nem a metade visível do sintoma. As duas rodadas anteriores mediram um motor com a
+suspeita principal desligada e concluíram, de boa-fé, que estava tudo bem.
+
+**O comando que confirma.** Medir o efeito, não olhar a captura: tirar duas capturas do mesmo
+estado, uma com a propriedade ligada e outra desligada, e comparar os arquivos.
+
+```bash
+cmp com-efeito.png sem-efeito.png && echo "ESTE MOTOR NÃO PINTA O EFEITO"
+```
+
+**Como não repetir.** O motor de prova serve para **layout, estrutura, acessibilidade e
+rolagem**. Não serve para **efeito visual composto** — borrão, sombra composta,
+`mix-blend-mode`, camada de composição. Nesses casos ele devolve um "está tudo bem" falso, que
+é pior do que não medir: fecha a investigação. Antes de aceitar um "não reproduz" sobre efeito
+visual, prove que o instrumento **produz o efeito**; se as duas capturas forem idênticas, o
+resultado inteiro é inválido. E, quando o motor não alcança, o desfecho honesto é uma página
+isolada extraída da aplicação em pé para um olho humano abrir no navegador relatado — não um
+conserto guiado por hipótese.

@@ -1,6 +1,6 @@
 # Aprendizados
 
-Vinte e duas coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
+Vinte e três coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
 parecia ser, o que era, o comando que confirma, e como não repetir.
 
 Não é lista de dicas. É o que já deu errado, com os números.
@@ -437,3 +437,46 @@ git rev-list --count homol..origin/homol      # quanto a base local está atrasa
 **Como não repetir.** Atribuir pelo **merge**, que diz de qual branch veio o que entrou, e
 não pelo intervalo. E, sempre que houver referência remota, preferir a remota à local: a
 local só anda quando alguém puxa.
+
+---
+
+## 23. O laço disse "sem login" quando a máquina é que não conseguia mais criar processo
+
+**O sintoma.** Em 04/09/2026, às 22:35Z, o laço da esteira do front parou dois ciclos
+seguidos com `💥 Laço parado — sessão do Claude Code sem login (claude auth login)`. A
+sessão de revisão despachada minutos antes continuava viva e trabalhando, e o `orq doctor`
+tinha fechado verde às 19:33 local, incluindo a chamada real ao ClickUp e a criação de
+worktree.
+
+**O que parecia ser.** Credencial do agente expirada no meio da corrida — o aprendizado 1
+outra vez, agora pego pelo laço em vez do pré-voo.
+
+**O que era.** A máquina bateu no limite de criação de processo. O painel da sessão viva
+mostrava, em sequência, `PreToolUse:Bash hook error … EAGAIN: resource temporarily
+unavailable, posix_spawn '/bin/sh'` e `hooks/cerca.sh: fork: Resource temporarily
+unavailable`. Quem não consegue dar fork não consegue rodar o teste de login do laço — e o
+teste, ao não conseguir *executar* o `claude`, conclui que não há sessão. O diagnóstico saiu
+com o nome da última coisa que a checagem toca, não com o nome do que falhou.
+
+Nada aqui era escassez de memória: no mesmo minuto havia 13,1 GB disponíveis, 235 processos
+para um teto de 2.666 por usuário e 1.303 threads. Foi um pico simultâneo de forks — o laço,
+a sessão viva, o gancho da cerca e o proxy de linha de comando disputando ao mesmo tempo — e
+passou sozinho em poucos minutos.
+
+**O comando que confirma.**
+
+```bash
+tmux capture-pane -p -t <sessão viva> | grep -E "EAGAIN|fork: Resource"
+```
+
+E, para separar limite de processo de falta de memória:
+
+```bash
+echo "$(ps -u $(id -u) -o pid= | wc -l) de $(sysctl -n kern.maxprocperuid)"
+```
+
+**Como não repetir.** Antes de acreditar em "sem login", confira se a máquina ainda cria
+processo: com `fork` falhando, TODA checagem que executa alguma coisa devolve o erro da
+última coisa que ela ia executar. E o remédio é o mesmo do teto de capacidade — parar de
+despachar por alguns minutos, não trocar credencial. Um laço que morre por isso é seguro de
+reerguer: ele reconsulta o ClickUp e reconhece a sessão viva em vez de duplicá-la.

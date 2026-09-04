@@ -56,11 +56,11 @@ comentado, para você revisar — nada é decidido às escondidas.
 | [Segurança](docs/seguranca.md) | A cerca, o que ela cobre e o que ela não cobre |
 | [Host Linux](docs/host-linux.md) | Rodar sozinho num servidor |
 | [Medição](docs/medicao.md) | O que a esteira produziu: sessões, retrabalho, espera humana, tokens e código |
-| **[Aprendizados](docs/aprendizados.md)** | **Vinte e duas coisas que custaram tempo descobrir** |
+| **[Aprendizados](docs/aprendizados.md)** | **Vinte e três coisas que custaram tempo descobrir** |
 
 **Comece pelos aprendizados se quiser saber se isto vale a pena.** É a parte que não se
 inventa: cada item é um problema que já aconteceu, com o número exato, o comando que
-confirma e o que foi feito para não repetir. Ferramenta se escreve de novo; essas vinte e duas
+confirma e o que foi feito para não repetir. Ferramenta se escreve de novo; essas vinte e três
 descobertas, não.
 
 ## O que já se sabe

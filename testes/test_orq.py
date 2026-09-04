@@ -95,10 +95,10 @@ class AmbienteDaSessaoTmux(unittest.TestCase):
     `subprocess.run(env=...)` só alcança o CLIENTE tmux. Quando o servidor já
     está de pé — e ele fica de pé por dias, compartilhado por TODAS as esteiras
     da máquina — a sessão nova herda o ambiente do SERVIDOR, congelado na
-    primeira sessão que o criou. Em 03/09/2026 isso pôs quatro sessões vivas
-    carregando o `ORQ_UNIT` de uma quinta, e sessões do app-exemplo nascendo com o
-    `ORQ_PIPELINE` de outro projeto — `orq show` respondia "unidade não está no
-    pipeline.toml" e havia risco real de escrever na lista do projeto errado.
+    primeira sessão que o criou. Numa máquina com duas esteiras isso pôs quatro
+    sessões vivas carregando o `ORQ_UNIT` de uma quinta, e sessões de uma esteira
+    nascendo com o `ORQ_PIPELINE` da outra — `orq show` respondia "unidade não
+    está no pipeline.toml" e havia risco real de escrever na lista errada.
     Foi relatado três vezes antes de alguém ver a causa.
     """
 
@@ -135,6 +135,55 @@ class AmbienteDaSessaoTmux(unittest.TestCase):
 
     def test_sem_ambiente_nao_inventa_e(self):
         self.assertNotIn("-e", self.args(ambiente={}))
+
+
+class BriefingRenderiza(unittest.TestCase):
+    """Toda ordem de serviço tem de fechar sem buraco, para todo estágio.
+
+    O briefing é montado por `str.format`. Um campo novo no texto sem a chave
+    correspondente no contexto levanta KeyError NA HORA DE LANCAR a sessão — a
+    unidade ja saiu da fila, a worktree ja existe, e o erro aparece longe de
+    quem o escreveu. Uma chave a mais e pior: passa calada e a sessao recebe uma
+    instrucao pela metade.
+    """
+
+    def cfg(self, pipeline_extra=None):
+        return orq.Config(path=Path("/tmp/x.toml"), raw={
+            "pipeline": {"name": "t", "list_id": "1", "repo": "/tmp",
+                         **(pipeline_extra or {})},
+            "gates": {"setup": ["make setup"], "verify": ["make test"]},
+        })
+
+    def brief(self, chave, pipeline_extra=None):
+        estagio = orq.Stage(key=chave, label=chave, queue="q", working="w",
+                            done="d", idx=0)
+        unidade = orq.Unit(id="868abc001", key="AA-01", title="titulo")
+        return orq.build_brief(self.cfg(pipeline_extra), unidade, estagio,
+                               Path("/tmp/wt"), "CU-868abc001-x")
+
+    def test_todo_estagio_fecha(self):
+        for chave in orq.BRIEFS:
+            with self.subTest(estagio=chave):
+                texto = self.brief(chave)
+                self.assertNotIn("{", texto, "sobrou campo sem substituir")
+                self.assertIn("AA-01", texto)
+
+    def test_sem_declaracao_nao_manda_procurar_verificacao(self):
+        # O padrao seguro: prova de menos, nunca uma prova que nao aconteceu.
+        texto = self.brief("integrate")
+        self.assertIn("NÃO declarou verificação automática", texto)
+        self.assertNotIn("gh run list", texto)
+
+    def test_declarada_vira_o_passo_7(self):
+        texto = self.brief("integrate",
+                           {"verificacao_automatica": "gh run list --limit 3"})
+        self.assertIn("gh run list --limit 3", texto)
+        self.assertNotIn("NÃO declarou", texto)
+
+    def test_so_o_integrador_fala_de_verificacao(self):
+        # Quem implementa nao publica: mandar conferir publicacao ali produz
+        # sessao procurando o que nao e dela.
+        self.assertNotIn("verificação automática", self.brief("implement"))
 
 
 if __name__ == "__main__":

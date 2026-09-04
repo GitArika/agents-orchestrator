@@ -26,7 +26,24 @@ Em português comum, sem código como sujeito de frase. Quatro coisas:
 - quais estágios a esteira vai ter, e o que cada um significa;
 - quais portões — e **de onde saíram**;
 - onde ficam as cópias de trabalho (fora do repositório, e por quê);
-- quanta memória por estágio, e que esse número se corrige por medida depois.
+- quanta memória por estágio, e que esse número se corrige por medida depois;
+- **o que prova que a publicação passou**, depois do merge — veja abaixo.
+
+## 2b. Pergunte quem faz o quê, e o que prova
+
+A ferramenta não adivinha estas quatro, e errar qualquer uma gasta sessão:
+
+- **Tem verificação automática?** Se sim, qual comando a consulta
+  (`gh run list --branch main --limit 3`, um script de deploy, um webhook). Isso vira
+  `verificacao_automatica` e é o passo 7 do integrador. **Se não tem, deixe vazio** —
+  a ordem de serviço passa a dizer que não há o que procurar. Nunca presuma que tem.
+- **Como se publica?** Se existe um comando só para isso, nomeie-o no
+  `publish_note` do estágio de integração. Ele vence o procedimento genérico, e é a
+  diferença entre o integrador executar e o integrador improvisar `rsync`.
+- **Tem ambiente fechado para provar comportamento?** Se sim, `esteira-sandbox`.
+- **Quais estágios são de gente?** Um estágio que uma pessoa faz não deve ser
+  despachado: declare-o fora dos estágios da esteira ou marque as unidades como
+  `hands-on` e ponha o modo em `skip_modes`.
 
 ## 3. Portões descobertos, nunca inventados
 

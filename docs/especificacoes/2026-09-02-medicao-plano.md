@@ -229,8 +229,8 @@ Rodar sobre a história copiada e conferir contra o desenho: 27+21+13+14 avança
 class TarefaDoBranch(unittest.TestCase):
     def test_extrai_o_id(self):
         self.assertEqual(
-            medir.tarefa_do_branch("CU-868kyu9v4-ligar-o-otimizador-automatic"),
-            "868kyu9v4")
+            medir.tarefa_do_branch("CU-868abc002-ligar-o-otimizador-automatic"),
+            "868abc002")
 
     def test_branch_de_fora_da_esteira(self):
         self.assertIsNone(medir.tarefa_do_branch("homol"))
@@ -244,7 +244,7 @@ class Consumo(unittest.TestCase):
         self.assertEqual(c["mensagens"], 2)
         self.assertEqual(c["tokens_saida"], 30)
         self.assertEqual(c["tokens_cache_leitura"], 300)
-        self.assertEqual(c["tarefa"], "868kyu9v4")
+        self.assertEqual(c["tarefa"], "868abc002")
         self.assertTrue(c["primeiro_ts"] <= c["ultimo_ts"])
 
     def test_linha_corrompida_nao_derruba_a_leitura(self):
@@ -259,7 +259,7 @@ class Consumo(unittest.TestCase):
 
 `testes/material/transcricao-curta.jsonl` com quatro linhas: duas mensagens do assistente
 com `usage` (saída 10 e 20; leitura de cache 100 e 200), uma linha sem `usage`, e uma
-última linha truncada no meio. Todas com `gitBranch` de `CU-868kyu9v4-...`.
+última linha truncada no meio. Todas com `gitBranch` de `CU-868abc002-...`.
 
 - [ ] **Passo 4: implementar**
 
@@ -291,16 +291,16 @@ carimbo dela. Sem janela, fica ligada só à unidade.
 class EventosDoLaco(unittest.TestCase):
     ESTADO = {
         "ticks": 366, "dispatched": 85,
-        "quarantine": ["868kyu8ec"],
-        "rework": {"868kyu71z": 1, "868kyu8ec": 2},
-        "hold": {"868kyugea": {"reason": "falta decidir a altura do botão",
+        "quarantine": ["868abc004"],
+        "rework": {"868abc001": 1, "868abc004": 2},
+        "hold": {"868abc003": {"reason": "falta decidir a altura do botão",
                                "at": "2026-09-01T03:44:10Z", "status": "em progresso"}},
     }
 
     def test_retrabalho_vira_evento_por_tarefa(self):
         ev = medir.eventos_do_laco_dict(self.ESTADO, "Q")
         r = [e for e in ev if e["tipo"] == "retrabalho"]
-        self.assertEqual({e["tarefa"] for e in r}, {"868kyu71z", "868kyu8ec"})
+        self.assertEqual({e["tarefa"] for e in r}, {"868abc001", "868abc004"})
 
     def test_espera_humana_carrega_hora_e_motivo(self):
         ev = medir.eventos_do_laco_dict(self.ESTADO, "Q")
@@ -346,25 +346,25 @@ class EventosDeGancho(unittest.TestCase):
 class Comentarios(unittest.TestCase):
     PAYLOAD = {"comments": [
         {"id": "1", "date": "1788211481689",
-         "user": {"username": "Ariel Evangelista", "id": 1},
+         "user": {"username": "Fulano de Tal", "id": 1},
          "comment_text": "INTEGRADO E PUBLICADO. merge-base ae43e34, commit c461c71."},
         {"id": "2", "date": "1788200000000",
-         "user": {"username": "Ariel Evangelista", "id": 1},
+         "user": {"username": "Fulano de Tal", "id": 1},
          "comment_text": "REPROVADO (retrabalho 1/2) — volta para 'spec pronta'."},
     ]}
 
     def test_hora_em_utc_e_autor(self):
-        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z")
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868abc001")
         self.assertTrue(all(e["ts"].endswith("Z") for e in ev))
-        self.assertEqual(ev[0]["autor"], "Ariel Evangelista")
+        self.assertEqual(ev[0]["autor"], "Fulano de Tal")
 
     def test_classifica_a_transicao(self):
-        ev = {e["tipo"] for e in medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z")}
+        ev = {e["tipo"] for e in medir.eventos_de_comentarios(self.PAYLOAD, "868abc001")}
         self.assertIn("integrado", ev)
         self.assertIn("reprovado", ev)
 
     def test_extrai_commits_citados(self):
-        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z")
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868abc001")
         shas = {s for e in ev for s in e["commits"]}
         self.assertIn("c461c71", shas)
         self.assertIn("ae43e34", shas)
@@ -397,7 +397,7 @@ class Comentarios(unittest.TestCase):
 class UnidadesDeclaradas(unittest.TestCase):
     TOML = b"""
 [[task]]
-id = "868kyu71z"
+id = "868abc001"
 key = "FE-01"
 title = "Erro numa tela nao pode apagar o aplicativo inteiro"
 depends_on = []
@@ -407,7 +407,7 @@ mode = "autonomous"
     def test_le_codigo_tarefa_e_titulo(self):
         u = medir.unidades_do_toml(tomllib.loads(self.TOML.decode()))
         self.assertEqual(u[0]["codigo"], "FE-01")
-        self.assertEqual(u[0]["tarefa"], "868kyu71z")
+        self.assertEqual(u[0]["tarefa"], "868abc001")
         self.assertIn("Erro numa tela", u[0]["titulo"])
 ```
 

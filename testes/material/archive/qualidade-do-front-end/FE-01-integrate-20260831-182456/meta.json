@@ -1,15 +1,15 @@
 {
   "pipeline": "Qualidade do Front-end",
   "unit": "FE-01",
-  "id": "868kyu71z",
+  "id": "868abc001",
   "stage": "integrate",
   "outcome": "advanced:integrate",
   "status_final": "integrando",
   "archived_at": "2026-08-31T21:24:56Z",
   "artifacts": [
-    "qualidade-do-fro-868kyu71z-integrate.brief.md",
-    "qualidade-do-fro-868kyu71z.settings.json",
-    "qualidade-do-fro-868kyu71z.log",
+    "qualidade-do-fro-868abc001-integrate.brief.md",
+    "qualidade-do-fro-868abc001.settings.json",
+    "qualidade-do-fro-868abc001.log",
     "FE-01-integrate.events"
   ]
 }

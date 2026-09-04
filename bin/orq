@@ -146,6 +146,33 @@ class Config:
     @property
     def slug_max(self): return int(self.raw["pipeline"].get("slug_max", 40))
 
+    def verificacao_bloco(self) -> str:
+        """O passo 7 do integrador, montado a partir do que ESTA esteira declarou.
+
+        Antes esta parte era uma frase fixa mandando `gh run list`, e outra,
+        duas linhas acima, afirmando que o repositório não tinha workflow —
+        conhecimento de UM projeto endurecido no molde de todos. Para quem tem
+        verificação automática, a segunda era mentira; para quem não tem, a
+        primeira mandava procurar o que não existe, e a sessão ia investigar a
+        ausência. Nenhuma esteira acertava as duas.
+
+        Sem declaração, o texto diz que não há o que procurar. É o padrão seguro:
+        no pior caso a esteira prova de menos, nunca acredita numa prova que não
+        aconteceu.
+        """
+        cmd = str(self.raw.get("pipeline", {}).get("verificacao_automatica", "")).strip()
+        if cmd:
+            return ("Confirme que a verificação automática desta esteira passou:\n"
+                    f"       {cmd}\n"
+                    "   Registre a evidência no `orq note`. Se ela falhar, isso é "
+                    "achado — `orq note`\n   com o log e `orq hold`: publicação "
+                    "quebrada é assunto de pessoa.")
+        return ("Esta esteira NÃO declarou verificação automática, e por isso não há\n"
+                "   execução para procurar. Os portões que VOCÊ rodou no passo 4 são a\n"
+                "   única prova — não vá atrás de workflow, painel ou log de serviço.\n"
+                "   Se o aviso de publicação nomeia um comando, ele é o passo 7 inteiro:\n"
+                "   rode-o e faça exatamente o que ele mandar.")
+
     def publish_note_for(self, stage_key: str) -> str:
         """Aviso de publicação por estágio.
 
@@ -846,13 +873,8 @@ Procedimento:
    pendência o que era ordem impossível. Ordem que a cerca proíbe não é ordem.
    Quem remove branch fundido é o ajuste do repositório ("automatically delete
    head branches") ou uma pessoa. Não tente, e não relate como pendência sua.
-   O PR não terá verificação automática: este repositório não tem workflow em
-   `pull_request`. Os portões que VOCÊ rodou no passo 4 são a única prova.
 
-7. Confirme que a publicação disparou: `gh run list --branch {base} --limit 3`.
-   Registre a URL da execução no `orq note`. Se o deploy falhar, isso é achado —
-   `orq note` com o log e `orq hold`, porque homologação quebrada é assunto de
-   pessoa.
+7. {verificacao}
 
 Você NÃO implementa funcionalidade nova. Só integra, concilia e publica.
 """,
@@ -911,6 +933,7 @@ def build_brief(cfg: Config, u: Unit, stage: Stage, worktree: Path, branch: str)
         worktree=worktree, branch=branch, base=cfg.base_branch, repo=cfg.repo,
         work_sub=cfg.work_sub, done_status=stage.done,
         publish=cfg.publish_note_for(stage.key),
+        verificacao=cfg.verificacao_bloco(),
         setup="\n".join(f"   {i+1}. {c}" for i, c in enumerate(cfg.setup)) or "   (nada)",
         context=CONTEXT.format(key=u.key),
         browser=cfg.browser_note_for(stage.key),
@@ -1035,10 +1058,10 @@ def argumentos_new_session(nome: str, wt, ambiente: dict, cmd: list) -> list:
     nenhum. O servidor fica de pé por dias e é COMPARTILHADO por todas as
     esteiras da máquina, então isso não é caso de canto: é o caso comum.
 
-    O sintoma foi caro e mudo. Em 03/09/2026, quatro sessões vivas do app-exemplo
-    carregavam o `ORQ_UNIT` de uma quinta, e sessões nasciam com o
-    `ORQ_PIPELINE` de outro projeto: `orq show` respondia "unidade não está no
-    pipeline.toml" e havia risco real de a sessão escrever na lista do projeto
+    O sintoma foi caro e mudo. Numa máquina com duas esteiras, quatro sessões
+    vivas de uma delas carregavam o `ORQ_UNIT` de uma quinta, e sessões nasciam
+    com o `ORQ_PIPELINE` da OUTRA esteira: `orq show` respondia "unidade não está
+    no pipeline.toml" e havia risco real de a sessão escrever na lista do projeto
     errado. Foi relatado em três sessões antes de alguém olhar para o servidor.
 
     `-e` (tmux ≥ 3.2) põe a variável no ambiente da SESSÃO, que é o único escopo

@@ -21,6 +21,18 @@ slug_max        = 28
 # ninguém mais enxerga o que mudou de verdade.
 worktree_root   = "__WORKTREE_ROOT__"
 
+# O comando que prova, DEPOIS do merge, que a publicação passou — a verificação
+# automática do projeto. É o passo 7 da ordem de serviço da integração.
+#
+# Deixe VAZIO se o projeto não tem nenhuma: a ordem de serviço passa a dizer, com
+# todas as letras, que não há execução para procurar, e o integrador para de
+# investigar a ausência de um workflow. Uma frase fixa aqui já mandou sessões
+# caçarem um CI que não existia, e afirmou a projetos que TÊM CI que eles não
+# tinham. Por isso a pergunta é sua, e não um palpite da ferramenta.
+#
+#   verificacao_automatica = "gh run list --branch main --limit 3"
+verificacao_automatica = ""
+
 # O que "depender de outra unidade" significa aqui.
 #
 # A regra genérica da ferramenta é "para entrar no estágio S, a dependência já

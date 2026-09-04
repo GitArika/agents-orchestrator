@@ -1,14 +1,14 @@
 {
   "pipeline": "Qualidade do Front-end",
   "unit": "DS-02",
-  "id": "868kyugea",
+  "id": "868abc003",
   "stage": "implement",
   "outcome": "hold",
   "status_final": "em progresso",
   "archived_at": "2026-09-01T03:44:11Z",
   "artifacts": [
-    "qualidade-do-fro-868kyugea-implement.brief.md",
-    "qualidade-do-fro-868kyugea.settings.json",
-    "qualidade-do-fro-868kyugea.log"
+    "qualidade-do-fro-868abc003-implement.brief.md",
+    "qualidade-do-fro-868abc003.settings.json",
+    "qualidade-do-fro-868abc003.log"
   ]
 }

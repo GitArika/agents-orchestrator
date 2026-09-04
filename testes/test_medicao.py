@@ -163,8 +163,8 @@ class Casamento(unittest.TestCase):
 class TarefaDoBranch(unittest.TestCase):
     def test_extrai_o_id(self):
         self.assertEqual(
-            medir.tarefa_do_branch("CU-868kyu9v4-ligar-o-otimizador-automatic"),
-            "868kyu9v4")
+            medir.tarefa_do_branch("CU-868abc002-ligar-o-otimizador-automatic"),
+            "868abc002")
 
     def test_branch_de_fora_da_esteira(self):
         self.assertIsNone(medir.tarefa_do_branch("homol"))
@@ -181,7 +181,7 @@ class Consumo(unittest.TestCase):
         self.assertEqual(c["tokens_saida"], 30)
         self.assertEqual(c["tokens_cache_leitura"], 300)
         self.assertEqual(c["tokens_entrada"], 8)
-        self.assertEqual(c["tarefa"], "868kyu9v4")
+        self.assertEqual(c["tarefa"], "868abc002")
         self.assertEqual(c["primeiro_ts"], "2026-08-31T20:10:00Z")
         self.assertEqual(c["ultimo_ts"], "2026-08-31T20:11:00Z")
 
@@ -214,9 +214,9 @@ class JanelaDaSessao(unittest.TestCase):
 class EventosDoLaco(unittest.TestCase):
     ESTADO = {
         "ticks": 366, "dispatched": 85,
-        "quarantine": ["868kyu8ec"],
-        "rework": {"868kyu71z": 1, "868kyu8ec": 2},
-        "hold": {"868kyugea": {"reason": "falta decidir a altura do botão",
+        "quarantine": ["868abc004"],
+        "rework": {"868abc001": 1, "868abc004": 2},
+        "hold": {"868abc003": {"reason": "falta decidir a altura do botão",
                                "at": "2026-09-01T03:44:10Z",
                                "status": "em progresso"}},
     }
@@ -224,14 +224,14 @@ class EventosDoLaco(unittest.TestCase):
     def test_retrabalho_vira_evento_por_tarefa(self):
         ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
         r = [e for e in ev if e["tipo"] == "retrabalho"]
-        self.assertEqual({e["tarefa"] for e in r}, {"868kyu71z", "868kyu8ec"})
+        self.assertEqual({e["tarefa"] for e in r}, {"868abc001", "868abc004"})
 
     def test_espera_humana_carrega_hora_e_motivo(self):
         ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
         h = [e for e in ev if e["tipo"] == "espera_humana"][0]
         self.assertEqual(h["ts"], "2026-09-01T03:44:10Z")
         self.assertIn("altura do botão", h["texto"])
-        self.assertEqual(h["tarefa"], "868kyugea")
+        self.assertEqual(h["tarefa"], "868abc003")
 
     def test_quarentena(self):
         ev = medir.eventos_do_laco(self.ESTADO, "Q", "servidor")
@@ -259,25 +259,25 @@ class EventosDeGancho(unittest.TestCase):
 class Comentarios(unittest.TestCase):
     PAYLOAD = {"comments": [
         {"id": "1", "date": "1788211481689",
-         "user": {"username": "Ariel Evangelista", "id": 1},
+         "user": {"username": "Fulano de Tal", "id": 1},
          "comment_text": "INTEGRADO E PUBLICADO. merge-base ae43e34, commit c461c71."},
         {"id": "2", "date": "1788200000000",
-         "user": {"username": "Ariel Evangelista", "id": 1},
+         "user": {"username": "Fulano de Tal", "id": 1},
          "comment_text": "REPROVADO (retrabalho 1/2) - volta para spec pronta."},
         {"id": "3", "date": "1788190000000",
-         "user": {"username": "Ariel Evangelista", "id": 1},
+         "user": {"username": "Fulano de Tal", "id": 1},
          "comment_text": "Spec publicada: ponto de partida medido."},
     ]}
 
     def test_hora_em_utc_e_autor(self):
-        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868abc001", "servidor")
         self.assertTrue(all(e["ts"].endswith("Z") for e in ev))
-        self.assertTrue(all(e["autor"] == "Ariel Evangelista" for e in ev))
+        self.assertTrue(all(e["autor"] == "Fulano de Tal" for e in ev))
         self.assertEqual(len(ev), 3)
 
     def test_classifica_a_transicao(self):
         tipos = {e["tipo"] for e in
-                 medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")}
+                 medir.eventos_de_comentarios(self.PAYLOAD, "868abc001", "servidor")}
         self.assertIn("integrado", tipos)
         self.assertIn("reprovado", tipos)
         self.assertIn("spec_publicada", tipos)
@@ -286,11 +286,11 @@ class Comentarios(unittest.TestCase):
         p = {"comments": [{"id": "9", "date": "1788190000000",
                            "user": {"username": "Alguem"},
                            "comment_text": "bom dia, alguma novidade?"}]}
-        ev = medir.eventos_de_comentarios(p, "868kyu71z", "servidor")
+        ev = medir.eventos_de_comentarios(p, "868abc001", "servidor")
         self.assertEqual(ev[0]["tipo"], "comentario")
 
     def test_extrai_commits_citados(self):
-        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868kyu71z", "servidor")
+        ev = medir.eventos_de_comentarios(self.PAYLOAD, "868abc001", "servidor")
         shas = {s for e in ev for s in e["commits"]}
         self.assertIn("c461c71", shas)
         self.assertIn("ae43e34", shas)
@@ -301,7 +301,7 @@ class Comentarios(unittest.TestCase):
         p = {"comments": [{"id": "9", "date": "1788190000000",
                            "user": {"username": "A"},
                            "comment_text": "a decisao foi acessada e efetivada."}]}
-        ev = medir.eventos_de_comentarios(p, "868kyu71z", "servidor")
+        ev = medir.eventos_de_comentarios(p, "868abc001", "servidor")
         self.assertEqual(ev[0]["commits"], [])
 
 
@@ -313,14 +313,14 @@ repo        = "/home/orq/repos/app-exemplo"
 base_branch = "homol"
 
 [[task]]
-id = "868kyu71z"
+id = "868abc001"
 key = "FE-01"
 title = "Erro numa tela nao pode apagar o aplicativo inteiro"
 depends_on = []
 mode = "autonomous"
 
 [[task]]
-id = "868kyu92r"
+id = "868abc007"
 key = "FE-09"
 title = "Remover as bibliotecas que o produto carrega e nao usa"
 depends_on = ["FE-01"]
@@ -332,7 +332,7 @@ mode = "hands-on"
         u = medir.unidades_do_toml(d)
         self.assertEqual(len(u), 2)
         self.assertEqual(u[0]["codigo"], "FE-01")
-        self.assertEqual(u[0]["tarefa"], "868kyu71z")
+        self.assertEqual(u[0]["tarefa"], "868abc001")
         self.assertIn("Erro numa tela", u[0]["titulo"])
 
     def test_le_a_configuracao_da_esteira(self):
@@ -359,13 +359,13 @@ class BranchDoMerge(unittest.TestCase):
     def test_merge_de_pedido_de_alteracao(self):
         self.assertEqual(
             medir.branch_do_merge(
-                "Merge pull request #35 from exemplo-org/CU-868abc009-escolher-entre-tabela-e-cart"),
-            "CU-868abc009-escolher-entre-tabela-e-cart")
+                "Merge pull request #35 from org-exemplo/CU-868abc005-escolher-entre-tabela-e-cart"),
+            "CU-868abc005-escolher-entre-tabela-e-cart")
 
     def test_merge_de_branch_simples(self):
         self.assertEqual(
-            medir.branch_do_merge("Merge branch 'CU-868kyu71z-erro-numa-tela' into homol"),
-            "CU-868kyu71z-erro-numa-tela")
+            medir.branch_do_merge("Merge branch 'CU-868abc001-erro-numa-tela' into homol"),
+            "CU-868abc001-erro-numa-tela")
 
     def test_merge_que_nao_e_de_unidade(self):
         self.assertIsNone(medir.branch_do_merge("Merge branch 'main' into homol"))
@@ -403,21 +403,21 @@ class SessaoViva(unittest.TestCase):
 
     def test_tira_a_tarefa_do_nome_da_sessao(self):
         self.assertEqual(
-            medir.tarefa_da_sessao(self.PREFIXO + "868kyu71z", self.PREFIXO), "868kyu71z")
+            medir.tarefa_da_sessao(self.PREFIXO + "868abc001", self.PREFIXO), "868abc001")
 
     def test_ignora_sessao_de_fora_da_esteira(self):
         self.assertIsNone(medir.tarefa_da_sessao("sessao-claude", self.PREFIXO))
         self.assertIsNone(medir.tarefa_da_sessao("orq-loop-qualidade-do-front", self.PREFIXO))
 
     def test_etapa_vem_do_arquivo_de_ordem_de_servico(self):
-        arquivos = ["qualidade-do-fro-868kyu71z-integrate.brief.md",
-                    "qualidade-do-fro-868kyugkg-review.brief.md",
+        arquivos = ["qualidade-do-fro-868abc001-integrate.brief.md",
+                    "qualidade-do-fro-868abc006-review.brief.md",
                     "runs.jsonl"]
-        self.assertEqual(medir.etapa_do_brief(arquivos, "868kyu71z"), "integrate")
-        self.assertEqual(medir.etapa_do_brief(arquivos, "868kyugkg"), "review")
+        self.assertEqual(medir.etapa_do_brief(arquivos, "868abc001"), "integrate")
+        self.assertEqual(medir.etapa_do_brief(arquivos, "868abc006"), "review")
 
     def test_sem_ordem_de_servico_nao_inventa_etapa(self):
-        self.assertIsNone(medir.etapa_do_brief(["runs.jsonl"], "868kyu71z"))
+        self.assertIsNone(medir.etapa_do_brief(["runs.jsonl"], "868abc001"))
 
 
 class MemoriaDaSessao(unittest.TestCase):
@@ -431,10 +431,10 @@ class MemoriaDaSessao(unittest.TestCase):
 
     def test_amostra_tem_chave_estavel_por_minuto(self):
         # Duas coletas no mesmo minuto nao podem virar duas amostras.
-        a = medir.chave_amostra("2026-09-03T12:34:56Z", "868kyu71z")
-        b = medir.chave_amostra("2026-09-03T12:34:12Z", "868kyu71z")
+        a = medir.chave_amostra("2026-09-03T12:34:56Z", "868abc001")
+        b = medir.chave_amostra("2026-09-03T12:34:12Z", "868abc001")
         self.assertEqual(a, b)
-        c = medir.chave_amostra("2026-09-03T12:35:01Z", "868kyu71z")
+        c = medir.chave_amostra("2026-09-03T12:35:01Z", "868abc001")
         self.assertNotEqual(a, c)
 
 

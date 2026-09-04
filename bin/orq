@@ -117,6 +117,9 @@ class Unit:
 class Config:
     path: Path
     raw: dict
+    # Nomeada por `--pipeline` ou `ORQ_PIPELINE`, ou descoberta sozinha? É a
+    # diferença entre "a pessoa escolheu" e "a ferramenta escolheu por ela".
+    explicita: bool = False
 
     @property
     def name(self): return self.raw["pipeline"]["name"]
@@ -305,6 +308,135 @@ class Config:
         die(f"chave '{key}' não encontrada em {f}")
 
 
+def git_dir_comum(cwd=None):
+    """O `.git` do repositório PRINCIPAL, visto de onde você está.
+
+    De dentro de uma worktree isto devolve o `.git` do repositório que a criou —
+    que é justamente o que a esteira declara em `repo`. Comparar o cwd reprovaria
+    toda worktree, isto é, TODA sessão da esteira.
+
+    Devolve None fora de qualquer repositório: `orq status` do diretório pessoal
+    é uso legítimo e não há com o que comparar.
+    """
+    base = Path(cwd or Path.cwd())
+    r = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                       cwd=str(base), capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    saida = Path(r.stdout.strip())
+    return saida if saida.is_absolute() else (base / saida).resolve()
+
+
+def divergencia_de_maquina(repo_declarado, git_dir_atual):
+    """A esteira resolvida governa o repositório onde você está? Senão, o motivo.
+
+    O `pipeline.toml` é VERSIONADO, então ele viaja: está no repositório e dentro
+    de cada worktree criada a partir dele. Em 04/09/2026, num Mac, a worktree da
+    esteira de um épico continha o `pipeline.toml` da esteira que roda na VPS
+    (`repo = /home/orq/repos/app-exemplo`, vinte unidades, outro objetivo). Sem esta
+    checagem, qualquer `orq` ali dentro sem `ORQ_PIPELINE` resolvia para a esteira
+    ERRADA — subindo pelos diretórios até achar aquele arquivo — e seguia calado.
+
+    A comparação é TEXTUAL de propósito: ela precisa dar o mesmo veredito nas duas
+    máquinas lendo o MESMO arquivo. No Mac o repo declarado nem existe; na VPS ele
+    é o certo. Tocar o disco faria a checagem depender de qual máquina pergunta,
+    que é exatamente o que ela existe para detectar.
+    """
+    if git_dir_atual is None:
+        return None
+    declarado = Path(repo_declarado).expanduser()
+    if Path(git_dir_atual) == declarado / ".git":
+        return None
+    return (f"esta esteira governa `{declarado}`, mas você está em "
+            f"`{Path(git_dir_atual).parent}`.\n"
+            f"  O pipeline.toml é versionado: ele viaja no repositório e em toda "
+            f"worktree,\n  então subir os diretórios pode achar a esteira de OUTRA "
+            f"máquina ou de outro\n  objetivo. Aponte a sua explicitamente:\n"
+            f"    export ORQ_PIPELINE=<caminho da esteira desta máquina>\n"
+            f"  ou `orq --pipeline <caminho> ...`")
+
+
+SO_LEEM = frozenset({"board", "next", "status", "show", "log", "capacity",
+                     "brief", "attach", "host", "doctor"})
+
+
+def deve_recusar(explicita, so_le, divergente):
+    """O portão de máquina deve barrar este comando?
+
+    Três condições, e todas precisam valer. Só barra o que AGE, só quando há
+    divergência, e só quando a esteira foi escolhida IMPLICITAMENTE — subindo os
+    diretórios ou pelo cache da última usada. Quem nomeia a esteira já resolveu a
+    ambiguidade que este portão existe para pegar; recusar ali é falso positivo, e
+    a mensagem ainda mandava fazer o que continuaria sendo recusado.
+    """
+    return divergente and not so_le and not explicita
+
+
+def comando_so_le(cmd):
+    """Este comando só olha a esteira, ou age nela?
+
+    Guarda que atrapalha é guarda que alguém desliga. Ler a esteira de outra
+    máquina não estraga nada — inclusive é útil para conferir o que a outra está
+    fazendo. Já `run`, `advance` ou `note` na esteira errada escrevem no ClickUp
+    de outro objetivo e lançam sessão com a ordem de serviço errada.
+
+    Desconhecido conta como escrita: comando novo entra pelo lado seguro.
+    """
+    return cmd in SO_LEEM
+
+
+def unidades_disputadas(mapa_a, mapa_b):
+    """Ids declarados por DUAS esteiras na MESMA lista do ClickUp.
+
+    Elas não brigam por status — o ClickUp já serializa isso, e uma esteira só
+    despacha o que está na fila do estágio. Brigam por DESPACHO: duas máquinas
+    lançam a mesma tarefa ao mesmo tempo, criam o mesmo branch e duplicam o
+    trabalho. Só dá para pegar comparando as declarações, antes.
+
+    Por lista de propósito: esteiras de projetos distintos não têm o que disputar.
+    """
+    disputadas = set()
+    for lista, ids in mapa_a.items():
+        outros = set(mapa_b.get(lista, []))
+        disputadas |= {i for i in ids if i in outros}
+    return sorted(disputadas)
+
+
+# Onde moram as esteiras que NÃO cabem no repositório: uma por épico, por dev,
+# por ambiente. O `pipeline.toml` versionado continua valendo para o projeto que
+# tem uma esteira só; este diretório é para quem tem várias.
+ESTEIRAS = Path.home() / ".config" / "orquestrador" / "esteiras"
+
+
+def esteiras_desta_maquina(candidatos, git_dir_atual):
+    """Dos candidatos `(caminho, repo_declarado)`, os que governam onde você está.
+
+    Config de outra máquina não deve nem ENTRAR na disputa. Antes, subir os
+    diretórios tinha prioridade sobre tudo que viesse depois; como o
+    `pipeline.toml` é versionado, quem estivesse dentro do repositório num Mac
+    recebia a esteira da VPS, e a esteira do próprio épico — guardada fora do
+    repositório — nunca era consultada. Avisar não resolvia: o comando seguia
+    inútil.
+
+    Fora de qualquer repositório devolve vazio, de propósito: não há com o que
+    discriminar, e escolher ali seria adivinhar. Quem decide passa a ser o cache
+    da última esteira usada, que ao menos anuncia o que escolheu.
+    """
+    if git_dir_atual is None:
+        return []
+    return [caminho for caminho, repo in candidatos
+            if divergencia_de_maquina(repo, git_dir_atual) is None]
+
+
+def repo_declarado_em(caminho):
+    """O `repo` de um pipeline.toml, sem carregar o resto. None se ilegível."""
+    try:
+        return Path(tomllib.loads(Path(caminho).read_text())["pipeline"]["repo"]
+                    ).expanduser()
+    except Exception:
+        return None
+
+
 LAST_PIPELINE = STATE / "last-pipeline"
 
 
@@ -313,15 +445,36 @@ def find_config(explicit: str | None) -> Config:
     o último usado. A última regra existe porque monitorar a esteira de outra
     janela é o caso comum, e obrigar a estar dentro do repo transforma
     `orq status` num comando que às vezes funciona."""
-    p = None
+    p, escolhida_por_voce = None, False
     if explicit:
         p = Path(explicit).expanduser().resolve()
+        escolhida_por_voce = True
     elif os.environ.get("ORQ_PIPELINE"):
         p = Path(os.environ["ORQ_PIPELINE"]).expanduser().resolve()
+        escolhida_por_voce = True
     else:
-        p = next((d / ".orchestrator" / "pipeline.toml"
-                  for d in [Path.cwd(), *Path.cwd().parents]
-                  if (d / ".orchestrator" / "pipeline.toml").exists()), None)
+        no_repo = next((d / ".orchestrator" / "pipeline.toml"
+                        for d in [Path.cwd(), *Path.cwd().parents]
+                        if (d / ".orchestrator" / "pipeline.toml").exists()), None)
+        # O arquivo do repositório concorre com as esteiras guardadas fora dele,
+        # em vez de vencer por estar mais perto. Quem desempata é a máquina.
+        candidatos = ([no_repo] if no_repo else []) + sorted(
+            ESTEIRAS.glob("*.toml") if ESTEIRAS.is_dir() else [])
+        pares = [(c, r) for c, r in ((c, repo_declarado_em(c)) for c in candidatos)
+                 if r is not None]
+        daqui = esteiras_desta_maquina(pares, git_dir_comum())
+        if len(daqui) == 1:
+            p = daqui[0]
+        elif len(daqui) > 1:
+            # Duas esteiras do MESMO repositório nesta máquina — dois épicos, por
+            # exemplo. Adivinhar aqui seria agir na errada; a escolha é sua.
+            die("mais de uma esteira governa este repositório. Escolha uma:\n"
+                + "\n".join(f"    export ORQ_PIPELINE={c}" for c in daqui))
+        elif no_repo is not None:
+            # Nenhuma é daqui, mas existe uma no repositório: quase sempre é a de
+            # outra máquina, viajando no git. Segue com ela para o portão de
+            # `main()` explicar — a mensagem de lá é específica e diz o que fazer.
+            p = no_repo
         if p is None and LAST_PIPELINE.exists():
             cand = Path(LAST_PIPELINE.read_text().strip())
             if cand.exists():
@@ -337,7 +490,8 @@ def find_config(explicit: str | None) -> Config:
         LAST_PIPELINE.write_text(str(p))
     except Exception:
         pass
-    return Config(path=p, raw=tomllib.loads(p.read_text()))
+    return Config(path=p, raw=tomllib.loads(p.read_text()),
+                  explicita=escolhida_por_voce)
 
 
 # ---------------------------------------------------------------- clickup
@@ -1935,6 +2089,12 @@ def cmd_release(cfg, args):
                 print(f"{C['yel']}!{C['r']} não consegui devolver a '{origem}': "
                       f"{str(e)[:120]}")
     st["strikes"].pop(r.unit.id, None)
+    # O bilhete que o ciclo seguinte vai ler. `release` devolve a unidade a um
+    # status de TRABALHO (foi ali que ela travou) e não há sessão viva: sem isto
+    # o próximo `tick` a lê como arranque falho e conta uma falta que ninguém
+    # cometeu. É de uso único — o `tick` consome.
+    if was and r.unit.id not in st.get("soltas_a_mao", []):
+        st.setdefault("soltas_a_mao", []).append(r.unit.id)
     if args.reset_rework:
         st["rework"].pop(r.unit.id, None); was.append("contador de retrabalho")
     save_loop_state(cfg, st)
@@ -1950,6 +2110,17 @@ def cmd_archive(cfg, args):
 
 # ---------------------------------------------------------------- laço autônomo
 
+def conta_falta(unit_id, key, soltas_no_ciclo, soltas_a_mao):
+    """Unidade em status de trabalho sem sessão viva: arranque falho, ou espera?
+
+    Só é falta quando ninguém a soltou. Há dois jeitos de soltar, e os dois
+    precisam ser perdoados: o laço destravando uma condição `--until-unit` DENTRO
+    deste ciclo, e uma pessoa digitando `orq release` em OUTRA invocação. O
+    segundo ficava de fora, porque a lista do primeiro nasce vazia a cada ciclo.
+    """
+    return key not in soltas_no_ciclo and unit_id not in soltas_a_mao
+
+
 def loop_state_path(cfg: Config) -> Path:
     return STATE / f"loop-{slugify(cfg.name, 24)}.json"
 
@@ -1960,13 +2131,14 @@ def loop_state(cfg: Config) -> dict:
         try:
             d = json.loads(p.read_text())
             for k, v in (("strikes", {}), ("quarantine", []), ("hold", {}),
-                         ("rework", {}), ("ticks", 0), ("dispatched", 0)):
+                         ("rework", {}), ("ticks", 0), ("dispatched", 0),
+                         ("soltas_a_mao", [])):
                 d.setdefault(k, v)
             return d
         except Exception:
             pass
     return {"strikes": {}, "quarantine": [], "hold": {}, "rework": {},
-            "ticks": 0, "dispatched": 0}
+            "ticks": 0, "dispatched": 0, "soltas_a_mao": []}
 
 
 def save_loop_state(cfg: Config, st: dict):
@@ -2093,6 +2265,10 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
 
     # 1. colher: unidade em status de trabalho sem sessão viva = arranque falho
     max_strikes = int(cfg.raw.get("loop", {}).get("max_strikes", 2))
+    # Bilhete de quem já saiu do status de trabalho não tem mais o que desculpar:
+    # some agora, para não perdoar uma falha futura de verdade.
+    _paradas = {r.unit.id for r in rows if r.state == "stalled"}
+    st["soltas_a_mao"] = [i for i in st.get("soltas_a_mao", []) if i in _paradas]
     for r in rows:
         if r.state != "stalled" or r.unit.id in st["quarantine"] \
                 or r.unit.id in st["hold"]:
@@ -2101,13 +2277,16 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
         # porque foi bloqueada ali, não porque o arranque falhou. Devolver para a
         # fila é certo; contar falta não é. Sem esta exceção, duas esperas
         # legítimas mandam para a quarentena uma unidade que nunca falhou.
-        if r.unit.key in out["released"]:
+        if not conta_falta(r.unit.id, r.unit.key, out["released"],
+                           st.get("soltas_a_mao", [])):
             try:
                 finalize(cfg, r.unit, r.stage, outcome="release-requeue", kill_delay=0)
                 set_status(cfg, r.unit.id, r.stage.queue)
                 out["reaped"].append(f"{r.unit.key}(espera)")
             except SystemExit:
                 pass
+            if r.unit.id in st.get("soltas_a_mao", []):
+                st["soltas_a_mao"].remove(r.unit.id)   # bilhete de uso único
             continue
         n = st["strikes"].get(r.unit.id, 0) + 1
         st["strikes"][r.unit.id] = n
@@ -2494,6 +2673,28 @@ def cmd_doctor(cfg, args):
     chk("cerca de permissões", CERCA.exists() and os.access(CERCA, os.X_OK),
         f"impressão {cerca_impressao()}" if CERCA.exists() else f"SUMIU: {CERCA}")
     chk("repositório", (cfg.repo / ".git").exists(), str(cfg.repo))
+    _motivo = divergencia_de_maquina(cfg.repo, git_dir_comum())
+    chk("a esteira é desta máquina", _motivo is None,
+        "governa o repositório onde você está" if _motivo is None
+        else _motivo.splitlines()[0])
+    # Duas esteiras na MESMA lista não podem declarar a mesma unidade: elas não
+    # brigam por status (o ClickUp serializa), brigam por DESPACHO — duas
+    # máquinas lançam a mesma tarefa e criam o mesmo branch. O vizinho óbvio é o
+    # `pipeline.toml` versionado do próprio repositório.
+    _vizinho = cfg.repo / ".orchestrator" / "pipeline.toml"
+    if _vizinho.exists() and _vizinho.resolve() != cfg.path.resolve():
+        try:
+            _outra = tomllib.loads(_vizinho.read_text())
+            _dela = {str(_outra["pipeline"]["list_id"]):
+                     [str(x["id"]) for x in _outra.get("task", [])]}
+            _disp = unidades_disputadas({cfg.list_id: [u.id for u in cfg.units]}, _dela)
+            chk("nenhuma unidade disputada", not _disp,
+                f"TAMBÉM declaradas em {_vizinho}: {', '.join(_disp)}" if _disp
+                else f"{_vizinho.parent.name}/{_vizinho.name} declara "
+                     f"{len(_dela.get(cfg.list_id, []))}, nenhuma em comum")
+        except Exception as _e:
+            chk("nenhuma unidade disputada", True,
+                f"não consegui ler {_vizinho}: {str(_e)[:60]}", fatal=False)
     chk("diretório de trabalho", cfg.work_dir.exists(), str(cfg.work_dir))
     r = subprocess.run(["git", "-C", str(cfg.repo), "rev-parse", "--verify", cfg.base_branch],
                        capture_output=True, text=True)
@@ -2702,6 +2903,17 @@ def main():
 
     args = p.parse_args()
     cfg = None if getattr(args, "sem_config", False) else find_config(args.pipeline)
+    # ANTES de qualquer comando agir. `doctor` é a exceção porque ele é a
+    # ferramenta de diagnóstico: morrer aqui esconderia dele justamente o achado
+    # que ele existe para relatar — ele o reporta como uma linha vermelha.
+    if cfg is not None and args.cmd != "doctor":
+        motivo = divergencia_de_maquina(cfg.repo, git_dir_comum())
+        if deve_recusar(cfg.explicita, comando_so_le(args.cmd), bool(motivo)):
+            die(f"esteira de outra máquina — recusado.\n  {motivo}")
+        if motivo and not cfg.explicita:
+            print(f"{C['yel']}atenção:{C['r']} {motivo.splitlines()[0]}\n"
+                  f"{C['d']}  Leitura permitida; qualquer comando que AJA daqui "
+                  f"é recusado.{C['r']}", file=sys.stderr)
     STATE.mkdir(parents=True, exist_ok=True)
     args.fn(cfg, args)
 

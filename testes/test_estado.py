@@ -22,6 +22,11 @@ import unittest
 from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
+
+# `orq-avisar` de mentira (OA-11): nenhum teste deste arquivo entrega aviso
+# de verdade, mesmo que a máquina tenha credenciais reais configuradas.
+os.environ.setdefault("ORQ_NOTIFY_CMD", str(RAIZ / "testes" / "fixtures" / "bin" / "orq-avisar"))
+
 _loader = importlib.machinery.SourceFileLoader("orq", str(RAIZ / "bin" / "orq"))
 _spec = importlib.util.spec_from_loader("orq", _loader)
 orq = importlib.util.module_from_spec(_spec)

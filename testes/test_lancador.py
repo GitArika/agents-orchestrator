@@ -36,6 +36,11 @@ ORQ_BIN = RAIZ / "bin" / "orq"
 FAKE_BIN = RAIZ / "testes" / "fixtures" / "bin"
 CERCA = RAIZ / "hooks" / "cerca.sh"
 
+# `orq-avisar` de mentira (OA-11): nenhum teste deste arquivo entrega aviso
+# de verdade, mesmo que a máquina tenha credenciais reais configuradas —
+# `orq run`/`dispatch` já geram eventos roteados (`despachada`).
+os.environ.setdefault("ORQ_NOTIFY_CMD", str(FAKE_BIN / "orq-avisar"))
+
 _loader = importlib.machinery.SourceFileLoader("orq", str(ORQ_BIN))
 _spec = importlib.util.spec_from_loader("orq", _loader)
 orq = importlib.util.module_from_spec(_spec)

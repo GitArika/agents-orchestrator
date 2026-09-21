@@ -306,10 +306,16 @@ def transacao(caminho: Path):
     Falhar dentro do bloco desfaz tudo — nunca fica meio gravado. É a garantia
     que falta em `save_loop_state` hoje: `write_text` trunca o arquivo antes de
     escrever, e uma queda no meio deixa JSON inválido para sempre.
+
+    Ao sair, DEPOIS do commit e com o lock já liberado, roteia para aviso
+    (OA-11) todo evento que esta transação gravou — é o que faz "quem grava a
+    transição emite o aviso" ser verdade sem uma chamada de emissão solta por
+    aí.
     """
     con = abrir_banco(caminho)
     try:
         con.execute("BEGIN IMMEDIATE")
+        marca = con.execute("SELECT COALESCE(max(id), 0) FROM evento").fetchone()[0]
         yield con
         con.commit()
     except BaseException:
@@ -317,6 +323,7 @@ def transacao(caminho: Path):
         raise
     finally:
         con.close()
+    _avisar_eventos_desde(caminho, marca)
 
 
 def _agora() -> str:
@@ -336,6 +343,107 @@ def registrar_evento(con: sqlite3.Connection, unidade_id: int | None, tipo: str,
         "INSERT INTO evento (unidade_id, tipo, de_status, para_status, texto, ts) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (unidade_id, tipo, de_status, para_status, texto, _agora()))
+
+
+# ---------------------------------------------------------------- estado — roteamento
+# de avisos (OA-11)
+#
+# Uma origem só: a transição de estado. Nenhuma chamada de emissão solta pelos
+# comandos — quem grava o evento (`registrar_evento`, acima) é quem, por
+# baixo de `transacao()`, aciona o aviso. É o que garante que aviso e estado
+# nunca discordem. Ver
+# docs/specs/orquestrador-agil/OA-11-roteamento-de-eventos-e-avisos.md.
+
+ROTEAMENTO_AVISOS = {
+    "despachada":        "tarefa iniciada por um agente",
+    "pr_aberto":         "PR aberto por um agente",
+    "bloqueada":         "tarefa bloqueada",
+    "pr_fundido":        "PR fundido — unidade concluída",
+    "pr_fundido_manual": "PR fundido fora do fluxo — unidade concluída",
+    "retrabalho":        "revisão pediu mudanças — retrabalho",
+    "recolhida":         "sessão recolhida, volta para a fila",
+    "espelho_falhou":    "falha ao espelhar o status no ClickUp",
+    "vigia_alerta":      "vigia de PR fora do ar",
+    "teardown_falhou":   "falha ao encerrar o ambiente da unidade",
+    "laco_parou":        "laço autônomo parado",
+    "esteira_concluida": "esteira concluída — nada pendente",
+}   # "declaracao" (verbos de OA-02) fica de fora de propósito — ato humano,
+    # quem digitou já sabe.
+
+# `vigia_falhou` (a cada falha isolada do gh) não está no roteamento acima —
+# a regra "só avisa na terceira falha seguida" (OA-08/OA-11) já é satisfeita
+# na ORIGEM: `vigiar_prs` só grava `vigia_alerta` exatamente na 3ª seguida, e
+# nunca mais que uma vez por sequência. Rotear `vigia_alerta` em vez de
+# `vigia_falhou` evita duplicar essa contagem aqui.
+
+AVISOS_OBRIGATORIOS = frozenset({"despachada", "pr_aberto", "bloqueada"})   # nunca cortáveis
+JANELA_ANTIRREPETICAO_MIN = 5
+
+
+def _avisos_cortados(con: sqlite3.Connection) -> set[str]:
+    """`orq config set avisos_silenciados <lista>` corta eventos operacionais
+    quando o volume incomodar. Os três do requisito nunca saem daqui."""
+    bruto = obter_config(con, "avisos_silenciados", "") or ""
+    return {t.strip() for t in bruto.split(",") if t.strip()} - AVISOS_OBRIGATORIOS
+
+
+def _repetido_ha_pouco(con: sqlite3.Connection, ev: sqlite3.Row) -> bool:
+    """O mesmo par (unidade, tipo) não avisa duas vezes em menos de
+    `JANELA_ANTIRREPETICAO_MIN` minutos — o `evento` já tem o carimbo, a
+    consulta é uma linha."""
+    row = con.execute(
+        "SELECT 1 FROM evento WHERE unidade_id IS ? AND tipo = ? AND id < ? "
+        "AND (julianday(?) - julianday(ts)) * 1440 < ? LIMIT 1",
+        (ev["unidade_id"], ev["tipo"], ev["id"], ev["ts"],
+         JANELA_ANTIRREPETICAO_MIN)).fetchone()
+    return row is not None
+
+
+def _entregador_avisos() -> str:
+    """`ORQ_NOTIFY_CMD` vence, mesma convenção de `hooks/notificar.sh` — um
+    único jeito de trocar o entregador em toda a esteira, não dois."""
+    return os.environ.get("ORQ_NOTIFY_CMD") or str(ORQ_REPO / "bin" / "orq-avisar")
+
+
+def _avisar_eventos_desde(caminho: Path, marca: int) -> None:
+    """O ÚNICO lugar do motor que aciona o entregador de avisos — chamado por
+    `transacao()` DEPOIS do commit: o lock de escrita já foi liberado ali, e
+    uma entrega de rede lenta aqui não trava outro escritor (mesma regra que
+    manda teardown/arquivamento para fora da transação em OA-05/OA-08).
+
+    Lê só os eventos com `id > marca` — os que ESTA transação gravou, nunca
+    os de outra (com `BEGIN IMMEDIATE` só um escritor por vez, então a marca
+    tirada na entrada da transação é exata). Falha de entrega nunca chega a
+    quem chamou: a transição já aconteceu, e é isso que garante que o
+    registro do evento e o estado nunca divirjam.
+    """
+    try:
+        con = abrir_banco(caminho)
+    except Exception:
+        return
+    try:
+        eventos = con.execute(
+            "SELECT e.id, e.unidade_id, e.tipo, e.texto, e.ts, u.chave "
+            "FROM evento e LEFT JOIN unidade u ON u.id = e.unidade_id "
+            "WHERE e.id > ? ORDER BY e.id", (marca,)).fetchall()
+        if not eventos:
+            return
+        cortados = _avisos_cortados(con)
+        entregador = _entregador_avisos()
+        for ev in eventos:
+            titulo = ROTEAMENTO_AVISOS.get(ev["tipo"])
+            if titulo is None or ev["tipo"] in cortados:
+                continue
+            if _repetido_ha_pouco(con, ev):
+                continue
+            env = {**os.environ, "ORQ_UNIT": ev["chave"] or ""}
+            try:
+                subprocess.run([entregador, titulo, ev["texto"] or ""],
+                               env=env, capture_output=True, timeout=25)
+            except Exception:
+                pass   # entrega nunca pode derrubar o motor (mesma regra do orq-avisar)
+    finally:
+        con.close()
 
 
 def criar_unidade(con: sqlite3.Connection, chave: str, *, clickup_id: str | None,
@@ -444,7 +552,7 @@ CONFIG_CHAVES_CONHECIDAS = frozenset({
     "name", "repo", "base_branch", "work_dir", "worktree_root", "branch_template",
     "list_id", "github_repo", "max_concurrent", "reserve_ram_gb", "ram_per_session_gb",
     "interval_seconds", "max_strikes", "max_rework", "permission_mode",
-    "remote_control", "model", "verificacao_automatica",
+    "remote_control", "model", "verificacao_automatica", "avisos_silenciados",
 })
 
 
@@ -1349,7 +1457,7 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
                             "worktree": sessao["worktree"] if sessao else None,
                             "branch": sessao["branch"] if sessao else None})
         elif info.get("reviewDecision") == "CHANGES_REQUESTED":
-            transicionar(con, u["id"], "em_progresso", tipo_evento="pr_devolvido",
+            transicionar(con, u["id"], "em_progresso", tipo_evento="retrabalho",
                         motivo="revisão pediu mudanças")
             achados.append({"chave": u["chave"], "desfecho": "em_progresso"})
         elif info.get("state") == "CLOSED":
@@ -2078,6 +2186,14 @@ def _trabalho_vivo(con: sqlite3.Connection) -> bool:
         "SELECT 1 FROM unidade WHERE status = 'revisao' LIMIT 1").fetchone() is not None
 
 
+def _esteira_concluida(con: sqlite3.Connection) -> bool:
+    """Nada além de `pronto` — nenhuma unidade pendurada em backlog,
+    em_progresso, revisao ou bloqueado. Distingue "terminamos" de "o laço
+    desistiu de esperar" (OA-11): são dois avisos diferentes."""
+    return con.execute(
+        "SELECT 1 FROM unidade WHERE status != 'pronto' LIMIT 1").fetchone() is None
+
+
 def cmd_loop(cfg, args):
     """O laço autônomo: vigia PRs → recolhe sessão morta → preenche vaga, a
     cada `interval_seconds` (padrão 60s). Para depois de
@@ -2134,10 +2250,18 @@ def cmd_loop(cfg, args):
 
         idle = 0 if (moveu or vivo) else idle + 1
         if idle >= IDLE_CICLOS_PARA_PARAR:
-            print(f"\n{C['yel']}{idle} ciclos sem nada vivo e sem nada avançar — "
-                 f"laço parado. Veja `orq board`.{C['r']}")
+            con = abrir_banco(caminho)
+            concluida = _esteira_concluida(con)
+            con.close()
+            if concluida:
+                print(f"\n{C['grn']}esteira sem trabalho pendente — laço encerrado.{C['r']}")
+                tipo, texto = "esteira_concluida", "nada pendente — todas as unidades prontas"
+            else:
+                print(f"\n{C['yel']}{idle} ciclos sem nada vivo e sem nada avançar — "
+                     f"laço parado. Veja `orq board`.{C['r']}")
+                tipo, texto = "laco_parou", f"{idle} ciclos ociosos"
             with transacao(caminho) as con:
-                registrar_evento(con, None, "laco_parado", texto=f"{idle} ciclos ociosos")
+                registrar_evento(con, None, tipo, texto=texto)
             return
         time.sleep(interval)
 

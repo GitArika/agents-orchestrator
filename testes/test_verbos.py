@@ -7,6 +7,7 @@ os comandos estão de fato REGISTRADOS e ligados aos verbos certos, não só que
 as funções por baixo funcionam.
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,11 @@ from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
 ORQ = RAIZ / "bin" / "orq"
+
+# `orq-avisar` de mentira (OA-11): nenhum teste deste arquivo entrega aviso
+# de verdade, mesmo que a máquina tenha credenciais reais configuradas.
+# `setdefault` para um teste específico poder sobrepor via env_extra.
+os.environ.setdefault("ORQ_NOTIFY_CMD", str(RAIZ / "testes" / "fixtures" / "bin" / "orq-avisar"))
 
 
 def orq(db, *args, cwd=None, checar=True):

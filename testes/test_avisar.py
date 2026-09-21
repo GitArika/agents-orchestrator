@@ -269,6 +269,33 @@ class ComoSubprocesso(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("não configurado", r.stdout + r.stderr)
 
+    def test_canal_local_nunca_tenta_entrega_mesmo_com_telegram_configurado(self):
+        """OA-11: o teste de ausência que protege o requisito de silêncio —
+        mesmo com credencial de verdade e ORQ_AVISO_DESTINO=telegram
+        explícito (o cenário de risco que o spec nomeia: alguém padronizou o
+        destino globalmente), `--canal local` nunca chega a tentar
+        `para_telegram`. Prova: nenhuma linha 'telegram:' no stdout — é o que
+        apareceria SE a entrega fosse tentada, sucesso ou falha."""
+        self.credenciais.write_text("TELEGRAM_BOT_TOKEN=x\nTELEGRAM_CHAT_ID=y\n")
+        r = self._rodar("--canal", "local", "título", "mensagem",
+                        env_extra={"ORQ_AVISO_DESTINO": "telegram"})
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("telegram:", r.stdout)
+        self.assertNotIn("entreguei", r.stdout + r.stderr)   # nem sucesso, nem falha — nem tentou
+
+    def test_canal_local_ainda_registra(self):
+        """--canal local pula a ENTREGA, não o registro — avisos.log é o
+        canal que sempre existe."""
+        self._rodar("--canal", "local", "título de teste", "mensagem de teste")
+        log = (self.logdir / "avisos.log").read_text()
+        self.assertIn("título de teste", log)
+
+    def test_canal_local_funciona_com_titulo_e_mensagem_antes_ou_depois(self):
+        r = self._rodar("título", "mensagem", "--canal", "local",
+                        env_extra={"ORQ_AVISO_DESTINO": "macos"})
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("macos:", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

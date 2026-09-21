@@ -4,6 +4,14 @@
 O motor chama assim:  orq-avisar "<título>" "<mensagem>"
 (e também põe ORQ_NOTIFY_TITLE / ORQ_NOTIFY_MSG no ambiente).
 
+`orq-avisar --canal local "<título>" "<mensagem>"` grava só em `avisos.log` —
+NENHUM destino externo, nem Telegram nem o resto de ORQ_AVISO_DESTINO. É o
+que `hooks/notificar.sh` usa para os ganchos Notification/Stop (OA-11): a
+sessão pedindo decisão já chega pelo app do Claude, avisar de novo pelo
+Telegram seria o mesmo fato duas vezes. Não confundir com ORQ_AVISO_CANAL
+(abaixo) — aquele é o id do canal de conversa do ClickUp; este `--canal` é o
+seletor de destino deste programa.
+
 Duas regras que este arquivo não pode quebrar:
 
   * NUNCA derrubar quem chamou. O Claude Code trata saída diferente de zero num
@@ -214,10 +222,29 @@ def _destino_padrao() -> str:
         return "macos"
 
 
+def _extrair_canal(argv: list) -> tuple:
+    """Tira `--canal <valor>` de `argv`, devolvendo o resto intacto (título e
+    mensagem continuam posicionais, como sempre). Existe só para
+    `hooks/notificar.sh` ter um jeito EXPLÍCITO de dizer "só o registro" que
+    nenhuma variável de ambiente ambígua reintroduza por engano (OA-11) —
+    `--canal local` pula QUALQUER destino externo, ponto."""
+    resto = list(argv)
+    canal = None
+    if "--canal" in resto:
+        i = resto.index("--canal")
+        if i + 1 < len(resto):
+            canal = resto[i + 1]
+            del resto[i:i + 2]
+        else:
+            del resto[i:i + 1]
+    return resto, canal
+
+
 def principal():
-    titulo = (sys.argv[1] if len(sys.argv) > 1
+    argv, canal = _extrair_canal(sys.argv)
+    titulo = (argv[1] if len(argv) > 1
               else os.environ.get("ORQ_NOTIFY_TITLE", "")).strip()
-    msg = (sys.argv[2] if len(sys.argv) > 2
+    msg = (argv[2] if len(argv) > 2
            else os.environ.get("ORQ_NOTIFY_MSG", "")).strip()
     if not (titulo or msg):
         return
@@ -227,6 +254,9 @@ def principal():
         registrar(unidade, titulo, msg)
     except Exception as e:
         print(f"orq-avisar: nem o registro funcionou ({e})", file=sys.stderr)
+
+    if canal == "local":
+        return   # só o registro acima — nenhum destino externo, nunca
 
     destinos = [d.strip() for d in
                os.environ.get("ORQ_AVISO_DESTINO", _destino_padrao()).split(",")

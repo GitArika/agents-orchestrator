@@ -27,6 +27,11 @@ RAIZ = Path(__file__).resolve().parent.parent
 ORQ_BIN = RAIZ / "bin" / "orq"
 FAKE_GH = RAIZ / "testes" / "fixtures" / "bin"
 
+# `orq-avisar` de mentira (OA-11): nenhum teste deste arquivo entrega aviso
+# de verdade, mesmo que a máquina tenha credenciais reais configuradas — o
+# vigia e o laço geram vários eventos roteados (pr_fundido, bloqueada...).
+os.environ.setdefault("ORQ_NOTIFY_CMD", str(FAKE_GH / "orq-avisar"))
+
 _loader = importlib.machinery.SourceFileLoader("orq", str(ORQ_BIN))
 _spec = importlib.util.spec_from_loader("orq", _loader)
 orq = importlib.util.module_from_spec(_spec)
@@ -437,11 +442,29 @@ class LoopComoSubprocesso(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_esteira_vazia_para_apos_vinte_ciclos_ociosos(self):
+    def test_esteira_vazia_para_e_conta_como_concluida(self):
+        # Nada declarado é vacuamente "nada pendente" — distinto de um laço
+        # que desistiu de esperar (ver o teste seguinte).
+        r = orq_cli(self.db, "loop", "--interval", "0")
+        self.assertIn("sem trabalho pendente", r.stdout)
+        con = orq.abrir_banco(self.db)
+        ev = con.execute("SELECT texto FROM evento WHERE tipo = 'esteira_concluida'").fetchone()
+        con.close()
+        self.assertIsNotNone(ev)
+
+    def test_unidade_bloqueada_para_apos_vinte_ciclos_e_nao_conta_como_concluida(self):
+        con = orq.abrir_banco(self.db)
+        a = orq.criar_unidade(con, "FE-A", clickup_id="1", titulo="a")
+        con.commit()
+        con.close()
+        with orq.transacao(self.db) as con:
+            orq.transicionar(con, a, "em_progresso")
+            orq.transicionar(con, a, "bloqueado", tipo_evento="bloqueada", motivo="esperando")
+
         r = orq_cli(self.db, "loop", "--interval", "0")
         self.assertIn("ciclos sem nada vivo", r.stdout)
         con = orq.abrir_banco(self.db)
-        ev = con.execute("SELECT texto FROM evento WHERE tipo = 'laco_parado'").fetchone()
+        ev = con.execute("SELECT texto FROM evento WHERE tipo = 'laco_parou'").fetchone()
         con.close()
         self.assertIsNotNone(ev)
         self.assertIn("20", ev["texto"])

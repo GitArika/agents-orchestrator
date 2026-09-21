@@ -927,6 +927,27 @@ const commands = {
     out({ task: taskId, removed: other, ok: true })
   },
 
+  // Apontamento de hora. O endpoint só aceita {tid, start, duration} de forma
+  // confiável — descrição e etiqueta são recurso pago do workspace e devolvem
+  // 403. `start` é ISO local (YYYY-MM-DDTHH:MM:SS[-03:00]); `duration` é
+  // minutos. A entrega sai assinada pelo dono de CLICKUP_API_KEY (whoami).
+  async ['time-entry']([taskId, start, minutes, ...flags]) {
+    if (!taskId || !start || !minutes) {
+      die('usage: time-entry <taskId> <startISO> <minutos>')
+    }
+    const startMs = Date.parse(start)
+    if (Number.isNaN(startMs)) die(`start inválido: "${start}" (esperado ISO 8601)`)
+    const durationMs = Math.round(Number(minutes) * 60000)
+    if (!Number.isFinite(durationMs) || durationMs <= 0) die(`minutos inválido: "${minutes}"`)
+    const teamId = await getTeamId()
+    const { data } = await api('POST', `/team/${teamId}/time_entries`, {
+      tid: taskId,
+      start: startMs,
+      duration: durationMs,
+    })
+    out({ task: taskId, entry_id: data?.id, start_ms: startMs, duration_ms: durationMs, ok: true })
+  },
+
   // --- Auditoria de lista -----------------------------------------------------
   // UMA chamada devolve o mapa inteiro da lista: status, dependências, links,
   // subtasks, tamanho da descrição e campos-chave. É o comando de "a lista está
@@ -1024,6 +1045,7 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   attach      <taskId> <arquivo> [arquivo...]           anexa prova ao cartao    -> NDJSON {id,title,url}
   dep         <taskId> <otherId> [--blocks]             cria bloqueio (padrao: taskId espera por otherId) -> {ok}
   undep       <taskId> <otherId> [--blocks]             remove o bloqueio        -> {ok}
+  time-entry  <taskId> <startISO> <minutos>              aponta hora (so tid/start/duration) -> {entry_id,ok}
  sprints
   sprints                                               list sprint lists (FOLDER_SPRINTS) -> NDJSON {id,name,start,due}
   sprint      <taskId>                                  add a task to the CURRENT sprint (LIST_SPRINT) -> {ok}

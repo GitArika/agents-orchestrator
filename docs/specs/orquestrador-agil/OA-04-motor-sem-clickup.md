@@ -77,3 +77,35 @@ em OA-12, não resolvida aqui.
   e escrever no cartão. A ordem definida em OA-05 (banco primeiro, cartão depois) torna a
   divergência visível no cartão, que é o lugar onde uma pessoa olha — e o rastro do banco
   permite recompor. Não há transação distribuída aqui, e fingir que há seria pior.
+
+## Nota de implementação (22/09/2026)
+
+**O escopo real ficou maior que a letra original deste spec.** OA-01/OA-02/OA-03 já
+prometiam, nas próprias palavras ("até OA-04 remover pipeline.toml por inteiro"), que esta
+unidade encerraria o motor TOML inteiro — não só as chamadas ao ClickUp. Confirmado com
+você: removido tudo, aceitando o hiato funcional até OA-05.
+
+Saiu de `bin/orq` (4187 → 1597 linhas): `Config`/`Unit`/`Stage`, `find_config` e o
+resolvedor de esteira por diretório, o write-guard (`deve_recusar`/`comando_so_le`/
+`SO_LEEM`), `api`/`fetch_board`/`status_order`/`set_status`/`comment`, as quatro
+templates de briefing (`BRIEFS`/`CONTEXT`/`SEM_NAVEGADOR`/`COMMON`), `launch`/
+`ensure_worktree`/`ensure_trusted`/`argumentos_new_session`/`settings_json`/
+`cerca_impressao`, `finalize`/`archive_dir`/`anotar_evento`/`rodar_teardown`, `classify`/
+`ready_queue`/`load`, o laço antigo (`tick`/`loop_state`/`notify`/`auth_ok`/`cmd_loop`), o
+pré-voo (`cmd_doctor` e as `_prova_*`), e os oito comandos que já estavam `_toml_legado`
+desde OA-03, mais `run`/`dispatch`/`capacity`/`sweep`/`archive`/`reset`/`reject`/
+`unquarantine`/`note`/`describe`/`attach`/`log`/`stop`/`brief`.
+
+**Consequência aceita:** `orq run`, `orq dispatch`, `orq doctor` e `orq capacity` não
+existem entre esta entrega e as próximas. A esteira não consegue lançar uma sessão nova
+até OA-05 dar a ela um lançador de verdade contra o banco, nem tem pré-voo até OA-12. Os
+dezesseis comandos que sobraram (`init/task/dep/config/export/validate/board/next/status/
+show/advance/hold/release/reopen/tick/host`) funcionam de ponta a ponta — confirmado por
+`orq --help`, pela suíte (183 testes) e por um ciclo manual completo com o ClickUp
+estruturalmente inalcançável (o binário não importa mais `urllib` nenhum).
+
+`testes/test_orq.py` perdeu as seis classes que testavam funções removidas
+(`teto_do_estagio`, `argumentos_new_session`, `build_brief`, `esteiras_desta_maquina`,
+`conta_falta`, `deve_recusar`, `comando_so_le`, `unidades_disputadas`); ficaram as que
+testam o que sobreviveu (cgroup/memória, `divergencia_de_maquina`, reaproveitada por
+`resolver_banco`).

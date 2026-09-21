@@ -39,7 +39,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | [OA-07](OA-07-espelho-de-cinco-status-no-clickup.md) | Espelho de cinco status no ClickUp | P1 | OA-04, OA-05 | não iniciado |
 | [OA-08](OA-08-vigia-de-pr-no-laco.md) | O vigia de PR dentro do laço | P0 | OA-03, OA-05 | não iniciado |
 | [OA-09](OA-09-retrabalho-a-partir-do-pr.md) | Retrabalho a partir do PR | P1 | OA-05, OA-08 | não iniciado |
-| [OA-10](OA-10-telegram-como-destino.md) | Telegram como destino de aviso | P1 | — | não iniciado |
+| [OA-10](OA-10-telegram-como-destino.md) | Telegram como destino de aviso | P1 | — | concluído (`bin/orq-avisar`, `testes/test_avisar.py`) |
 | [OA-11](OA-11-roteamento-de-eventos-e-avisos.md) | Roteamento de eventos: o que avisa e o que cala | P0 | OA-03, OA-08, OA-10 | não iniciado |
 | [OA-12](OA-12-pre-voo-do-modelo-novo.md) | O pré-voo do modelo novo | P1 | OA-02, OA-04, OA-06, OA-10 | não iniciado |
 | [OA-13](OA-13-medicao-adaptada.md) | A medição adaptada | P2 | OA-01, OA-08, OA-09, OA-11 | não iniciado |

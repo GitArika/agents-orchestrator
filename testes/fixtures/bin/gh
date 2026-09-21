@@ -25,11 +25,29 @@ Três formatos de `gh pr view <numero> --repo <repo>`:
 comentários de LINHA que `_coletar_retrabalho` (OA-09) busca à parte (é uma
 chamada REST, não `pr view`). Imprime `FAKE_GH_PR_COMMENTS_<numero>` (um
 array JSON, padrão []).
+
+`gh auth status` e `gh pr list --repo <repo> --limit N` — o que `_prova_gh`
+(OA-12) chama. `FAKE_GH_AUTH_OK` (padrão "1") e `FAKE_GH_PR_LIST_OK`
+(padrão "1"): "0" simula a falha correspondente, saindo 1 com stderr.
 """
 import json
 import os
 import re
 import sys
+
+if len(sys.argv) >= 3 and sys.argv[1] == "auth" and sys.argv[2] == "status":
+    if os.environ.get("FAKE_GH_AUTH_OK", "1") == "1":
+        sys.stderr.write("Logged in to github.com as teste (fake)\n")
+        sys.exit(0)
+    sys.stderr.write("You are not logged into any GitHub hosts.\n")
+    sys.exit(1)
+
+if len(sys.argv) >= 2 and sys.argv[1] == "pr" and len(sys.argv) > 2 and sys.argv[2] == "list":
+    if os.environ.get("FAKE_GH_PR_LIST_OK", "1") == "1":
+        print("[]")
+        sys.exit(0)
+    sys.stderr.write("gh: erro simulado de rede\n")
+    sys.exit(1)
 
 if len(sys.argv) >= 3 and sys.argv[1] == "pr" and sys.argv[2] == "view":
     numero = sys.argv[3] if len(sys.argv) > 3 else ""

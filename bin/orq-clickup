@@ -277,6 +277,51 @@ const STATUS_CINCO = [
 ]
 
 const commands = {
+  // O pré-voo do ClickUp — OA-12 tira esta prova de dentro de `orq doctor`
+  // (bin/orq): o motor não depende mais do ClickUp para despachar, e um
+  // pré-voo que falha por uma ferramenta de gestão fora do ar impediria
+  // trabalho sem necessidade. Quem ainda precisa da prova (o agente, a
+  // instalação) chama aqui, com o `--lista` que quiser conferir.
+  //
+  // Chamadas cruas (não `api()`, que sai do processo em qualquer erro HTTP):
+  // um pré-voo precisa terminar as DUAS provas mesmo se a primeira falhar.
+  async doctor([...flags]) {
+    const listId = flagVal(flags, 'lista')
+    let ok = true
+    const chk = async (rotulo, fn) => {
+      try {
+        linha(`  ✓ ${rotulo}: ${await fn()}`)
+      } catch (e) {
+        ok = false
+        linha(`  ✗ ${rotulo}: ${e.message}`)
+      }
+    }
+    linha('Pré-voo do ClickUp')
+    await chk('token/autenticação', async () => {
+      if (!KEY) throw new Error(AJUDA_CREDENCIAL.split('\n')[0])
+      const res = await fetch(`${API}/user`, {
+        headers: { Authorization: KEY }, signal: AbortSignal.timeout(15000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const d = await res.json()
+      return `${d.user.username} <${d.user.email}>`
+    })
+    if (listId) {
+      await chk('lista responde', async () => {
+        const res = await fetch(`${API}/list/${resolveId('LIST', listId)}`, {
+          headers: { Authorization: KEY }, signal: AbortSignal.timeout(15000),
+        })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const l = await res.json()
+        const status = (l.statuses || []).map((s) => s.status).join(' · ')
+        return `"${l.name}" (${l.id}) — status: ${status || '(nenhum)'}`
+      })
+    } else {
+      linha('  (sem --lista — pulei a checagem da lista)')
+    }
+    if (!ok) process.exit(1)
+  },
+
   // Antes de QUALQUER escrita, saber de quem é a autoria. Em 27/08/2026 uma
   // aprovação foi publicada assinada por outra pessoa porque a escrita saiu por
   // uma sessão autenticada que não era a do dono do projeto. Aprovação atribuída
@@ -945,6 +990,7 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   node .claude/skills/clickup-api/clickup.mjs <command> ...
 
  read
+  doctor      [--lista=<id>]                            pré-voo do ClickUp (OA-12) — token e lista, chamada real
   whoami      [--json]                                  de quem é a autoria     <- ANTES de escrever
   list        <listId|alias> [--json]                   a lista e seus status
   status-provisionar <listId> [--aplicar]               cria os 10 status da esteira (simula por padrão)

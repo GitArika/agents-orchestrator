@@ -255,12 +255,16 @@ class SemNotifySolto(unittest.TestCase):
         # construção: zero ocorrências é mais forte que "exatamente uma".
         self.assertNotIn("notify(", texto)
 
-    def test_entregador_e_chamado_de_um_unico_lugar(self):
+    def test_entregador_e_chamado_so_dos_dois_lugares_esperados(self):
         texto = ORQ_BIN.read_text()
-        # Uma ocorrência é a definição (`def _entregador_avisos() -> str:`);
-        # a única chamada de verdade fica dentro de `_avisar_eventos_desde`.
-        self.assertEqual(texto.count("_entregador_avisos()"), 2)
+        # Uma ocorrência é a definição (`def _entregador_avisos() -> str:`).
+        # Duas chamadas de verdade: `_avisar_eventos_desde` (o aviso
+        # automático de toda transição — a origem única) e `_prova_telegram`
+        # (o diagnóstico manual de `orq doctor`, OA-12 — não é aviso
+        # disparado por evento, é `--testar` sob pedido). Nenhuma outra.
+        self.assertEqual(texto.count("_entregador_avisos()"), 3)
         self.assertEqual(texto.count("= _entregador_avisos()"), 1)
+        self.assertEqual(texto.count("[_entregador_avisos(), \"--testar\"]"), 1)
 
 
 # =================================================================== PROCESSO

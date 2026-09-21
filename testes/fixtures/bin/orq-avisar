@@ -11,10 +11,21 @@ definido, só sai 0 sem fazer nada — o padrão seguro que todo teste deste
 repositório usa como `ORQ_NOTIFY_CMD`, para que disparar uma transição
 roteada (bloqueada, despachada, pr_aberto...) durante a suíte nunca tente uma
 entrega de verdade.
+
+`--testar` (o que `_prova_telegram`, OA-12, chama): imprime `ok: ...` e sai 0
+se `FAKE_AVISAR_TESTAR=ok`; senão imprime em stderr e sai 1 — o mesmo
+contrato do `orq-avisar --testar` real.
 """
 import json
 import os
 import sys
+
+if "--testar" in sys.argv:
+    if os.environ.get("FAKE_AVISAR_TESTAR") == "ok":
+        print("ok: message_id=1")
+        sys.exit(0)
+    print("Telegram não configurado: mentira de teste", file=sys.stderr)
+    sys.exit(1)
 
 registro = os.environ.get("FAKE_AVISAR_LOG")
 if registro:

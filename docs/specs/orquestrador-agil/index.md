@@ -41,7 +41,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | [OA-09](OA-09-retrabalho-a-partir-do-pr.md) | Retrabalho a partir do PR | P1 | OA-05, OA-08 | concluído (`bin/orq`, `testes/test_retrabalho.py`) |
 | [OA-10](OA-10-telegram-como-destino.md) | Telegram como destino de aviso | P1 | — | concluído (`bin/orq-avisar`, `testes/test_avisar.py`) |
 | [OA-11](OA-11-roteamento-de-eventos-e-avisos.md) | Roteamento de eventos: o que avisa e o que cala | P0 | OA-03, OA-08, OA-10 | concluído (`bin/orq`, `bin/orq-avisar`, `hooks/notificar.sh`, `testes/test_avisos.py`) |
-| [OA-12](OA-12-pre-voo-do-modelo-novo.md) | O pré-voo do modelo novo | P1 | OA-02, OA-04, OA-06, OA-10 | não iniciado |
+| [OA-12](OA-12-pre-voo-do-modelo-novo.md) | O pré-voo do modelo novo | P1 | OA-02, OA-04, OA-06, OA-10 | concluído (`bin/orq`, `bin/orq-clickup`, `testes/test_doctor.py`, `testes/test_clickup_doctor.py`) |
 | [OA-13](OA-13-medicao-adaptada.md) | A medição adaptada | P2 | OA-01, OA-08, OA-09, OA-11 | não iniciado |
 | [OA-14](OA-14-documentacao-e-skills.md) | Documentação e skills | P2 | OA-02, OA-05, OA-07, OA-12 | não iniciado |
 

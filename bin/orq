@@ -40,10 +40,13 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
   partir do PR             na mesma worktree/branch, o teto (OA-09)
   estado — laço autônomo   vigia → recolhe → despacha a cada ciclo, e a
                            parada por ociosidade — comando `loop` (OA-08)
+  pré-voo                  cada prova por chamada real, nunca por declaração
+                           — comando `doctor` (OA-12)
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -51,6 +54,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -863,9 +867,10 @@ def _primeiro_ciclo(con: sqlite3.Connection, ids: list) -> str | None:
     return None
 
 
-def cmd_validate(cfg, args):
-    """Recusa esteira incoerente, sem escrever nada no banco."""
-    con = abrir_banco(Path(args.db))
+def _validar(con: sqlite3.Connection) -> list[str]:
+    """A lista de problemas de uma esteira — nunca escreve nada. `cmd_validate`
+    é a casca de CLI; `orq doctor` (OA-12) CHAMA esta função como uma das
+    provas do pré-voo, em vez de duplicar a checagem."""
     problemas = []
     conf = {r["chave"]: r["valor"] for r in con.execute("SELECT chave, valor FROM config")}
 
@@ -935,6 +940,13 @@ def cmd_validate(cfg, args):
     ciclo = _primeiro_ciclo(con, [u["id"] for u in unidades])
     if ciclo:
         problemas.append(f"ciclo de dependência: {ciclo}.")
+    return problemas
+
+
+def cmd_validate(cfg, args):
+    """Recusa esteira incoerente, sem escrever nada no banco."""
+    con = abrir_banco(Path(args.db))
+    problemas = _validar(con)
     con.close()
 
     if problemas:
@@ -2807,6 +2819,379 @@ def cmd_host(cfg, args):
     sys.exit(1 if alertas else 0)
 
 
+# ---------------------------------------------------------------- pré-voo (OA-12)
+#
+# `orq doctor` some por inteiro em OA-04 (dependia do motor TOML/ClickUp) e
+# volta aqui, reescrito: cada prova por CHAMADA REAL, nunca por declaração —
+# é a lição nº 1 da casa (docs/aprendizados.md:10): o pré-voo antigo dava
+# verde perguntando `claude auth status`, que responde `loggedIn: true` só
+# por existir uma variável de ambiente, e cada sessão morria em dois
+# segundos. A prova de ClickUp SAI daqui (fica em `orq-clickup doctor`): o
+# motor não depende mais dele para funcionar, e um pré-voo que falha por uma
+# ferramenta de gestão fora do ar impediria despacho sem necessidade.
+
+REDE_FS = {"nfs", "nfs4", "cifs", "smb", "smbfs", "afp", "9p", "fuse.sshfs"}
+
+
+def _prova(fn):
+    """Roda uma prova e nunca deixa uma exceção matar o pré-voo inteiro — a
+    evidência é o que a chamada devolveu DE VERDADE, ou o erro que ela
+    levantou, nunca a palavra 'ok' (aprendizado nº 1)."""
+    try:
+        ok, evidencia = fn()
+        return ok, str(evidencia or "").strip()[:200]
+    except Exception as e:
+        return False, str(e).strip()[:200]
+
+
+def _tipo_sistema_arquivos(caminho: Path) -> str | None:
+    """O tipo do sistema de arquivos que contém `caminho` — via `mount`, que
+    existe em macOS e Linux, com formatos de saída diferentes:
+      macOS:  /dev/disk3s5 on / (apfs, local, journaled)
+      Linux:  /dev/sda1 on / type ext4 (rw,relatime)
+    `None` quando não dá para saber — a prova trata isso como "não provado
+    rede", nunca como "provado local"."""
+    alvo = str(caminho.resolve())
+    try:
+        saida = subprocess.run(["mount"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    melhor = None
+    for linha in saida.splitlines():
+        m = re.match(r"^\S+ on (\S+) (?:type (\S+) )?\(([^)]*)\)", linha)
+        if not m:
+            continue
+        ponto = m.group(1)
+        if not alvo.startswith(ponto):
+            continue
+        if melhor is None or len(ponto) > len(melhor[0]):
+            tipo = m.group(2) or m.group(3).split(",")[0].strip()
+            melhor = (ponto, tipo)
+    return melhor[1] if melhor else None
+
+
+def _prova_banco_desta_maquina(con: sqlite3.Connection) -> tuple:
+    row = con.execute("SELECT versao FROM esquema").fetchone()
+    repo_declarado = obter_config(con, "repo")
+    if not repo_declarado:
+        return False, "config 'repo' não declarada."
+    motivo = divergencia_de_maquina(repo_declarado, git_dir_comum())
+    if motivo:
+        return False, motivo.splitlines()[0]
+    return True, f"esquema v{row['versao']}, repo={repo_declarado}"
+
+
+def _prova_wal_e_disco_local(con: sqlite3.Connection, caminho: Path) -> tuple:
+    modo = con.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(modo).lower() != "wal":
+        return False, f"journal_mode = {modo}, esperado 'wal'."
+    tipo = _tipo_sistema_arquivos(caminho)
+    if tipo and tipo.lower() in REDE_FS:
+        return False, (f"banco em sistema de arquivos de rede ({tipo}) — WAL não é "
+                       f"seguro com múltiplos escritores num volume de rede.")
+    return True, f"wal · {tipo or 'tipo de disco não identificado'}"
+
+
+def _prova_fila(caminho: Path) -> tuple:
+    """Dois escritores concorrentes numa unidade reservada (`__doctor__`):
+    prova que `BEGIN IMMEDIATE` + `busy_timeout` (OA-01) enfileira em vez de
+    perder escrita. A unidade é removida ao fim, aconteça o que acontecer."""
+    chave = "__doctor__"
+    with transacao(caminho) as con:
+        row = con.execute("SELECT strikes FROM unidade WHERE chave = ?", (chave,)).fetchone()
+        if row is None:
+            criar_unidade(con, chave, clickup_id=None, titulo="prova de fila (orq doctor)")
+            base = 0
+        else:
+            base = row["strikes"]
+    try:
+        resultados = {}
+
+        def escrever(nome):
+            try:
+                inicio = time.monotonic()
+                with transacao(caminho) as con:
+                    atual = con.execute(
+                        "SELECT strikes FROM unidade WHERE chave = ?", (chave,)).fetchone()
+                    time.sleep(0.2)
+                    con.execute("UPDATE unidade SET strikes = ? WHERE chave = ?",
+                               (atual["strikes"] + 1, chave))
+                resultados[nome] = (inicio, time.monotonic())
+            except Exception as e:
+                resultados[nome] = e
+
+        t1 = threading.Thread(target=escrever, args=("a",))
+        t2 = threading.Thread(target=escrever, args=("b",))
+        t1.start()
+        time.sleep(0.05)   # garante que 'b' tenta começar ENQUANTO 'a' está dentro
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+
+        if set(resultados) != {"a", "b"}:
+            return False, "um dos dois escritores não terminou a tempo (15s)."
+        for nome, r in resultados.items():
+            if isinstance(r, Exception):
+                return False, f"escritor '{nome}' falhou: {r}"
+        (i1, f1), (i2, f2) = resultados["a"], resultados["b"]
+        sobrepoe = i1 < f2 and i2 < f1
+        con = abrir_banco(caminho)
+        final = con.execute(
+            "SELECT strikes FROM unidade WHERE chave = ?", (chave,)).fetchone()["strikes"]
+        con.close()
+        if final != base + 2:
+            return False, f"escrita perdida: esperava {base + 2}, achei {final}."
+        if not sobrepoe:
+            return False, "os dois escritores não chegaram a se sobrepor no tempo."
+        return True, f"dois escritores concorrentes, {final - base} incrementos, nenhum perdido"
+    finally:
+        with transacao(caminho) as con:
+            con.execute("DELETE FROM unidade WHERE chave = ?", (chave,))
+
+
+def _prova_validate(caminho: Path) -> tuple:
+    con = abrir_banco(caminho)
+    problemas = _validar(con)
+    con.close()
+    if problemas:
+        return False, "; ".join(problemas)[:200]
+    return True, "esteira coerente"
+
+
+def _contagem_e_limite_de_processos() -> tuple:
+    """Quantos processos este usuário tem, e o teto — para dizer 'a máquina
+    não cria mais processo' com o NÚMERO, não só a suspeita (aprendizado
+    nº 23)."""
+    n = -1
+    try:
+        saida = subprocess.run(["ps", "-u", str(os.getuid()), "-o", "pid="],
+                               capture_output=True, text=True, timeout=5).stdout
+        n = len([l for l in saida.splitlines() if l.strip()])
+    except Exception:
+        pass
+    limite = None
+    try:
+        if sys.platform == "darwin":
+            limite = int(subprocess.run(["sysctl", "-n", "kern.maxprocperuid"],
+                                        capture_output=True, text=True, timeout=5).stdout.strip())
+        else:
+            import resource
+            limite = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+    except Exception:
+        pass
+    return n, limite
+
+
+def _prova_agente(timeout: int = 45) -> tuple:
+    """`claude -p "responda apenas: ok"` — a única prova que confirma login
+    de verdade (aprendizado nº 1). Antes de concluir 'sem login', confirma
+    que a MÁQUINA ainda cria processo: com fork falhando, esta e qualquer
+    outra checagem que executa algo devolveria o erro da última coisa que
+    ia rodar, com o diagnóstico errado (aprendizado nº 23)."""
+    try:
+        subprocess.run(["true"], timeout=5)
+    except OSError as e:
+        n, limite = _contagem_e_limite_de_processos()
+        return False, (f"a máquina não consegue mais criar processo ({e}) — "
+                       f"{n} processos de {limite if limite is not None else '?'} de teto. "
+                       f"NÃO é falta de login.")
+    if not shutil.which("claude"):
+        return False, "`claude` não está na PATH."
+    try:
+        r = subprocess.run(["claude", "-p", "responda apenas: ok"],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"`claude -p` não respondeu em {timeout}s."
+    except OSError as e:
+        n, limite = _contagem_e_limite_de_processos()
+        return False, (f"a máquina não consegue mais criar processo ({e}) — "
+                       f"{n} processos de {limite if limite is not None else '?'} de teto. "
+                       f"NÃO é falta de login.")
+    saida = (r.stdout or "").strip()
+    if r.returncode != 0 or "ok" not in saida.lower():
+        return False, (f"não respondeu 'ok' (saída: {saida[:120]!r}, código {r.returncode}) "
+                       f"— rode `claude auth login`.")
+    return True, f"respondeu {saida[:60]!r}"
+
+
+def _prova_gh(github_repo: str | None) -> tuple:
+    if not shutil.which("gh"):
+        return False, "`gh` não está na PATH — `brew install gh` ou equivalente."
+    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return False, f"`gh auth login` — {(r.stderr or r.stdout).strip()[:160]}"
+    if not github_repo:
+        return True, "autenticado (github_repo não declarado — pulei o pr list)."
+    r2 = subprocess.run(["gh", "pr", "list", "--repo", github_repo, "--limit", "1"],
+                        capture_output=True, text=True, timeout=20)
+    if r2.returncode != 0:
+        return False, f"`gh pr list --repo {github_repo}` falhou: {r2.stderr.strip()[:160]}"
+    return True, f"autenticado, {github_repo} acessível."
+
+
+def _prova_git_credencial(repo: str, base: str) -> tuple:
+    r = subprocess.run(["git", "-C", repo, "ls-remote", "--exit-code", "origin", base],
+                       capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if r.returncode != 0:
+        return False, ("sem credencial não interativa para o remoto — "
+                       "`ssh-add --apple-use-keychain` ou `gh auth setup-git`.")
+    partes = r.stdout.split()
+    return True, f"origin/{base} → {partes[0][:12] if partes else 'ok'}"
+
+
+def _prova_tmux() -> tuple:
+    if not has_tmux():
+        return False, "tmux não está na PATH — o lançador (OA-05) exige >= 3.2."
+    versao_txt = subprocess.run(["tmux", "-V"], capture_output=True,
+                                text=True, timeout=10).stdout.strip()
+    m = re.search(r"(\d+)\.(\d+)", versao_txt)
+    if not m:
+        return False, f"não consegui ler a versão: {versao_txt!r}"
+    if (int(m.group(1)), int(m.group(2))) < (3, 2):
+        return False, f"{versao_txt} — o lançador exige >= 3.2 (a opção -e)."
+    return True, versao_txt
+
+
+def cerca_impressao() -> str | None:
+    """Um SHA256 curto do arquivo — não prova que o CONTEÚDO está certo, só
+    que ninguém trocou o arquivo por baixo sem ninguém perceber. Registrado
+    a cada `orq doctor` para dar o que comparar depois."""
+    if not CERCA.exists():
+        return None
+    return hashlib.sha256(CERCA.read_bytes()).hexdigest()[:12]
+
+
+def _prova_cerca() -> tuple:
+    if not (CERCA.exists() and os.access(CERCA, os.X_OK)):
+        return False, f"sumiu ou não é executável: {CERCA}"
+    script = ORQ_REPO / "testes" / "cerca.sh"
+    if not script.exists():
+        return False, f"impressão {cerca_impressao()} · testes/cerca.sh sumiu, não pude provar"
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        ultima = (r.stdout + r.stderr).strip().splitlines()
+        return False, f"testes/cerca.sh falhou: {ultima[-1][:160] if ultima else '(sem saída)'}"
+    return True, f"impressão {cerca_impressao()} · testes/cerca.sh verde"
+
+
+def _prova_confianca(repo: str) -> tuple:
+    try:
+        d = json.loads(CLAUDE_JSON.read_text())
+    except Exception as e:
+        return False, f"não consegui ler {CLAUDE_JSON}: {e}"
+    chave = str(Path(repo).expanduser())
+    confiavel = bool(d.get("projects", {}).get(chave, {}).get("hasTrustDialogAccepted"))
+    if not confiavel:
+        return False, f"abra uma vez e aceite: cd {repo} && claude"
+    return True, "worktrees herdam a confiança do repositório base"
+
+
+def _prova_worktree_fora(repo: str, worktree_root: str) -> tuple:
+    try:
+        Path(worktree_root).expanduser().resolve().relative_to(Path(repo).expanduser().resolve())
+        return False, f"'{worktree_root}' está DENTRO do repositório."
+    except ValueError:
+        return True, worktree_root
+
+
+def _prova_telegram() -> tuple:
+    try:
+        r = subprocess.run([_entregador_avisos(), "--testar"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, str(e)[:200]
+    saida = ((r.stdout or "") + (r.stderr or "")).strip()
+    linhas = saida.splitlines()
+    if r.returncode != 0 or "ok:" not in saida:
+        return False, linhas[-1][:160] if linhas else "sem credencial configurada."
+    return True, linhas[-1][:160]
+
+
+def _prova_capacidade(con: sqlite3.Connection) -> tuple:
+    cap = capacidade(con)
+    return (cap["slots_free"] > 0,
+           f"RAM livre {cap['free_ram_gb']}GB · vagas {cap['slots_free']} · "
+           f"load {cap['load1']}")
+
+
+def cmd_doctor(cfg, args):
+    """O pré-voo — cada prova por chamada real, nunca por declaração
+    (aprendizado nº 1). `--rapido` pula as duas mais caras (agente, fila)
+    e AVISA que pulou, nunca finge que passaram (Riscos do spec)."""
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    repo = obter_config(con, "repo")
+    base = obter_config(con, "base_branch") or "main"
+    worktree_root = obter_config(con, "worktree_root")
+    github_repo = obter_config(con, "github_repo")
+    con.close()
+
+    tudo_ok = True
+
+    def marcar(rotulo, ok, evidencia, *, fatal=True):
+        nonlocal tudo_ok
+        if ok:
+            simbolo = f"{C['grn']}✓{C['r']}"
+        elif not fatal:
+            simbolo = f"{C['yel']}!{C['r']}"
+        else:
+            simbolo = f"{C['red']}✗{C['r']}"
+        print(f" {simbolo} {rotulo:<38} {C['d']}{evidencia}{C['r']}")
+        if not ok and fatal:
+            tudo_ok = False
+
+    print(f"{C['b']}Pré-voo{C['r']}")
+
+    con = abrir_banco(caminho)
+    marcar("banco abre e é desta máquina", *_prova(lambda: _prova_banco_desta_maquina(con)))
+    marcar("WAL ativo e disco local", *_prova(lambda: _prova_wal_e_disco_local(con, caminho)))
+    con.close()
+
+    if args.rapido:
+        marcar("a fila funciona (concorrência)", True,
+              "pulado por --rapido — NÃO é prova", fatal=False)
+    else:
+        marcar("a fila funciona (concorrência)", *_prova(lambda: _prova_fila(caminho)))
+
+    marcar("declaração coerente (orq validate)", *_prova(lambda: _prova_validate(caminho)))
+
+    if args.rapido:
+        marcar("o agente responde", True, "pulado por --rapido — NÃO é prova", fatal=False)
+    else:
+        marcar("o agente responde (chamada real)", *_prova(_prova_agente))
+
+    marcar("gh na PATH e autenticado", *_prova(lambda: _prova_gh(github_repo)))
+
+    if repo:
+        marcar("git com credencial não interativa", *_prova(lambda: _prova_git_credencial(repo, base)))
+        marcar("confiança de pasta herdável", *_prova(lambda: _prova_confianca(repo)))
+    else:
+        marcar("git com credencial não interativa", False, "config 'repo' não declarada.")
+        marcar("confiança de pasta herdável", False, "config 'repo' não declarada.")
+
+    marcar("tmux >= 3.2", *_prova(_prova_tmux))
+    marcar("cerca presente e íntegra", *_prova(_prova_cerca))
+
+    if repo and worktree_root:
+        marcar("worktree root fora do repo", *_prova(lambda: _prova_worktree_fora(repo, worktree_root)))
+    else:
+        marcar("worktree root fora do repo", False, "'repo'/'worktree_root' não declarados.")
+
+    marcar("telegram entrega", *_prova(_prova_telegram), fatal=False)
+
+    con = abrir_banco(caminho)
+    marcar("capacidade", *_prova(lambda: _prova_capacidade(con)), fatal=False)
+    con.close()
+
+    print()
+    if tudo_ok:
+        print(f"{C['grn']}{C['b']}PRONTO{C['r']}")
+    else:
+        print(f"{C['red']}{C['b']}NÃO PRONTO{C['r']}")
+    sys.exit(0 if tudo_ok else 1)
+
+
 def main():
     p = argparse.ArgumentParser(prog="orq",
                                 description="Orquestrador de esteiras — despacha agentes "
@@ -2956,9 +3341,11 @@ def main():
     s.add_argument("--check", action="store_true",
                    help="só alerta; sai com 1 quando há alerta")
 
-    # `orq doctor` (pré-voo) ainda não existe — dependia do motor TOML
-    # removido em OA-04, e volta com checagem de verdade contra o banco em
-    # OA-12. Não há comando aqui fingindo fazer o que ainda não faz.
+    s = add("doctor", cmd_doctor,
+            "pré-voo: cada prova por chamada real, nunca por declaração (OA-12)",
+            banco=True)
+    s.add_argument("--rapido", action="store_true",
+                   help="pula as duas provas mais caras (agente, fila) — avisa, não finge")
 
     args = p.parse_args()
     if getattr(args, "banco", False):

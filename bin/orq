@@ -30,6 +30,11 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
   lançamento               run/dispatch/attach/log/stop (OA-05)
   estado — vigia de PR     consulta ao gh, transições que ela dispara,
                            encerramento em 'pronto' (OA-08)
+  estado — roteamento      uma origem só (transacao()) para todo aviso —
+  de avisos                roteamento, antirrepetição, avisos_silenciados
+                           (OA-11)
+  estado — retrabalho a    escopo a partir da revisão de verdade, relança
+  partir do PR             na mesma worktree/branch, o teto (OA-09)
   estado — laço autônomo   vigia → recolhe → despacha a cada ciclo, e a
                            parada por ociosidade — comando `loop` (OA-08)
 """
@@ -100,13 +105,13 @@ def norm(s: str) -> str:
 # pipeline.toml/ClickUp) já ligaram tudo isto aos comandos — não há mais motor
 # nenhum por trás.
 
-VERSAO_ESQUEMA = 2
+VERSAO_ESQUEMA = 3
 
 BANCOS = Path.home() / ".config" / "orquestrador" / "esteiras"
 
 ESQUEMA_SQL = """
 CREATE TABLE esquema (versao INTEGER NOT NULL);
-INSERT INTO esquema (versao) VALUES (2);
+INSERT INTO esquema (versao) VALUES (3);
 
 CREATE TABLE config (
   chave TEXT PRIMARY KEY,
@@ -128,6 +133,9 @@ CREATE TABLE unidade (
   pr_url        TEXT,
   strikes       INTEGER NOT NULL DEFAULT 0,
   retrabalho    INTEGER NOT NULL DEFAULT 0,
+  retrabalho_em TEXT,     -- carimbo do último relançamento (OA-09) — só
+                          -- revisão/comentário POSTERIOR a isto entra no
+                          -- próximo briefing; NULL nunca filtra nada
   solta_em      TEXT,     -- bilhete de uso único do `orq release` (OA-03):
                           -- consumido pelo primeiro recolhimento, para uma
                           -- unidade liberada não contar falta antes de ter
@@ -242,12 +250,20 @@ def _migrar(con: sqlite3.Connection, de_versao: int) -> None:
     1 → 2 (OA-08): `unidade` ganha `vigia_falhas` e `pr_draft`, que o vigia
     de PR precisa para não confundir uma falha de rede com três seguidas, e
     para o quadro distinguir PR rascunho de PR pedindo revisão de verdade.
+
+    2 → 3 (OA-09): `unidade` ganha `retrabalho_em`, o carimbo que impede o
+    retrabalho de repetir, no segundo relançamento, um achado de revisão já
+    corrigido no primeiro.
     """
     if de_versao == 1:
         con.execute("ALTER TABLE unidade ADD COLUMN vigia_falhas INTEGER NOT NULL DEFAULT 0")
         con.execute("ALTER TABLE unidade ADD COLUMN pr_draft INTEGER NOT NULL DEFAULT 0")
         con.execute("UPDATE esquema SET versao = 2")
         de_versao = 2
+    if de_versao == 2:
+        con.execute("ALTER TABLE unidade ADD COLUMN retrabalho_em TEXT")
+        con.execute("UPDATE esquema SET versao = 3")
+        de_versao = 3
     if de_versao != VERSAO_ESQUEMA:
         raise ErroEstado(
             f"banco na versão {de_versao}, e este binário não tem migração "
@@ -358,6 +374,7 @@ ROTEAMENTO_AVISOS = {
     "despachada":        "tarefa iniciada por um agente",
     "pr_aberto":         "PR aberto por um agente",
     "bloqueada":         "tarefa bloqueada",
+    "pr_fechado":        "tarefa bloqueada — PR fechado sem merge",
     "pr_fundido":        "PR fundido — unidade concluída",
     "pr_fundido_manual": "PR fundido fora do fluxo — unidade concluída",
     "retrabalho":        "revisão pediu mudanças — retrabalho",
@@ -1332,13 +1349,22 @@ def cmd_release(cfg, args):
         # strikes zera e o bilhete `solta_em` nasce ANTES da transição: é o
         # que impede o próprio `recolher_sessoes_mortas` de contar falta na
         # primeira vez que encontrar esta unidade sem sessão viva.
-        con.execute("UPDATE unidade SET strikes = 0, solta_em = ? WHERE id = ?",
-                   (_agora(), uid))
+        if args.zerar_retrabalho:
+            # --zerar-retrabalho (OA-09): para quando a pessoa corrigiu o
+            # requisito que travou a unidade no teto — sem zerar, a próxima
+            # devolução bloquearia de novo na hora.
+            con.execute(
+                "UPDATE unidade SET strikes = 0, solta_em = ?, retrabalho = 0, "
+                "retrabalho_em = NULL WHERE id = ?", (_agora(), uid))
+        else:
+            con.execute("UPDATE unidade SET strikes = 0, solta_em = ? WHERE id = ?",
+                       (_agora(), uid))
         try:
             transicionar(con, uid, "backlog", tipo_evento="liberada")
         except ErroTransicaoIlegal as e:
             die(str(e))
-    print(f"{C['grn']}✓{C['r']} {args.chave} liberada — volta para a fila.")
+    extra = " · retrabalho zerado" if args.zerar_retrabalho else ""
+    print(f"{C['grn']}✓{C['r']} {args.chave} liberada — volta para a fila.{extra}")
 
 
 def cmd_reopen(cfg, args):
@@ -1425,8 +1451,8 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
         return achados
     tem_gh = shutil.which("gh") is not None
     for u in con.execute(
-            "SELECT id, chave, pr_numero, vigia_falhas FROM unidade "
-            "WHERE status = 'revisao' AND pr_numero IS NOT NULL"):
+            "SELECT id, chave, pr_numero, vigia_falhas, retrabalho, retrabalho_em "
+            "FROM unidade WHERE status = 'revisao' AND pr_numero IS NOT NULL"):
         if tem_gh:
             info, erro = _consultar_pr(github_repo, u["pr_numero"])
         else:
@@ -1457,13 +1483,28 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
                             "worktree": sessao["worktree"] if sessao else None,
                             "branch": sessao["branch"] if sessao else None})
         elif info.get("reviewDecision") == "CHANGES_REQUESTED":
-            transicionar(con, u["id"], "em_progresso", tipo_evento="retrabalho",
-                        motivo="revisão pediu mudanças")
-            achados.append({"chave": u["chave"], "desfecho": "em_progresso"})
+            max_rework = int(obter_config(con, "max_rework", "2") or 2)
+            if u["retrabalho"] >= max_rework:
+                # O teto (OA-09): a devolução que segue à `max_rework`-ésima
+                # já fundida some no meio do caminho — aqui é onde a esteira
+                # desiste de relançar sozinha e pede decisão humana.
+                motivo = (f"{u['retrabalho'] + 1}ª devolução no PR — o defeito provavelmente "
+                         f"está no requisito, não na implementação.")
+                transicionar(con, u["id"], "bloqueado", tipo_evento="bloqueada", motivo=motivo)
+                achados.append({"chave": u["chave"], "desfecho": "bloqueado", "motivo": motivo})
+            else:
+                transicionar(con, u["id"], "em_progresso", tipo_evento="retrabalho",
+                            motivo="revisão pediu mudanças")
+                achados.append({
+                    "chave": u["chave"], "desfecho": "em_progresso", "unidade_id": u["id"],
+                    "pr_numero": u["pr_numero"], "retrabalho": u["retrabalho"],
+                    "retrabalho_em": u["retrabalho_em"],
+                    "worktree": sessao["worktree"] if sessao else None,
+                    "branch": sessao["branch"] if sessao else None})
         elif info.get("state") == "CLOSED":
-            transicionar(con, u["id"], "bloqueado", tipo_evento="pr_fechado",
-                        motivo="PR fechado sem merge")
-            achados.append({"chave": u["chave"], "desfecho": "bloqueado"})
+            motivo = "PR fechado sem merge"
+            transicionar(con, u["id"], "bloqueado", tipo_evento="pr_fechado", motivo=motivo)
+            achados.append({"chave": u["chave"], "desfecho": "bloqueado", "motivo": motivo})
         # OPEN sem novidade: nenhuma transição, nenhum achado.
     return achados
 
@@ -1569,9 +1610,12 @@ def cmd_advance(cfg, args):
 
 def cmd_tick(cfg, args):
     """Vigia os PRs em `revisao` primeiro (OA-08) — um merge detectado neste
-    ciclo libera dependente já no `board` seguinte — e só depois recolhe
-    sessão morta. Preencher vaga continua fora daqui: é `orq run`/`orq
-    dispatch`, ou `orq loop`, que encadeia os três."""
+    ciclo libera dependente já no `board` seguinte, e uma devolução relança
+    o retrabalho (OA-09) — e só DEPOIS recolhe sessão morta: sem essa ordem,
+    a unidade que acabou de virar `em_progresso` por devolução seria lida
+    como arranque falho no mesmo ciclo que a devolveu. Preencher vaga
+    continua fora daqui: é `orq run`/`orq dispatch`, ou `orq loop`, que
+    encadeia os três."""
     caminho = Path(args.db)
     con = abrir_banco(caminho)
     max_strikes = int(obter_config(con, "max_strikes", "2") or 2)
@@ -1586,9 +1630,9 @@ def cmd_tick(cfg, args):
         if a["desfecho"] == "pronto":
             print(_concluir_merge(caminho, repo, nome_esteira, a))
         elif a["desfecho"] == "em_progresso":
-            print(f"  {C['yel']}↺{C['r']} {a['chave']}: revisão pediu mudanças")
+            print(_relancar_retrabalho(caminho, github_repo, repo, a))
         elif a["desfecho"] == "bloqueado":
-            print(f"  {C['red']}✗{C['r']} {a['chave']}: PR fechado sem merge")
+            print(f"  {C['red']}✗{C['r']} {a['chave']}: {a.get('motivo', 'bloqueada')}")
         elif a["desfecho"] == "falhou":
             print(f"  {C['red']}!{C['r']} {a['chave']}: vigia falhou — {a['detalhe']}")
         # rascunho: silencioso aqui — aparece no `orq board`.
@@ -1859,20 +1903,24 @@ trabalhou.
 """
 
 
-def build_brief(con: sqlite3.Connection, u, wt: Path, branch: str) -> str:
+def build_brief(con: sqlite3.Connection, u, wt: Path, branch: str, *, prefixo: str = "") -> str:
+    """`prefixo` (OA-09): o bloco RETRABALHO vai ANTES de tudo — o escopo da
+    revisão devolvida tem prioridade sobre o resto do cartão, e um bloco no
+    meio do briefing se perde entre as oito seções normais."""
     base = obter_config(con, "base_branch") or "main"
     repo = obter_config(con, "repo") or "?"
     github_repo = obter_config(con, "github_repo") or "(github_repo não declarado)"
     url = (f"https://app.clickup.com/t/{u['clickup_id']}" if u["clickup_id"]
           else "(sem ClickUp)")
-    return BRIEFING.format(
+    return prefixo + BRIEFING.format(
         pipeline=obter_config(con, "name") or "(sem nome)", chave=u["chave"],
         clickup_id=u["clickup_id"] or "?", titulo=u["titulo"] or "(ver ClickUp)",
         url=url, worktree=wt, branch=branch, base=base, repo=repo,
         github_repo=github_repo)
 
 
-def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False) -> str:
+def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False, *,
+          prefixo_briefing: str = "") -> str:
     """Lança a sessão: worktree, confiança, briefing, settings, tmux ou
     processo solto. Só a ÚLTIMA escrita (registrar a sessão) roda em
     transação — o resto é git/tmux e pode demorar; segurar o lock de escrita
@@ -1885,7 +1933,7 @@ def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False) -> str
     label = u["chave"]
     nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
     brief_path = STATE / f"{nome_esteira}-{u['id']}.brief.md"
-    brief_path.write_text(build_brief(con, u, wt, branch))
+    brief_path.write_text(build_brief(con, u, wt, branch, prefixo=prefixo_briefing))
     setts = STATE / f"{nome_esteira}-{u['id']}.settings.json"
     setts.write_text(settings_json(label, str(wt), branch, base))
     logf = STATE / f"{nome_esteira}-{u['id']}.log"
@@ -1934,6 +1982,152 @@ def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False) -> str
     if attach and has_tmux():
         os.execvp("tmux", ["tmux", "attach", "-t", nome_sessao])
     return how
+
+
+# ---------------------------------------------------------------- estado — retrabalho
+# a partir do PR (OA-09)
+#
+# A detecção (revisão devolvida → em_progresso) é do vigia (OA-08); esta
+# seção é só o QUE FAZER com isso — montar o escopo a partir da revisão de
+# verdade, relançar na MESMA worktree/branch, e o teto que manda para
+# decisão humana. Ver
+# docs/specs/orquestrador-agil/OA-09-retrabalho-a-partir-do-pr.md.
+
+def _atualizar_worktree_ou_falhar(repo: Path, wt: Path, base: str) -> str | None:
+    """`git fetch` + `merge --ff-only origin/<base>` na worktree já
+    existente — a MESMA operação que `ensure_worktree` já faz ao reaproveitar
+    uma worktree, mas aqui o resultado é CHECADO: o retrabalho nunca pode
+    assumir que a base convergiu só porque o comando rodou. Devolve `None`
+    em sucesso, ou uma mensagem legível em falha (base divergiu de verdade —
+    conciliar é julgamento humano, não do agente)."""
+    subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"],
+                   capture_output=True, text=True, timeout=120)
+    remoto = f"origin/{base}"
+    tem_remoto = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", remoto],
+                                capture_output=True).returncode == 0
+    r = subprocess.run(["git", "-C", str(wt), "merge", "--ff-only",
+                        remoto if tem_remoto else base],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return (r.stderr or r.stdout or "merge --ff-only falhou").strip()[:300]
+    return None
+
+
+def _coletar_retrabalho(github_repo: str, numero: int, desde: str | None) -> dict:
+    """`gh pr view --json reviews` (revisões CHANGES_REQUESTED) + `gh api
+    .../pulls/<n>/comments` (comentários de LINHA — endpoint diferente, a
+    REST API de review comments). Só o que é mais novo que `desde` entra —
+    sem isso a segunda rodada repetiria achados da primeira, já corrigidos."""
+    reviews, comentarios = [], []
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(numero), "--repo", github_repo, "--json", "reviews"],
+            capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            for rv in json.loads(r.stdout).get("reviews", []):
+                if rv.get("state") != "CHANGES_REQUESTED":
+                    continue
+                quando = rv.get("submittedAt") or ""
+                if desde and quando and quando <= desde:
+                    continue
+                reviews.append(rv)
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(
+            ["gh", "api", "--paginate", f"repos/{github_repo}/pulls/{numero}/comments"],
+            capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            for c in json.loads(r.stdout):
+                quando = c.get("created_at") or ""
+                if desde and quando and quando <= desde:
+                    continue
+                comentarios.append(c)
+    except Exception:
+        pass
+    return {"reviews": reviews, "comentarios": comentarios}
+
+
+def _formatar_bloco_retrabalho(ordem: int, maximo: int, numero: int, colhido: dict) -> str:
+    """O bloco que vai ANTES de tudo no briefing (`build_brief(prefixo=...)`)
+    — formato fixo do spec, para o agente nunca precisar adivinhar onde
+    termina o escopo do retrabalho e começa o resto do cartão."""
+    reviews = colhido["reviews"]
+    if reviews:
+        blocos = []
+        for rv in reviews:
+            autor = (rv.get("author") or {}).get("login") or "?"
+            data = (rv.get("submittedAt") or "")[:10] or "?"
+            corpo = (rv.get("body") or "").strip() or "(sem corpo)"
+            blocos.append(f"O que foi pedido (revisão de {autor}, {data}):\n{corpo}")
+        secao_reviews = "\n\n".join(blocos)
+    else:
+        secao_reviews = "O que foi pedido: (ver os comentários de linha abaixo)"
+    comentarios = colhido["comentarios"]
+    if comentarios:
+        linhas = "\n".join(
+            f"{c.get('path') or '?'}:{c.get('line') or c.get('original_line') or '?'} — "
+            f"{(c.get('body') or '').strip()}"
+            for c in comentarios)
+    else:
+        linhas = "(nenhum)"
+    return (
+        f"RETRABALHO {ordem}/{maximo} — este PR foi devolvido pela revisão humana.\n\n"
+        f"{secao_reviews}\n\n"
+        f"Comentários de linha:\n{linhas}\n\n"
+        f"Estes achados SÃO o seu escopo, com prioridade sobre o resto da tarefa. O PR\n"
+        f"#{numero} continua aberto no mesmo branch: corrija, rode os portões de novo,\n"
+        f"comite e empurre. NÃO abra outro PR.\n\n"
+        + "─" * 78 + "\n\n"
+    )
+
+
+def _relancar_retrabalho(caminho: Path, github_repo: str | None, repo: str | None,
+                         achado: dict) -> str:
+    """A metade de fora-da-transação do retrabalho: `vigiar_prs` já gravou
+    revisão→em_progresso; esta função decide o que fazer AGORA que isso
+    aconteceu — atualizar a worktree (checado), coletar a revisão de
+    verdade, relançar. Roda ANTES de `recolher_sessoes_mortas` no mesmo
+    ciclo (`cmd_tick`/`cmd_loop`): sem isso, a unidade que acabou de virar
+    `em_progresso` sem sessão viva seria lida como arranque falho no mesmo
+    tick que a devolveu."""
+    uid, chave = achado["unidade_id"], achado["chave"]
+    wt = Path(achado["worktree"]) if achado.get("worktree") else None
+    if wt is None or not wt.exists() or not repo:
+        motivo = "retrabalho sem worktree para reusar — a sessão original nunca chegou a rodar"
+        with transacao(caminho) as con:
+            transicionar(con, uid, "bloqueado", tipo_evento="bloqueada", motivo=motivo)
+        return f"{C['red']}✗{C['r']} {chave}: {motivo}"
+
+    con = abrir_banco(caminho)
+    base = obter_config(con, "base_branch") or "main"
+    max_rework = int(obter_config(con, "max_rework", "2") or 2)
+    con.close()
+
+    erro_merge = _atualizar_worktree_ou_falhar(Path(repo), wt, base)
+    if erro_merge:
+        motivo = f"base divergiu — merge --ff-only falhou: {erro_merge}"
+        with transacao(caminho) as con:
+            transicionar(con, uid, "bloqueado", tipo_evento="bloqueada", motivo=motivo)
+        return f"{C['red']}✗{C['r']} {chave}: {motivo}"
+
+    colhido = {"reviews": [], "comentarios": []}
+    if github_repo and shutil.which("gh"):
+        colhido = _coletar_retrabalho(github_repo, achado["pr_numero"], achado["retrabalho_em"])
+    ordem = achado["retrabalho"] + 1
+    bloco = _formatar_bloco_retrabalho(ordem, max_rework, achado["pr_numero"], colhido)
+
+    con = abrir_banco(caminho)
+    u = con.execute("SELECT * FROM unidade WHERE id = ?", (uid,)).fetchone()
+    how = launch(con, caminho, u, prefixo_briefing=bloco)
+    con.close()
+
+    with transacao(caminho) as con:
+        con.execute("UPDATE unidade SET retrabalho = ?, retrabalho_em = ? WHERE id = ?",
+                   (ordem, _agora(), uid))
+        registrar_evento(con, uid, "retrabalho_relancado",
+                         texto=f"relançado {ordem}/{max_rework}")
+    return f"{C['grn']}✓{C['r']} {chave}: retrabalho {ordem}/{max_rework} relançado — {how}"
 
 
 def arquivar_artefatos(nome_esteira: str, uid: int, chave: str, outcome: str) -> Path:
@@ -2195,10 +2389,11 @@ def _esteira_concluida(con: sqlite3.Connection) -> bool:
 
 
 def cmd_loop(cfg, args):
-    """O laço autônomo: vigia PRs → recolhe sessão morta → preenche vaga, a
-    cada `interval_seconds` (padrão 60s). Para depois de
-    `IDLE_CICLOS_PARA_PARAR` ciclos sem nada vivo e sem nada mudar — é
-    esperar um humano para sempre em silêncio que este limite evita."""
+    """O laço autônomo: vigia PRs (merge, retrabalho — OA-09, fechamento) →
+    recolhe sessão morta → preenche vaga, a cada `interval_seconds` (padrão
+    60s). Para depois de `IDLE_CICLOS_PARA_PARAR` ciclos sem nada vivo e sem
+    nada mudar — é esperar um humano para sempre em silêncio que este
+    limite evita."""
     caminho = Path(args.db)
     con = abrir_banco(caminho)
     interval = _intervalo_efetivo(con, args.interval)
@@ -2220,8 +2415,11 @@ def cmd_loop(cfg, args):
             if a["desfecho"] == "pronto":
                 print(_concluir_merge(caminho, repo, nome_esteira, a))
                 moveu = True
-            elif a["desfecho"] in ("em_progresso", "bloqueado"):
-                print(f"  {C['yel']}↺{C['r']} {a['chave']}: {a['desfecho']}")
+            elif a["desfecho"] == "em_progresso":
+                print(_relancar_retrabalho(caminho, github_repo, repo, a))
+                moveu = True
+            elif a["desfecho"] == "bloqueado":
+                print(f"  {C['red']}✗{C['r']} {a['chave']}: {a.get('motivo', 'bloqueada')}")
                 moveu = True
             elif a["desfecho"] == "falhou":
                 print(f"  {C['red']}!{C['r']} {a['chave']}: vigia falhou — {a['detalhe']}")
@@ -2649,6 +2847,8 @@ def main():
     s = add("release", cmd_release, "libera uma unidade bloqueada — volta para a fila",
             banco=True)
     s.add_argument("chave")
+    s.add_argument("--zerar-retrabalho", action="store_true", dest="zerar_retrabalho",
+                   help="zera o contador de retrabalho (OA-09) — a pessoa corrigiu o requisito")
     s = add("reopen", cmd_reopen,
             "reabre uma unidade 'pronto' — único jeito de sair de um estado terminal",
             banco=True)

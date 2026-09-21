@@ -2,17 +2,44 @@
 """`gh` de mentira para os testes: nenhum teste automatizado deve depender da
 API real do GitHub nem de um repositório `acme/x` que não existe.
 
-Só entende `gh pr view <numero> --repo <repo>` — o único subcomando que
-`_pr_existe` (OA-05) chama. Sai 0 (PR existe) se `<numero>` estiver na lista
-`FAKE_GH_PRS_OK` (separada por vírgula), ou se essa variável for "*" (todos
-existem — o padrão para testes que não estão testando ESTA checagem). Sai 1
-(PR não existe) caso contrário.
+Dois formatos de `gh pr view <numero> --repo <repo>`:
+
+  * SEM `--json` — o que `_pr_existe` (OA-05) chama. Sai 0 (PR existe) se
+    `<numero>` estiver na lista `FAKE_GH_PRS_OK` (separada por vírgula), ou
+    se essa variável for "*" (todos existem — o padrão para testes que não
+    estão testando ESTA checagem). Sai 1 (PR não existe) caso contrário.
+
+  * COM `--json ...` — o que `_consultar_pr`/`vigiar_prs` (OA-08) chama.
+    Imprime um JSON montado por PR a partir de três variáveis, todas por
+    número de PR:
+      `FAKE_GH_PR_STATE_<numero>`  — OPEN | MERGED | CLOSED (padrão OPEN)
+      `FAKE_GH_PR_REVIEW_<numero>` — ex. CHANGES_REQUESTED (padrão vazio/null)
+      `FAKE_GH_PR_DRAFT_<numero>`  — 1/true (padrão falso)
+    `FAKE_GH_PR_FAIL_<numero>=1` (ou `FAKE_GH_FAIL_ALL=1`) simula o `gh`
+    fora do ar: sai 1 com uma mensagem em stderr, sem imprimir JSON nenhum.
 """
+import json
 import os
 import sys
 
 if len(sys.argv) >= 3 and sys.argv[1] == "pr" and sys.argv[2] == "view":
     numero = sys.argv[3] if len(sys.argv) > 3 else ""
+
+    if "--json" in sys.argv:
+        if (os.environ.get("FAKE_GH_FAIL_ALL") == "1"
+                or os.environ.get(f"FAKE_GH_PR_FAIL_{numero}") == "1"):
+            sys.stderr.write("gh: erro simulado de rede\n")
+            sys.exit(1)
+        estado = os.environ.get(f"FAKE_GH_PR_STATE_{numero}", "OPEN")
+        review = os.environ.get(f"FAKE_GH_PR_REVIEW_{numero}", "") or None
+        rascunho = os.environ.get(f"FAKE_GH_PR_DRAFT_{numero}", "").strip().lower() in (
+            "1", "true", "sim")
+        print(json.dumps({
+            "state": estado, "mergedAt": None, "mergeCommit": None,
+            "reviewDecision": review, "isDraft": rascunho, "updatedAt": "",
+        }))
+        sys.exit(0)
+
     ok = os.environ.get("FAKE_GH_PRS_OK", "*")
     if ok == "*" or numero in {n.strip() for n in ok.split(",") if n.strip()}:
         sys.exit(0)

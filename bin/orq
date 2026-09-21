@@ -28,6 +28,10 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
                            reopen/advance/tick (OA-03)
   estado — sessão e        worktree, briefing único, cerca, capacidade,
   lançamento               run/dispatch/attach/log/stop (OA-05)
+  estado — vigia de PR     consulta ao gh, transições que ela dispara,
+                           encerramento em 'pronto' (OA-08)
+  estado — laço autônomo   vigia → recolhe → despacha a cada ciclo, e a
+                           parada por ociosidade — comando `loop` (OA-08)
 """
 from __future__ import annotations
 
@@ -96,13 +100,13 @@ def norm(s: str) -> str:
 # pipeline.toml/ClickUp) já ligaram tudo isto aos comandos — não há mais motor
 # nenhum por trás.
 
-VERSAO_ESQUEMA = 1
+VERSAO_ESQUEMA = 2
 
 BANCOS = Path.home() / ".config" / "orquestrador" / "esteiras"
 
 ESQUEMA_SQL = """
 CREATE TABLE esquema (versao INTEGER NOT NULL);
-INSERT INTO esquema (versao) VALUES (1);
+INSERT INTO esquema (versao) VALUES (2);
 
 CREATE TABLE config (
   chave TEXT PRIMARY KEY,
@@ -128,6 +132,12 @@ CREATE TABLE unidade (
                           -- consumido pelo primeiro recolhimento, para uma
                           -- unidade liberada não contar falta antes de ter
                           -- a chance de ser despachada de novo
+  vigia_falhas  INTEGER NOT NULL DEFAULT 0,   -- falhas SEGUIDAS do `gh` nesta
+                          -- unidade (OA-08); zera na primeira consulta que
+                          -- responde
+  pr_draft      INTEGER NOT NULL DEFAULT 0,   -- `isDraft` da última consulta
+                          -- do vigia (OA-08) — só para o quadro mostrar
+                          -- "rascunho"; nunca decide transição
   criado_em     TEXT NOT NULL,
   atualizado_em TEXT NOT NULL
 );
@@ -226,17 +236,22 @@ def criar_banco(caminho: Path, *, forcar: bool = False) -> sqlite3.Connection:
 
 
 def _migrar(con: sqlite3.Connection, de_versao: int) -> None:
-    """Aplica as migrações em ordem, dentro da MESMA transação da abertura.
+    """Aplica as migrações em ordem, dentro da MESMA transação da abertura —
+    nunca `--forcar`, que apagaria o estado de gente de verdade.
 
-    Não existe migração ainda — a única versão até agora é a 1. O ponto de
-    entrada já existe porque um esquema que só sabe nascer na versão mais
-    recente é um esquema que vai forçar `--forcar` na primeira mudança de
-    campo, e isso apaga o estado de gente de verdade.
+    1 → 2 (OA-08): `unidade` ganha `vigia_falhas` e `pr_draft`, que o vigia
+    de PR precisa para não confundir uma falha de rede com três seguidas, e
+    para o quadro distinguir PR rascunho de PR pedindo revisão de verdade.
     """
-    raise ErroEstado(
-        f"banco na versão {de_versao}, e este binário não tem migração "
-        f"cadastrada para chegar à {VERSAO_ESQUEMA}. Isto não deveria "
-        f"acontecer com a única versão existente — o banco está incoerente.")
+    if de_versao == 1:
+        con.execute("ALTER TABLE unidade ADD COLUMN vigia_falhas INTEGER NOT NULL DEFAULT 0")
+        con.execute("ALTER TABLE unidade ADD COLUMN pr_draft INTEGER NOT NULL DEFAULT 0")
+        con.execute("UPDATE esquema SET versao = 2")
+        de_versao = 2
+    if de_versao != VERSAO_ESQUEMA:
+        raise ErroEstado(
+            f"banco na versão {de_versao}, e este binário não tem migração "
+            f"cadastrada para chegar à {VERSAO_ESQUEMA}.")
 
 
 def abrir_banco(caminho: Path) -> sqlite3.Connection:
@@ -478,7 +493,7 @@ def cmd_init(cfg, args):
     valores = {
         "name": nome, "repo": str(repo), "base_branch": args.base,
         "worktree_root": str(worktrees), "list_id": args.lista or "",
-        "github_repo": args.github or "",
+        "github_repo": args.github or "", "interval_seconds": "60",
     }
     with transacao(caminho) as con:
         for chave, valor in valores.items():
@@ -1000,7 +1015,12 @@ def classificar(con: sqlite3.Connection) -> list:
             linhas.append({"unidade": u, "estado": "running" if viva else "stalled",
                            "motivo": "sessão viva" if viva else "sem sessão viva"})
         elif u["status"] == "revisao":
-            motivo = f"PR #{u['pr_numero']}" if u["pr_numero"] else "aguardando abertura do PR"
+            if not u["pr_numero"]:
+                motivo = "aguardando abertura do PR"
+            elif u["pr_draft"]:
+                motivo = f"PR #{u['pr_numero']} — rascunho, ainda não pede revisão"
+            else:
+                motivo = f"PR #{u['pr_numero']}"
             linhas.append({"unidade": u, "estado": "revisao", "motivo": motivo})
         elif u["status"] == "bloqueado":
             linhas.append({"unidade": u, "estado": "bloqueado", "motivo": u["motivo"] or ""})
@@ -1249,13 +1269,168 @@ def _pr_existe(github_repo: str | None, numero: int) -> bool:
     return r.returncode == 0
 
 
+# ---------------------------------------------------------------- estado — vigia de PR
+# (OA-08)
+#
+# revisão → pronto é a única transição que nenhuma sessão pode fazer: quando
+# o humano funde o PR, a sessão daquela unidade já morreu. Alguém precisa
+# perguntar ao GitHub — por `gh`, a cada ciclo do laço (`cmd_loop`, mais
+# abaixo). Ver docs/specs/orquestrador-agil/OA-08-vigia-de-pr-no-laco.md.
+
+LIMIAR_VIGIA_ALERTA = 3   # falhas SEGUIDAS do `gh` na mesma unidade que escalam
+
+
+def _consultar_pr(github_repo: str, numero: int) -> tuple[dict | None, str | None]:
+    """Uma chamada `gh pr view --json` por PR. Devolve (info, None) num
+    sucesso, ou (None, motivo) em qualquer falha — rede, autenticação, `gh`
+    respondendo algo que não é o JSON esperado."""
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(numero), "--repo", github_repo, "--json",
+             "state,mergedAt,mergeCommit,reviewDecision,isDraft,updatedAt"],
+            capture_output=True, text=True, timeout=20)
+    except Exception as e:
+        return None, str(e)[:200]
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout or "gh falhou").strip()[:200]
+    try:
+        return json.loads(r.stdout), None
+    except Exception as e:
+        return None, f"resposta do gh ilegível: {e}"
+
+
+def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
+    """Uma consulta ao `gh` por unidade em `revisao` com PR aberto, e as
+    transições que a resposta dispara (tabela do spec). Roda DENTRO da
+    transação que o chamador já abriu — mas NUNCA faz I/O lento aqui dentro
+    (teardown de ambiente, `git worktree remove`): devolve, para cada unidade
+    que virou `pronto`, o que o chamador precisa para fazer isso DEPOIS de
+    fechar a transação (mesma regra de `recolher_sessoes_mortas`).
+
+    Erro do `gh` nunca move unidade — rede instável não pode bloquear
+    trabalho revisado, e um `gh` desautenticado não pode virar a esteira
+    inteira `bloqueado`. Cada falha grava `vigia_falhou`; três SEGUIDAS na
+    mesma unidade escalam para `vigia_alerta`, ainda sem mover nada.
+    """
+    achados = []
+    if not github_repo:
+        return achados
+    tem_gh = shutil.which("gh") is not None
+    for u in con.execute(
+            "SELECT id, chave, pr_numero, vigia_falhas FROM unidade "
+            "WHERE status = 'revisao' AND pr_numero IS NOT NULL"):
+        if tem_gh:
+            info, erro = _consultar_pr(github_repo, u["pr_numero"])
+        else:
+            info, erro = None, "`gh` não está na PATH"
+        if erro:
+            n = u["vigia_falhas"] + 1
+            con.execute("UPDATE unidade SET vigia_falhas = ? WHERE id = ?", (n, u["id"]))
+            registrar_evento(con, u["id"], "vigia_falhou", texto=erro)
+            if n == LIMIAR_VIGIA_ALERTA:
+                registrar_evento(con, u["id"], "vigia_alerta",
+                                 texto=f"{n} falhas seguidas do vigia: {erro}")
+            achados.append({"chave": u["chave"], "desfecho": "falhou", "detalhe": erro})
+            continue
+        if u["vigia_falhas"]:
+            con.execute("UPDATE unidade SET vigia_falhas = 0 WHERE id = ?", (u["id"],))
+        con.execute("UPDATE unidade SET pr_draft = ? WHERE id = ?",
+                   (1 if info.get("isDraft") else 0, u["id"]))
+        if info.get("isDraft"):
+            achados.append({"chave": u["chave"], "desfecho": "rascunho"})
+            continue
+        sessao = con.execute(
+            "SELECT worktree, branch FROM sessao WHERE unidade_id = ? "
+            "ORDER BY id DESC LIMIT 1", (u["id"],)).fetchone()
+        if info.get("state") == "MERGED":
+            transicionar(con, u["id"], "pronto", tipo_evento="pr_fundido",
+                        motivo=f"PR #{u['pr_numero']} fundido")
+            achados.append({"chave": u["chave"], "desfecho": "pronto", "unidade_id": u["id"],
+                            "worktree": sessao["worktree"] if sessao else None,
+                            "branch": sessao["branch"] if sessao else None})
+        elif info.get("reviewDecision") == "CHANGES_REQUESTED":
+            transicionar(con, u["id"], "em_progresso", tipo_evento="pr_devolvido",
+                        motivo="revisão pediu mudanças")
+            achados.append({"chave": u["chave"], "desfecho": "em_progresso"})
+        elif info.get("state") == "CLOSED":
+            transicionar(con, u["id"], "bloqueado", tipo_evento="pr_fechado",
+                        motivo="PR fechado sem merge")
+            achados.append({"chave": u["chave"], "desfecho": "bloqueado"})
+        # OPEN sem novidade: nenhuma transição, nenhum achado.
+    return achados
+
+
+def _concluir_merge(caminho: Path, repo: str | None, nome_esteira: str, achado: dict) -> str:
+    """O que acontece em `pronto`, fora da transação que já gravou a
+    transição (docker compose pode levar até dois minutos — segurar o lock
+    de escrita por isso seria o mesmo erro que a migração para SQLite
+    corrigiu). Nesta ordem, sempre: encerramento fixo → evento → artefatos →
+    worktree e branch local removidos. Se o encerramento falhar, a worktree
+    NÃO é removida e fica para `orq sweep` cobrar."""
+    uid, chave = achado["unidade_id"], achado["chave"]
+    wt = Path(achado["worktree"]) if achado.get("worktree") else None
+    falhas_td = encerramento_fixo(wt) if wt is not None else []
+    with transacao(caminho) as con:
+        registrar_evento(con, uid, "teardown_falhou" if falhas_td else "teardown_ok",
+                         texto="; ".join(falhas_td))
+    arquivar_artefatos(nome_esteira, uid, chave, "pr_fundido")
+    if not falhas_td and wt is not None and wt.exists() and repo:
+        subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
+                       capture_output=True)
+        if achado.get("branch"):
+            subprocess.run(["git", "-C", repo, "branch", "-D", achado["branch"]],
+                           capture_output=True)
+    if falhas_td:
+        return (f"{C['yel']}!{C['r']} {chave}: pronto, mas o encerramento do ambiente "
+                f"falhou; worktree NÃO removida: {'; '.join(falhas_td)}")
+    return f"{C['grn']}✓{C['r']} {chave}: pronto"
+
+
 def cmd_advance(cfg, args):
-    """em_progresso → revisão. Confere que o PR existe de verdade — a única
-    chamada de rede do motor fora do vigia. A worktree SOBREVIVE (retrabalho
-    de OA-09 pode reusá-la); só a sessão de agente encerra."""
+    """em_progresso → revisão com --pr. Confere que o PR existe de verdade —
+    a única chamada de rede do motor fora do vigia. A worktree SOBREVIVE
+    (retrabalho de OA-09 pode reusá-la); só a sessão de agente encerra.
+
+    revisão → pronto com --forcar, sem chamada de rede nenhuma: a saída
+    manual para o merge feito fora do fluxo automático (squash local, merge
+    na mão) que o vigia (OA-08) nunca veria como `MERGED` — sem ela a
+    unidade ficaria em 'revisao' para sempre e travaria a cadeia de
+    dependência."""
     caminho = Path(args.db)
     con = abrir_banco(caminho)
-    _resolver_unidade_id(con, args.chave)   # valida cedo, antes da chamada de rede
+    uid = _resolver_unidade_id(con, args.chave)
+    status_atual = con.execute(
+        "SELECT status FROM unidade WHERE id = ?", (uid,)).fetchone()["status"]
+
+    if args.forcar:
+        if status_atual != "revisao":
+            con.close()
+            die(f"{args.chave} está '{status_atual}', não 'revisao'. --forcar fecha "
+                f"uma revisão fundida fora do fluxo automático — não serve para "
+                f"outra transição.")
+        pr_numero = con.execute(
+            "SELECT pr_numero FROM unidade WHERE id = ?", (uid,)).fetchone()["pr_numero"]
+        repo = obter_config(con, "repo")
+        nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+        sessao = con.execute(
+            "SELECT worktree, branch FROM sessao WHERE unidade_id = ? "
+            "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+        con.close()
+        with transacao(caminho) as con2:
+            uid2 = _resolver_unidade_id(con2, args.chave)
+            motivo = (f"PR #{pr_numero} fundido fora do fluxo (--forcar)"
+                     if pr_numero else "fundido fora do fluxo (--forcar)")
+            transicionar(con2, uid2, "pronto", tipo_evento="pr_fundido_manual", motivo=motivo)
+        achado = {"unidade_id": uid, "chave": args.chave,
+                 "worktree": sessao["worktree"] if sessao else None,
+                 "branch": sessao["branch"] if sessao else None}
+        print(_concluir_merge(caminho, repo, nome_esteira, achado))
+        return
+
+    if not args.pr:
+        con.close()
+        die("--pr é obrigatório (ou use --forcar numa unidade já em 'revisao' "
+            "fundida fora do fluxo automático).")
     numero, url = _numero_e_url_do_pr(con, args.pr)
     github_repo = obter_config(con, "github_repo")
     con.close()
@@ -1285,16 +1460,34 @@ def cmd_advance(cfg, args):
 
 
 def cmd_tick(cfg, args):
-    """SÓ recolhe sessão morta. Preencher vaga (o laço autônomo de verdade)
-    não existe ainda — `orq run`/`orq dispatch` são manuais nesta unidade."""
+    """Vigia os PRs em `revisao` primeiro (OA-08) — um merge detectado neste
+    ciclo libera dependente já no `board` seguinte — e só depois recolhe
+    sessão morta. Preencher vaga continua fora daqui: é `orq run`/`orq
+    dispatch`, ou `orq loop`, que encadeia os três."""
     caminho = Path(args.db)
     con = abrir_banco(caminho)
     max_strikes = int(obter_config(con, "max_strikes", "2") or 2)
     repo = obter_config(con, "repo")
+    github_repo = obter_config(con, "github_repo")
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
     con.close()
+
+    with transacao(caminho) as con:
+        achados = vigiar_prs(con, github_repo)
+    for a in achados:
+        if a["desfecho"] == "pronto":
+            print(_concluir_merge(caminho, repo, nome_esteira, a))
+        elif a["desfecho"] == "em_progresso":
+            print(f"  {C['yel']}↺{C['r']} {a['chave']}: revisão pediu mudanças")
+        elif a["desfecho"] == "bloqueado":
+            print(f"  {C['red']}✗{C['r']} {a['chave']}: PR fechado sem merge")
+        elif a["desfecho"] == "falhou":
+            print(f"  {C['red']}!{C['r']} {a['chave']}: vigia falhou — {a['detalhe']}")
+        # rascunho: silencioso aqui — aparece no `orq board`.
+
     with transacao(caminho) as con:
         recolhidas = recolher_sessoes_mortas(con, max_strikes)
-    if not recolhidas:
+    if not recolhidas and not achados:
         print("nada para recolher.")
         return
     for r in recolhidas:
@@ -1831,6 +2024,124 @@ def cmd_dispatch(cfg, args):
             print(f"  {C['red']}pulou {r['chave']}{C['r']}")
 
 
+# ---------------------------------------------------------------- estado — laço
+# autônomo (OA-08)
+#
+# A ordem de cada ciclo é proposital: vigia PRs primeiro, porque um merge
+# detectado agora pode liberar uma dependente que este MESMO ciclo já pode
+# despachar — em vez de esperar o próximo. Só depois recolhe sessão morta e
+# preenche vaga. `orq tick` continua fazendo só as duas primeiras peças
+# (nunca despacha sozinho); é `orq loop` que encadeia as três.
+
+IDLE_CICLOS_PARA_PARAR = 20   # ver "Riscos" do spec: revisão conta como vivo
+
+
+def _intervalo_efetivo(con: sqlite3.Connection, explicito: int | None) -> int:
+    """`explicito` vem de `--interval` — `None` quando a flag não foi dada
+    (default 0 confundiria "não passei" com "passei 0 de propósito")."""
+    if explicito is not None:
+        return explicito
+    return int(obter_config(con, "interval_seconds", "60") or 60)
+
+
+def _preencher_vaga(con: sqlite3.Connection, caminho: Path) -> list[str]:
+    """A parte de `cmd_dispatch` que não pergunta nada — o laço já decidiu
+    rodar sozinho ao chamar `orq loop`; pedir confirmação a cada ciclo
+    travaria exatamente o automatismo que o laço existe para dar."""
+    prontas = unidades_prontas(con)
+    vagas = capacidade(con)["slots_free"]
+    linhas = []
+    for r in prontas[:max(0, vagas)]:
+        try:
+            how = launch(con, caminho, r, attach=False)
+        except SystemExit:
+            linhas.append(f"  {C['red']}pulou {r['chave']}{C['r']}")
+            continue
+        with transacao(caminho) as con2:
+            uid2 = con2.execute(
+                "SELECT id FROM unidade WHERE chave = ?", (r["chave"],)).fetchone()["id"]
+            transicionar(con2, uid2, "em_progresso", tipo_evento="despachada")
+        linhas.append(f"  {C['grn']}▶{C['r']} {r['chave']} — {how}")
+    return linhas
+
+
+def _trabalho_vivo(con: sqlite3.Connection) -> bool:
+    """Ocioso é o laço esperando UMA PESSOA — nunca esperando a si mesmo.
+    Sessão viva conta; unidade em `revisao` TAMBÉM conta desde OA-08: o gate
+    humano faz 'nada vivo' virar comum, e sem esta correção o laço morre
+    enquanto só falta alguém revisar um PR."""
+    em_progresso = con.execute(
+        "SELECT id FROM unidade WHERE status = 'em_progresso'").fetchall()
+    if any(sessao_viva(con, u["id"]) for u in em_progresso):
+        return True
+    return con.execute(
+        "SELECT 1 FROM unidade WHERE status = 'revisao' LIMIT 1").fetchone() is not None
+
+
+def cmd_loop(cfg, args):
+    """O laço autônomo: vigia PRs → recolhe sessão morta → preenche vaga, a
+    cada `interval_seconds` (padrão 60s). Para depois de
+    `IDLE_CICLOS_PARA_PARAR` ciclos sem nada vivo e sem nada mudar — é
+    esperar um humano para sempre em silêncio que este limite evita."""
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    interval = _intervalo_efetivo(con, args.interval)
+    github_repo = obter_config(con, "github_repo")
+    repo = obter_config(con, "repo")
+    max_strikes = int(obter_config(con, "max_strikes", "2") or 2)
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+    con.close()
+
+    print(f"{C['b']}laço autônomo{C['r']}  {C['d']}intervalo {interval}s · "
+          f"Ctrl-C para parar{C['r']}")
+    idle = 0
+    while True:
+        moveu = False
+
+        with transacao(caminho) as con:
+            achados = vigiar_prs(con, github_repo)
+        for a in achados:
+            if a["desfecho"] == "pronto":
+                print(_concluir_merge(caminho, repo, nome_esteira, a))
+                moveu = True
+            elif a["desfecho"] in ("em_progresso", "bloqueado"):
+                print(f"  {C['yel']}↺{C['r']} {a['chave']}: {a['desfecho']}")
+                moveu = True
+            elif a["desfecho"] == "falhou":
+                print(f"  {C['red']}!{C['r']} {a['chave']}: vigia falhou — {a['detalhe']}")
+
+        with transacao(caminho) as con:
+            recolhidas = recolher_sessoes_mortas(con, max_strikes)
+        for r in recolhidas:
+            moveu = True
+            print(f"  {r['chave']}: {r['desfecho']}")
+            if r["desfecho"] == "quarentena" and r.get("worktree"):
+                wt = Path(r["worktree"])
+                falhas_td = encerramento_fixo(wt)
+                if not falhas_td and wt.exists() and repo:
+                    subprocess.run(["git", "-C", repo, "worktree", "remove",
+                                    "--force", str(wt)], capture_output=True)
+
+        con = abrir_banco(caminho)
+        for linha in _preencher_vaga(con, caminho):
+            print(linha)
+            moveu = True
+        vivo = _trabalho_vivo(con)
+        con.close()
+
+        print(f"{time.strftime('%H:%M:%S')}  "
+              + (f"{C['d']}sem mudança{C['r']}" if not moveu else "seguindo"))
+
+        idle = 0 if (moveu or vivo) else idle + 1
+        if idle >= IDLE_CICLOS_PARA_PARAR:
+            print(f"\n{C['yel']}{idle} ciclos sem nada vivo e sem nada avançar — "
+                 f"laço parado. Veja `orq board`.{C['r']}")
+            with transacao(caminho) as con:
+                registrar_evento(con, None, "laco_parado", texto=f"{idle} ciclos ociosos")
+            return
+        time.sleep(interval)
+
+
 def cmd_attach(cfg, args):
     con = abrir_banco(Path(args.db))
     uid = _resolver_unidade_id(con, args.chave)
@@ -2199,9 +2510,15 @@ def main():
     s = add("show", cmd_show, "detalhes da unidade: status, dependências, PR, eventos",
             banco=True)
     s.add_argument("chave")
-    s = add("advance", cmd_advance, "PR aberto → 'revisão' (o agente chama ao terminar)",
+    s = add("advance", cmd_advance,
+            "PR aberto → 'revisão' (--pr) · revisão fundida fora do fluxo → 'pronto' (--forcar)",
             banco=True)
-    s.add_argument("chave"); s.add_argument("--pr", required=True, metavar="NUMERO|URL")
+    s.add_argument("chave")
+    s.add_argument("--pr", metavar="NUMERO|URL",
+                   help="número ou URL do PR — obrigatório sem --forcar")
+    s.add_argument("--forcar", action="store_true",
+                   help="fecha uma unidade em 'revisao' cujo PR foi fundido fora do "
+                        "fluxo automático (squash local, merge na mão)")
     s = add("hold", cmd_hold, "marca a unidade como bloqueada por decisão humana",
             banco=True)
     s.add_argument("chave"); s.add_argument("--motivo", required=True)
@@ -2213,7 +2530,8 @@ def main():
             banco=True)
     s.add_argument("chave")
     s.add_argument("--forcar", action="store_true", help="obrigatório — confirma a reabertura")
-    s = add("tick", cmd_tick, "recolhe sessão morta (isto NÃO despacha)", banco=True)
+    s = add("tick", cmd_tick,
+            "vigia PR (OA-08) e recolhe sessão morta — isto NÃO despacha", banco=True)
 
     # ---- OA-05: o lançador de verdade — worktree, briefing único, tmux/
     # processo, encerramento sem lançador (hold/advance já arquivam e matam a
@@ -2228,6 +2546,11 @@ def main():
     s.add_argument("-n", type=int, default=0)
     s.add_argument("-y", "--yes", action="store_true")
     add("capacity", cmd_capacity, "vagas livres para lançar sessão agora", banco=True)
+    s = add("loop", cmd_loop,
+            "laço autônomo: vigia PR, recolhe sessão morta, preenche vaga (OA-08)",
+            banco=True)
+    s.add_argument("--interval", type=int, default=None,
+                   help="segundos entre ciclos — sobrepõe interval_seconds (padrão 60)")
     s = add("attach", cmd_attach, "entra na sessão (tmux) de uma unidade", banco=True)
     s.add_argument("chave")
     s = add("log", cmd_log, "lê o log da sessão de uma unidade", banco=True)

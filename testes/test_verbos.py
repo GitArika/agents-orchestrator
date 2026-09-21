@@ -70,6 +70,13 @@ class Init(ComRepoDeMentira):
         self.assertIn("base_branch = main", r.stdout)
         self.assertIn("github_repo = acme/smoke", r.stdout)
 
+    def test_interval_seconds_nasce_em_60(self):
+        """Cadência do vigia de PR (OA-08): 60s por padrão, sem precisar de
+        `config set`."""
+        self._init()
+        r = orq(self.db, "config", "get", "interval_seconds")
+        self.assertEqual(r.stdout.strip(), "60")
+
     def test_recusa_sobrescrever_sem_forcar(self):
         self._init()
         r = orq(self.db, "init", "--nome", "smoke", "--repo", str(self.repo),

@@ -31,6 +31,10 @@ FAKE_GH = RAIZ / "testes" / "fixtures" / "bin"
 # de verdade, mesmo que a máquina tenha credenciais reais configuradas — o
 # vigia e o laço geram vários eventos roteados (pr_fundido, bloqueada...).
 os.environ.setdefault("ORQ_NOTIFY_CMD", str(FAKE_GH / "orq-avisar"))
+# `orq-clickup` de mentira (OA-07): idem — o real é Node.js e precisa de
+# credencial e rede; `_concluir_merge` chama `set-status ... pronto` a cada
+# merge.
+os.environ.setdefault("ORQ_CLICKUP_CMD", str(FAKE_GH / "orq-clickup"))
 
 _loader = importlib.machinery.SourceFileLoader("orq", str(ORQ_BIN))
 _spec = importlib.util.spec_from_loader("orq", _loader)

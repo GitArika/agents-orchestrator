@@ -36,7 +36,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | [OA-04](OA-04-motor-sem-clickup.md) | O motor deixa de falar com o ClickUp | P0 | OA-03 | concluído (`bin/orq`: 4187→1597 linhas) |
 | [OA-05](OA-05-papel-unico-auto-contido.md) | O papel único auto-contido | P0 | OA-03, OA-04 | concluído (`bin/orq`, `testes/test_lancador.py`) |
 | [OA-06](OA-06-cerca-do-papel-unico.md) | A cerca do papel único | P0 | OA-05 | concluído (`hooks/cerca.sh`, `testes/cerca.sh`) |
-| [OA-07](OA-07-espelho-de-cinco-status-no-clickup.md) | Espelho de cinco status no ClickUp | P1 | OA-04, OA-05 | não iniciado |
+| [OA-07](OA-07-espelho-de-cinco-status-no-clickup.md) | Espelho de cinco status no ClickUp | P1 | OA-04, OA-05 | concluído (`bin/orq`, `bin/orq-clickup`, `testes/test_espelho.py`, `testes/test_padronizar.py`) |
 | [OA-08](OA-08-vigia-de-pr-no-laco.md) | O vigia de PR dentro do laço | P0 | OA-03, OA-05 | concluído (`bin/orq`, `testes/test_vigia.py`) |
 | [OA-09](OA-09-retrabalho-a-partir-do-pr.md) | Retrabalho a partir do PR | P1 | OA-05, OA-08 | concluído (`bin/orq`, `testes/test_retrabalho.py`) |
 | [OA-10](OA-10-telegram-como-destino.md) | Telegram como destino de aviso | P1 | — | concluído (`bin/orq-avisar`, `testes/test_avisar.py`) |

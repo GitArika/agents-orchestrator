@@ -24,12 +24,15 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
   estado (SQLite)          esquema, transação, versionamento — o núcleo (OA-01)
   estado — verbos          init/task/dep/config/export/validate (OA-02)
   estado — máquina         as cinco transições legais, sessão viva, fila de
-  de cinco estados         despacho, board/next/status/show, hold/release/
+  de cinco estados         despacho, board/next/status/show (com o ⚠ de
+                           espelho divergente — OA-07), hold/release/
                            reopen/advance/tick (OA-03)
-  estado — sessão e        worktree, briefing único, cerca, capacidade,
-  lançamento               run/dispatch/attach/log/stop (OA-05)
+  estado — sessão e        worktree, briefing único (contrato do ClickUp —
+  lançamento               OA-07), cerca, capacidade, run/dispatch/attach/
+                           log/stop (OA-05)
   estado — vigia de PR     consulta ao gh, transições que ela dispara,
-                           encerramento em 'pronto' (OA-08)
+                           encerramento em 'pronto' e o espelho no ClickUp
+                           (OA-07/OA-08)
   estado — roteamento      uma origem só (transacao()) para todo aviso —
   de avisos                roteamento, antirrepetição, avisos_silenciados
                            (OA-11)
@@ -1116,6 +1119,16 @@ ORDEM_ESTADO = {"stalled": 0, "bloqueado": 1, "revisao": 2, "running": 3,
                "ready": 4, "blocked": 5, "pronto": 6}
 
 
+def _espelho_divergente(con: sqlite3.Connection, unidade_id: int) -> bool:
+    """`orq board` marca ⚠ (OA-07) quando o `espelho_falhou` mais recente
+    desta unidade é mais novo que o `espelho_ok` mais recente — o cartão do
+    ClickUp pode estar mentindo, e sem este sinal ninguém percebe."""
+    row = con.execute(
+        "SELECT tipo FROM evento WHERE unidade_id = ? AND tipo IN "
+        "('espelho_falhou', 'espelho_ok') ORDER BY id DESC LIMIT 1", (unidade_id,)).fetchone()
+    return row is not None and row["tipo"] == "espelho_falhou"
+
+
 def classificar(con: sqlite3.Connection) -> list:
     """Para cada unidade, o rótulo de leitura e o motivo — SEMPRE calculado,
     nunca gravado. É o que faz 'pronta' e 'travada por dependência' conviverem
@@ -1125,20 +1138,24 @@ def classificar(con: sqlite3.Connection) -> list:
     prontas_ids = {u["id"] for u in unidades_prontas(con)}
     linhas = []
     for u in unidades:
+        divergente = _espelho_divergente(con, u["id"])
         if u["status"] == "backlog":
             if u["id"] in prontas_ids:
-                linhas.append({"unidade": u, "estado": "ready", "motivo": "pronta para começar"})
+                linhas.append({"unidade": u, "estado": "ready", "motivo": "pronta para começar",
+                               "espelho_divergente": divergente})
             else:
                 faltando = con.execute(
                     "SELECT dep.chave, dep.status FROM dependencia d "
                     "JOIN unidade dep ON dep.id = d.depende_de "
                     "WHERE d.unidade_id = ? AND dep.status != 'pronto'", (u["id"],)).fetchall()
                 nomes = ", ".join(f"{d['chave']} ({d['status']})" for d in faltando)
-                linhas.append({"unidade": u, "estado": "blocked", "motivo": f"espera: {nomes}"})
+                linhas.append({"unidade": u, "estado": "blocked", "motivo": f"espera: {nomes}",
+                               "espelho_divergente": divergente})
         elif u["status"] == "em_progresso":
             viva = sessao_viva(con, u["id"])
             linhas.append({"unidade": u, "estado": "running" if viva else "stalled",
-                           "motivo": "sessão viva" if viva else "sem sessão viva"})
+                           "motivo": "sessão viva" if viva else "sem sessão viva",
+                           "espelho_divergente": divergente})
         elif u["status"] == "revisao":
             if not u["pr_numero"]:
                 motivo = "aguardando abertura do PR"
@@ -1146,11 +1163,14 @@ def classificar(con: sqlite3.Connection) -> list:
                 motivo = f"PR #{u['pr_numero']} — rascunho, ainda não pede revisão"
             else:
                 motivo = f"PR #{u['pr_numero']}"
-            linhas.append({"unidade": u, "estado": "revisao", "motivo": motivo})
+            linhas.append({"unidade": u, "estado": "revisao", "motivo": motivo,
+                           "espelho_divergente": divergente})
         elif u["status"] == "bloqueado":
-            linhas.append({"unidade": u, "estado": "bloqueado", "motivo": u["motivo"] or ""})
+            linhas.append({"unidade": u, "estado": "bloqueado", "motivo": u["motivo"] or "",
+                           "espelho_divergente": divergente})
         elif u["status"] == "pronto":
-            linhas.append({"unidade": u, "estado": "pronto", "motivo": "concluída"})
+            linhas.append({"unidade": u, "estado": "pronto", "motivo": "concluída",
+                           "espelho_divergente": divergente})
     linhas.sort(key=lambda l: (ORDEM_ESTADO.get(l["estado"], 9), l["unidade"]["chave"]))
     return linhas
 
@@ -1229,7 +1249,10 @@ def cmd_board(cfg, args):
         u = l["unidade"]
         icone = ICONE_ESTADO.get(l["estado"], "❓")
         motivo = (l["motivo"] or "")[:70]
-        print(f"{icone} {u['chave']:<{largura}}  {u['status']:<12}  {motivo}")
+        # ⚠ (OA-07): o espelho no ClickUp pode estar mentindo — o cartão
+        # ainda diz o status velho porque a última escrita falhou.
+        aviso = f"{C['yel']}⚠{C['r']} " if l.get("espelho_divergente") else ""
+        print(f"{icone} {aviso}{u['chave']:<{largura}}  {u['status']:<12}  {motivo}")
 
 
 def cmd_next(cfg, args):
@@ -1451,8 +1474,8 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
         return achados
     tem_gh = shutil.which("gh") is not None
     for u in con.execute(
-            "SELECT id, chave, pr_numero, vigia_falhas, retrabalho, retrabalho_em "
-            "FROM unidade WHERE status = 'revisao' AND pr_numero IS NOT NULL"):
+            "SELECT id, chave, clickup_id, pr_numero, vigia_falhas, retrabalho, "
+            "retrabalho_em FROM unidade WHERE status = 'revisao' AND pr_numero IS NOT NULL"):
         if tem_gh:
             info, erro = _consultar_pr(github_repo, u["pr_numero"])
         else:
@@ -1480,6 +1503,7 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
             transicionar(con, u["id"], "pronto", tipo_evento="pr_fundido",
                         motivo=f"PR #{u['pr_numero']} fundido")
             achados.append({"chave": u["chave"], "desfecho": "pronto", "unidade_id": u["id"],
+                            "clickup_id": u["clickup_id"],
                             "worktree": sessao["worktree"] if sessao else None,
                             "branch": sessao["branch"] if sessao else None})
         elif info.get("reviewDecision") == "CHANGES_REQUESTED":
@@ -1509,19 +1533,47 @@ def vigiar_prs(con: sqlite3.Connection, github_repo: str | None) -> list[dict]:
     return achados
 
 
+def _entregador_clickup() -> str:
+    """`ORQ_CLICKUP_CMD` vence — mesma convenção de `ORQ_NOTIFY_CMD` (OA-11):
+    um único jeito de trocar o binário em toda a esteira."""
+    return os.environ.get("ORQ_CLICKUP_CMD") or str(ORQ_REPO / "bin" / "orq-clickup")
+
+
+def _espelhar_pronto(clickup_id: str | None) -> str | None:
+    """`orq-clickup set-status <id> "pronto"` (OA-07) — a única escrita do
+    MOTOR no ClickUp: quando o vigia detecta o merge, a sessão que escreveria
+    isso já morreu há tempo. Devolve `None` em sucesso, ou o erro em falha —
+    NUNCA levanta: um ClickUp fora do ar não pode travar a esteira."""
+    if not clickup_id:
+        return "unidade sem clickup_id — nada para espelhar"
+    try:
+        r = subprocess.run([_entregador_clickup(), "set-status", clickup_id, "pronto"],
+                           capture_output=True, text=True, timeout=25)
+    except Exception as e:
+        return str(e)[:200]
+    if r.returncode != 0:
+        return (r.stderr or r.stdout or "orq-clickup falhou").strip()[:200]
+    return None
+
+
 def _concluir_merge(caminho: Path, repo: str | None, nome_esteira: str, achado: dict) -> str:
     """O que acontece em `pronto`, fora da transação que já gravou a
     transição (docker compose pode levar até dois minutos — segurar o lock
     de escrita por isso seria o mesmo erro que a migração para SQLite
-    corrigiu). Nesta ordem, sempre: encerramento fixo → evento → artefatos →
-    worktree e branch local removidos. Se o encerramento falhar, a worktree
-    NÃO é removida e fica para `orq sweep` cobrar."""
+    corrigiu). Nesta ordem, sempre: encerramento fixo → evento → espelho no
+    ClickUp (OA-07) → artefatos → worktree e branch local removidos. Se o
+    encerramento falhar, a worktree NÃO é removida e fica para `orq sweep`
+    cobrar; se o espelho falhar, `orq board` marca ⚠ — nenhum dos dois
+    reverte a transição, que já aconteceu."""
     uid, chave = achado["unidade_id"], achado["chave"]
     wt = Path(achado["worktree"]) if achado.get("worktree") else None
     falhas_td = encerramento_fixo(wt) if wt is not None else []
+    erro_espelho = _espelhar_pronto(achado.get("clickup_id"))
     with transacao(caminho) as con:
         registrar_evento(con, uid, "teardown_falhou" if falhas_td else "teardown_ok",
                          texto="; ".join(falhas_td))
+        registrar_evento(con, uid, "espelho_falhou" if erro_espelho else "espelho_ok",
+                         texto=erro_espelho or "")
     arquivar_artefatos(nome_esteira, uid, chave, "pr_fundido")
     if not falhas_td and wt is not None and wt.exists() and repo:
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
@@ -1557,8 +1609,9 @@ def cmd_advance(cfg, args):
             die(f"{args.chave} está '{status_atual}', não 'revisao'. --forcar fecha "
                 f"uma revisão fundida fora do fluxo automático — não serve para "
                 f"outra transição.")
-        pr_numero = con.execute(
-            "SELECT pr_numero FROM unidade WHERE id = ?", (uid,)).fetchone()["pr_numero"]
+        u = con.execute(
+            "SELECT pr_numero, clickup_id FROM unidade WHERE id = ?", (uid,)).fetchone()
+        pr_numero = u["pr_numero"]
         repo = obter_config(con, "repo")
         nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
         sessao = con.execute(
@@ -1570,7 +1623,7 @@ def cmd_advance(cfg, args):
             motivo = (f"PR #{pr_numero} fundido fora do fluxo (--forcar)"
                      if pr_numero else "fundido fora do fluxo (--forcar)")
             transicionar(con2, uid2, "pronto", tipo_evento="pr_fundido_manual", motivo=motivo)
-        achado = {"unidade_id": uid, "chave": args.chave,
+        achado = {"unidade_id": uid, "chave": args.chave, "clickup_id": u["clickup_id"],
                  "worktree": sessao["worktree"] if sessao else None,
                  "branch": sessao["branch"] if sessao else None}
         print(_concluir_merge(caminho, repo, nome_esteira, achado))
@@ -1804,13 +1857,17 @@ Worktree: {worktree}  (branch {branch}, a partir de {base})
 Repositório: {repo}
 
 ────────────────────────────────────────────────────────────────────────────
-1. LEIA A TAREFA INTEIRA — antes de qualquer outra coisa
+1. MARQUE O CARTÃO E LEIA A TAREFA INTEIRA — antes de qualquer outra coisa
 
+    orq-clickup set-status {clickup_id} "em progresso"
     orq-clickup show {clickup_id}
 
-Isso imprime a descrição E todos os comentários, do mais antigo ao mais
-recente. Os comentários não são conversa paralela: é onde mora o que a
-descrição não tem.
+O status muda SEM comentário — o Telegram já avisa que a unidade começou, e
+um comentário a cada início vira ruído no cartão (OA-07).
+
+`orq-clickup show` imprime a descrição E todos os comentários, do mais
+antigo ao mais recente. Os comentários não são conversa paralela: é onde
+mora o que a descrição não tem.
 
   - Divergências entre a descrição e o código real, registradas por quem veio
     antes.
@@ -1890,16 +1947,26 @@ Encerrar sem nenhum dos dois deixa a unidade em 'em_progresso' sem sessão
 viva — a esteira lê isso como arranque falho e conta uma falta.
 
 ────────────────────────────────────────────────────────────────────────────
-8. SÓ DEPOIS, ATUALIZE O CARTÃO
+8. SÓ DEPOIS, ATUALIZE O CARTÃO — os dois lados do espelho (OA-07)
 
-    orq-clickup comment {clickup_id} --text "<resumo com o link do PR>"
+Se você abriu PR (`orq advance` no passo 7):
+
+    orq-clickup set-status {clickup_id} "revisão"
+    orq-clickup comment {clickup_id} "<URL do PR, os critérios de aceite com a
+        evidência do passo 4, e a saída da verificação do passo 5>"
+
+Se você travou (`orq hold` no passo 7):
+
+    orq-clickup set-status {clickup_id} "bloqueado"
+    orq-clickup comment {clickup_id} "AGUARDANDO DECISÃO HUMANA: <o mesmo
+        motivo que você passou a --motivo>"
 
 NESTA ORDEM, não na inversa: o banco (passo 7) é a autoridade da esteira; o
 cartão é só o espelho que uma pessoa lê. Se você morrer entre os dois passos,
 a divergência fica visível no lugar onde alguém olha — o cartão —, e o
-rastro do banco permite reconstruir o que houve. Comentar antes de encerrar
-deixaria o cartão dizendo "revisão" com a esteira ainda achando que ninguém
-trabalhou.
+rastro do banco permite reconstruir o que houve. Escrever o cartão antes de
+encerrar deixaria o cartão dizendo "revisão" com a esteira ainda achando que
+ninguém trabalhou.
 """
 
 

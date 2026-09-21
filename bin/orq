@@ -368,13 +368,6 @@ CREATE TABLE dependencia (
   CHECK (unidade_id <> depende_de)
 );
 
-CREATE TABLE portao (
-  id      INTEGER PRIMARY KEY,
-  tipo    TEXT NOT NULL CHECK (tipo IN ('setup','verify','teardown')),
-  ordem   INTEGER NOT NULL,
-  comando TEXT NOT NULL
-);
-
 -- Append-only: é o rastro. Nenhuma escrita aqui é apagada ou reescrita, só
 -- inserida — é o que permite reconstruir o que aconteceu quando o resto
 -- divergir (o cartão do ClickUp, uma pessoa perguntando "o que houve aqui?").

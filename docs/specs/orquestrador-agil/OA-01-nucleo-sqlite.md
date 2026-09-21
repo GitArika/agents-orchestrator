@@ -83,13 +83,6 @@ CREATE TABLE dependencia (
   CHECK (unidade_id <> depende_de)
 );
 
-CREATE TABLE portao (
-  id      INTEGER PRIMARY KEY,
-  tipo    TEXT NOT NULL CHECK (tipo IN ('setup','verify','teardown')),
-  ordem   INTEGER NOT NULL,
-  comando TEXT NOT NULL
-);
-
 CREATE TABLE evento (                          -- append-only; o rastro
   id         INTEGER PRIMARY KEY,
   unidade_id INTEGER REFERENCES unidade(id) ON DELETE SET NULL,
@@ -113,6 +106,14 @@ CREATE TABLE sessao (
 `base_branch`, `work_dir`, `worktree_root`, `branch_template`, `list_id`, `github_repo`,
 `max_concurrent`, `reserve_ram_gb`, `ram_per_session_gb`, `interval_seconds`, `max_strikes`,
 `max_rework`, `permission_mode`, `remote_control`, `model`, `verificacao_automatica`.
+
+**Nota de 22/09/2026, sobre esta tabela já implementada:** o esquema nasceu com uma tabela
+`portao` (setup/verify/teardown), removida aqui. Decisão posterior: o orquestrador deixa de
+se preocupar com gates — quem executa é o agente, seguindo o `CLAUDE.md` do próprio
+projeto (OA-02, OA-05). Teardown de ambiente continua existindo, mas como comando FIXO do
+orquestrador (a mesma busca por `docker-compose*.yml` para toda esteira), nunca declarado
+por unidade — não precisa de tabela. Como nada em produção usou a versão anterior do
+esquema (decisão de 21/09/2026: "começa limpo"), a remoção é direta, sem migração.
 
 ### A disciplina que faz a fila existir
 

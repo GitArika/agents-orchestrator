@@ -16,7 +16,8 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | Estado | **SQLite substitui o `pipeline.toml` por inteiro.** Um banco por esteira, em `~/.config/orquestrador/esteiras/<nome>.db` |
 | Concorrência | Transação com `BEGIN IMMEDIATE` + WAL + `busy_timeout`; a fila é o kernel, não um daemon |
 | ClickUp | O motor não fala mais com ele. Quem escreve no quadro é o agente, por `orq-clickup` |
-| Papéis | Um só, auto-contido: lê o cartão, implementa, roda os portões, abre o PR, atualiza o quadro |
+| Papéis | Um só, auto-contido: lê o cartão, implementa, roda a verificação do próprio `CLAUDE.md`, abre o PR, atualiza o quadro |
+| Gates | O orquestrador **deixa de se preocupar com eles**. Setup e verify são responsabilidade do agente, seguindo o `CLAUDE.md`/`AGENTS.md` que o projeto já declara — não configuração da esteira. Teardown de ambiente continua com o orquestrador, mas vira comando fixo (`docker-compose*.yml` → `down`), nunca declarado por esteira. Decisão de 22/09/2026 |
 | Status | `backlog`, `em_progresso`, `revisao`, `pronto`, `bloqueado` — e o ClickUp espelha os cinco com o mesmo nome |
 | Merge | Gate **humano**. Nenhum agente funde; a cerca barra `gh pr merge` sem exceção |
 | PR devolvido | `CHANGES_REQUESTED` relança o agente com os comentários; PR fechado sem merge bloqueia |
@@ -133,6 +134,8 @@ errada, o conserto agora é barato.
 | 6 | O Telegram avisa **mais** do que os três eventos do requisito (inclui falha operacional) | OA-11 | `orq config set avisos <lista>` corta; os três do requisito nunca são cortáveis |
 | 7 | Não existe `orq import` — `orq export` é só de saída | OA-02 | Um caminho de volta reintroduziria o arquivo que a decisão eliminou |
 | 8 | A prova de ClickUp sai do `orq doctor` e vira `orq-clickup doctor` | OA-12 | Deixá-la fatal impediria despacho por indisponibilidade de ferramenta de gestão |
+| 9 | O encerramento fixo de ambiente só conhece Docker Compose (busca por `docker-compose*.yml`/`compose*.yml`) | OA-08 | Projeto que suba serviço por outro meio fica sem encerramento automático; o sinal aparece em `orq sweep`, não em silêncio |
+| 10 | `orq validate` exige `CLAUDE.md`/`AGENTS.md` na raiz do projeto — é o único lugar de onde o agente tira os portões agora | OA-02 | Projeto sem nenhum dos dois nunca teria portão nenhum; a recusa antecipa isso em vez de deixar o agente descobrir sozinho |
 
 ## A perda que esta entrega aceita
 

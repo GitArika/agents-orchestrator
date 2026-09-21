@@ -40,16 +40,26 @@ Mantém o que já provou valor e adapta o resto:
    ([bin/orq:813](../../../bin/orq:813)) é preservado quase palavra por palavra, trocando
    `orq show` por `orq-clickup show <id>`: descrição **e** todos os comentários. É o erro
    mais caro da esteira e continua sendo.
-2. **Preparo** — rodar os portões `setup` na worktree, que nasce sem dependências.
+2. **Preparo** — ler o `CLAUDE.md`/`AGENTS.md` do projeto e seguir o que ele manda para
+   deixar a worktree pronta (instalar dependências, subir o que for preciso). Decisão de
+   22/09/2026: **o orquestrador deixa de declarar portões.** `setup`, `verify` e `teardown`
+   saem do `pipeline.toml`/banco e viram inteiramente responsabilidade do agente, seguindo
+   as regras que o **próprio projeto** já documenta para qualquer sessão do Claude Code —
+   não uma cópia mantida à parte, que diverge do comando real (aprendizado nº 20: o erro
+   parecia do projeto e era da ferramenta, porque o comando declarado não era o comando
+   verdadeiro).
 3. **Implementar** com escopo fechado no cartão. Defeito fora de escopo vira comentário no
    cartão, não conserto.
 4. **Revisar o próprio trabalho** — e aqui o briefing precisa ser mais duro do que era,
    porque não há segunda leitura: para cada critério de aceite, a evidência (arquivo e
    linha, ou saída de comando). Critério sem evidência **não** está atendido, e o caminho
    é travar, não afirmar.
-5. **Portões `verify` verdes**, rodados por ele, com a saída colada no PR.
+5. **Rodar a verificação que o `CLAUDE.md` manda** (tipo, lint, teste — o que o projeto
+   declarar) e colar a saída no PR. Se o `CLAUDE.md` não disser como verificar, isso não é
+   "sem portão" — é um projeto sem guia, e o agente registra isso no PR em vez de inventar
+   um comando.
 6. **Commit e PR** — `git push -u origin <branch>` e `gh pr create`. O corpo do PR carrega:
-   critérios de aceite com evidência, saída dos portões, o que ficou fora e por quê.
+   critérios de aceite com evidência, saída da verificação, o que ficou fora e por quê.
    **Não funde.** `gh pr merge` é barrado pela cerca (OA-06) e o briefing diz isso com
    todas as letras, porque ordem que a cerca proíbe não é ordem — o aprendizado do
    `--delete-branch` ([bin/orq:1021](../../../bin/orq:1021)) custou três sessões.
@@ -82,8 +92,9 @@ olha, e o rastro do banco permite recompor. A ordem inversa deixaria o cartão d
 
 A worktree **sobrevive** à transição para `revisao`: o humano pode pedir mudanças e o agente
 é relançado nela (OA-09). Ela só é encerrada quando a unidade chega a `pronto` ou
-`bloqueado` — aí roda `teardown`, arquiva os artefatos e a worktree é removida. O branch
-remoto fica, como hoje, e quem o remove é o ajuste do repositório ou uma pessoa.
+`bloqueado` — aí o orquestrador roda o encerramento de ambiente fixo (não mais um portão
+declarado; ver OA-08), arquiva os artefatos e a worktree é removida. O branch remoto fica,
+como hoje, e quem o remove é o ajuste do repositório ou uma pessoa.
 
 A worktree continua nascendo de `origin/<base>` com `fetch` antes
 ([bin/orq:1167](../../../bin/orq:1167)), e agora isso fica mais simples de raciocinar:

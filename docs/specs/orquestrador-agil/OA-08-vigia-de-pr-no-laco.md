@@ -48,7 +48,7 @@ webhook: webhook exigiria endereço acessível de fora, que a VPS e o Mac não t
 
 | Resposta do `gh` | Transição | Efeito colateral |
 | --- | --- | --- |
-| `state=MERGED` | `revisao → pronto` | roda `teardown`, arquiva artefatos, remove a worktree, escreve "pronto" no cartão (OA-07), libera dependentes |
+| `state=MERGED` | `revisao → pronto` | roda o encerramento fixo de ambiente, arquiva artefatos, remove a worktree, escreve "pronto" no cartão (OA-07), libera dependentes |
 | `reviewDecision=CHANGES_REQUESTED` | `revisao → em_progresso` | relança o agente com os comentários (OA-09) |
 | `state=CLOSED` e não fundido | `revisao → bloqueado` | motivo: "PR fechado sem merge"; avisa (OA-11) |
 | `state=OPEN`, nada novo | nenhuma | nada |
@@ -60,15 +60,26 @@ seguidas na mesma unidade geram um aviso, não uma transição.
 
 ### O que acontece em `pronto`
 
-1. `teardown` roda na worktree — o bloco obrigatório de
-   [modelos/pipeline.toml:155](../../../modelos/pipeline.toml:155), que existe porque 27
-   ambientes sobreviveram a uma noite segurando 8,8 GB;
+Decisão de 22/09/2026: **gates deixam de ser configuração da esteira** (OA-02) — `setup` e
+`verify` viram trabalho do agente seguindo o `CLAUDE.md` do projeto (OA-05). Teardown é
+diferente por natureza: quando o vigia detecta o merge, o agente já morreu há tempo — não
+há sessão viva para ler `CLAUDE.md` nenhum. É por isso que teardown continua sendo
+obrigação do orquestrador, mas vira um **comando fixo**, o mesmo para toda esteira, em vez
+de configuração declarada por projeto:
+
+1. **encerramento fixo**: para cada `docker-compose*.{yml,yaml}` ou `compose*.{yml,yaml}`
+   encontrado na raiz da worktree (a mesma busca que a skill `esteira-sandbox` já usa para
+   descobrir serviços), roda `docker compose -f <arquivo> down --volumes --remove-orphans`.
+   Nenhum arquivo encontrado não é falha — é "nada para encerrar". Existe porque 27
+   ambientes sobreviveram a uma noite segurando 8,8 GB, e continua sendo obrigatório
+   independente de qualquer coisa que o `CLAUDE.md` diga — o `CLAUDE.md` é do PROJETO, e o
+   projeto não tem por que saber que está rodando dentro de uma worktree descartável;
 2. artefatos vão para `archive/<esteira>/<unidade>-<ts>/` com `meta.json`, como hoje
    ([bin/orq:1326](../../../bin/orq:1326));
 3. a worktree é removida (`git worktree remove`), o branch **local** apagado, o **remoto
    fica** — quem remove branch fundido é o ajuste do repositório ou uma pessoa;
-4. se o teardown falhar, a worktree **não** é removida e o evento `teardown_falhou` fica
-   registrado para `orq sweep` cobrar.
+4. se o `docker compose down` falhar, a worktree **não** é removida e o evento
+   `teardown_falhou` fica registrado para `orq sweep` cobrar.
 
 ### `orq advance --forcar`
 
@@ -83,7 +94,9 @@ por fora ficaria em `revisao` para sempre e travaria a cadeia.
 | Merge vira `pronto` em ≤ 1 ciclo | Teste de integração com repositório de mentira: fundir o PR, rodar um tick → status `pronto` |
 | `pronto` libera dependente no MESMO ciclo | Unidade B depende de A; fundir o PR de A → no mesmo tick, B é despachada |
 | Teardown roda antes de arquivar | O evento `teardown_ok` tem carimbo anterior ao arquivamento |
-| Teardown falho preserva a worktree | Forçar falha → diretório continua lá, evento `teardown_falhou` gravado, `orq sweep` cobra |
+| Teardown falho preserva a worktree | Forçar falha no `docker compose down` → diretório continua lá, evento `teardown_falhou` gravado, `orq sweep` cobra |
+| Teardown é fixo, não declarado | Worktree sem nenhum `docker-compose*.yml` → nenhum comando roda, nenhuma falha, a worktree é removida normalmente |
+| Teardown encontra o compose em qualquer nome canônico | `compose.yaml`, `docker-compose.yml` e `docker-compose.override.yml` são todos encontrados e encerrados |
 | `gh` fora do ar não move nada | `PATH` sem `gh` → tick registra `vigia_falhou` e nenhum status muda |
 | PR fechado sem merge bloqueia | Fechar o PR → `bloqueado` com motivo legível |
 | A cadência é de 1 minuto | `orq config get interval_seconds` → 60; o rastro mostra ciclos ~60s |
@@ -101,3 +114,10 @@ por fora ficaria em `revisao` para sempre e travaria a cadeia.
 - **Draft PR.** PR aberto como rascunho não deveria contar como revisão pedida. O campo
   `isDraft` é consultado; rascunho é tratado como `OPEN` sem novidade, e o quadro mostra
   "rascunho" para a pessoa não esperar por um gate que ninguém pediu.
+- **Encerramento fixo só conhece Docker Compose.** Um projeto que suba ambiente por outro
+  meio (um `pnpm dev` em background, um banco instalado direto na worktree) não tem
+  cobertura — o comando fixo não encontra nada para encerrar e o processo continua vivo. É
+  a troca aceita ao tirar `teardown` da declaração por esteira: se isso doer na prática, o
+  sinal aparece em `orq sweep`/`orq host` (RAM presa sem processo conhecido), não em
+  silêncio. Convém que a skill `esteira-sandbox` continue recomendando Docker Compose como
+  o padrão, já que é o único que este encerramento sabe desligar.

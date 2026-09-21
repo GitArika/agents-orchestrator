@@ -79,13 +79,23 @@ class BancoNovo(unittest.TestCase):
         con2.close()
         self.assertEqual(n, 0)
 
-    def test_esquema_tem_as_cinco_tabelas_principais(self):
+    def test_esquema_tem_as_tabelas_principais(self):
         con = orq.criar_banco(self.caminho)
         nomes = {r["name"] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         con.close()
-        for esperado in ("unidade", "dependencia", "portao", "evento", "sessao", "config"):
+        for esperado in ("unidade", "dependencia", "evento", "sessao", "config"):
             self.assertIn(esperado, nomes)
+
+    def test_esquema_nao_tem_tabela_de_portao(self):
+        # Decisão de 22/09/2026: gates saem do orquestrador — quem executa é o
+        # agente, seguindo o CLAUDE.md do projeto. Não há mais nada para
+        # declarar aqui (ver docs/specs/orquestrador-agil/OA-02).
+        con = orq.criar_banco(self.caminho)
+        nomes = {r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        con.close()
+        self.assertNotIn("portao", nomes)
 
 
 class EstadoNuncaVoltaVazioEmSilencio(unittest.TestCase):

@@ -357,6 +357,10 @@ CREATE TABLE unidade (
   pr_url        TEXT,
   strikes       INTEGER NOT NULL DEFAULT 0,
   retrabalho    INTEGER NOT NULL DEFAULT 0,
+  solta_em      TEXT,     -- bilhete de uso único do `orq release` (OA-03):
+                          -- consumido pelo primeiro recolhimento, para uma
+                          -- unidade liberada não contar falta antes de ter
+                          -- a chance de ser despachada de novo
   criado_em     TEXT NOT NULL,
   atualizado_em TEXT NOT NULL
 );
@@ -1031,6 +1035,435 @@ def cmd_validate(cfg, args):
             print(f"{C['red']}✗{C['r']} {p}")
         sys.exit(1)
     print(f"{C['grn']}✓{C['r']} esteira coerente.")
+
+
+# ---------------------------------------------------------------- estado — máquina de
+# cinco estados (OA-03)
+#
+# Os quatro estágios (spec→implement→review→integrate) morrem. No lugar, CINCO
+# status — e a diferença não é cosmética: antes o estado era DERIVADO do
+# cruzamento entre ClickUp, TOML e processos vivos; agora o status é um CAMPO
+# GRAVADO, e o que se deriva é só o que pode ser conferido na hora (sessão
+# viva, dependência satisfeita). Ver
+# docs/specs/orquestrador-agil/OA-03-maquina-de-cinco-estados.md.
+#
+# `orq run` e `orq dispatch` FICAM DE FORA — despachar sem lançar (OA-05 ainda
+# não existe) seria um comando que promete e não faz; melhor não ter o verbo
+# do que ter um que mente.
+
+TRANSICOES_LEGAIS = {
+    "backlog":      {"em_progresso"},
+    "em_progresso": {"revisao", "bloqueado", "backlog"},
+    "revisao":      {"pronto", "em_progresso", "bloqueado"},
+    "bloqueado":    {"backlog"},
+    "pronto":       set(),   # terminal — só sai com `orq reopen --forcar`
+}
+
+
+class ErroTransicaoIlegal(ErroEstado):
+    """A transição pedida não está na tabela — e a tabela é a lista INTEIRA,
+    não um recorte. Transição fora dela é erro de programa, não caso de
+    canto: por isso não existe caminho silencioso, só --forcar explícito."""
+
+
+def transicionar(con: sqlite3.Connection, unidade_id: int, para_status: str, *,
+                 motivo: str = "", tipo_evento: str = "transicao",
+                 forcar: bool = False) -> None:
+    """A ÚNICA porta de escrita de status que checa legalidade — chama
+    `definir_status` (OA-01) por baixo depois de confirmar que a transição
+    pode acontecer. Todo verbo deste arquivo que move uma unidade passa por
+    aqui; nenhum grava direto na tabela `unidade`.
+    """
+    if para_status not in STATUS_UNIDADE:
+        raise ErroEstado(f"'{para_status}' não é um status desta esteira. "
+                         f"Use um de: {', '.join(sorted(STATUS_UNIDADE))}.")
+    row = con.execute("SELECT status FROM unidade WHERE id = ?", (unidade_id,)).fetchone()
+    if row is None:
+        raise ErroEstado(f"unidade {unidade_id} não existe.")
+    de_status = row["status"]
+    if not forcar and para_status not in TRANSICOES_LEGAIS.get(de_status, set()):
+        legais = sorted(TRANSICOES_LEGAIS.get(de_status, set()))
+        raise ErroTransicaoIlegal(
+            f"transição ilegal: '{de_status}' → '{para_status}'. "
+            f"De '{de_status}' só se vai para: {', '.join(legais) or '(nada — use --forcar)'}.")
+    definir_status(con, unidade_id, para_status, motivo=motivo, tipo_evento=tipo_evento)
+
+
+STATUS_UNIDADE = frozenset(TRANSICOES_LEGAIS)
+
+
+# ---- sessão viva — detecção continua sendo o SISTEMA OPERACIONAL, nunca um
+# heartbeat gravado. O banco (tabela `sessao`) só guarda ONDE procurar.
+
+def registrar_sessao(con: sqlite3.Connection, unidade_id: int, *, worktree: str,
+                     branch: str, tmux: str | None = None, pid: int | None = None) -> int:
+    """Abre uma sessão para a unidade. Quem chama de verdade é o lançador de
+    OA-05; até lá, é o que os testes deste arquivo usam para simular 'havia
+    uma sessão viva'."""
+    cur = con.execute(
+        "INSERT INTO sessao (unidade_id, tmux, pid, worktree, branch, iniciada_em) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (unidade_id, tmux, pid, worktree, branch, _agora()))
+    return cur.lastrowid
+
+
+def encerrar_sessao(con: sqlite3.Connection, unidade_id: int, desfecho: str) -> None:
+    """Fecha a sessão ABERTA mais recente da unidade (se houver nenhuma, não
+    faz nada — encerrar duas vezes não é erro, é idempotência)."""
+    con.execute(
+        "UPDATE sessao SET encerrada_em = ?, desfecho = ? "
+        "WHERE unidade_id = ? AND encerrada_em IS NULL",
+        (_agora(), desfecho, unidade_id))
+
+
+def sessao_viva(con: sqlite3.Connection, unidade_id: int) -> bool:
+    """A unidade tem processo de verdade rodando agora? Confere o sistema
+    operacional (tmux ou PID), nunca um campo do banco — um campo poderia
+    dizer 'viva' para sempre se ninguém o atualizasse."""
+    row = con.execute(
+        "SELECT tmux, pid FROM sessao WHERE unidade_id = ? AND encerrada_em IS NULL "
+        "ORDER BY id DESC LIMIT 1", (unidade_id,)).fetchone()
+    if row is None:
+        return False
+    if row["tmux"]:
+        r = subprocess.run(["tmux", "has-session", "-t", row["tmux"]],
+                           capture_output=True)
+        return r.returncode == 0
+    if row["pid"]:
+        try:
+            os.kill(int(row["pid"]), 0)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def recolher_sessoes_mortas(con: sqlite3.Connection, max_strikes: int) -> list:
+    """Unidade em `em_progresso` sem sessão viva é arranque falho — detectado
+    aqui, nunca por heartbeat. Devolve à fila com strike; no teto, bloqueia.
+
+    A exceção preservada do modelo antigo: unidade recém-solta por
+    `orq release` (coluna `solta_em`) não conta falta na PRIMEIRA vez que é
+    encontrada sem sessão — é perdoada, e o bilhete é consumido (`solta_em`
+    volta a NULL). Sem isto, toda unidade liberada seria imediatamente
+    recolhida de novo antes de alguém ter a chance de despachá-la.
+    """
+    recolhidas = []
+    for u in con.execute(
+            "SELECT id, chave, strikes, solta_em FROM unidade WHERE status = 'em_progresso'"):
+        if sessao_viva(con, u["id"]):
+            continue
+        encerrar_sessao(con, u["id"], "sessao-morta")
+        if u["solta_em"] is not None:
+            con.execute("UPDATE unidade SET solta_em = NULL WHERE id = ?", (u["id"],))
+            transicionar(con, u["id"], "backlog",
+                        motivo="liberada; ainda sem sessão nova", tipo_evento="recolhida")
+            recolhidas.append({"chave": u["chave"], "desfecho": "liberada"})
+            continue
+        n = u["strikes"] + 1
+        con.execute("UPDATE unidade SET strikes = ? WHERE id = ?", (n, u["id"]))
+        if n >= max_strikes:
+            transicionar(con, u["id"], "bloqueado",
+                        motivo=f"{n} arranques falhos seguidos", tipo_evento="recolhida")
+            recolhidas.append({"chave": u["chave"], "desfecho": "quarentena", "strikes": n})
+        else:
+            transicionar(con, u["id"], "backlog",
+                        motivo=f"arranque falho ({n}/{max_strikes})", tipo_evento="recolhida")
+            recolhidas.append({"chave": u["chave"], "desfecho": "recolhida", "strikes": n})
+    return recolhidas
+
+
+# ---- fila de despacho — "pode começar agora"
+
+def unidades_prontas(con: sqlite3.Connection) -> list:
+    """Backlog cujas dependências estão TODAS em 'pronto'. Ordem: prioridade,
+    depois quantas unidades dependem dela (quem desbloqueia mais vai primeiro
+    — com dependência liberando só no merge, escolher mal a ordem custa mais
+    do que custava), depois a chave."""
+    return con.execute(
+        "SELECT u.*, "
+        "(SELECT count(*) FROM dependencia d2 WHERE d2.depende_de = u.id) AS desbloqueia "
+        "FROM unidade u WHERE u.status = 'backlog' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM dependencia d JOIN unidade dep ON dep.id = d.depende_de "
+        "  WHERE d.unidade_id = u.id AND dep.status != 'pronto'"
+        ") "
+        "ORDER BY u.prioridade ASC, desbloqueia DESC, u.chave ASC"
+    ).fetchall()
+
+
+ICONE_ESTADO = {"ready": "🟢", "blocked": "⛔", "running": "▶ ", "stalled": "💥",
+                "revisao": "👀", "bloqueado": "🚫", "pronto": "✅"}
+ORDEM_ESTADO = {"stalled": 0, "bloqueado": 1, "revisao": 2, "running": 3,
+               "ready": 4, "blocked": 5, "pronto": 6}
+
+
+def classificar(con: sqlite3.Connection) -> list:
+    """Para cada unidade, o rótulo de leitura e o motivo — SEMPRE calculado,
+    nunca gravado. É o que faz 'pronta' e 'travada por dependência' conviverem
+    dentro do mesmo status `backlog` sem precisar de um sexto status: a
+    diferença é uma consulta, não um campo que pode ficar velho."""
+    unidades = con.execute("SELECT * FROM unidade ORDER BY chave").fetchall()
+    prontas_ids = {u["id"] for u in unidades_prontas(con)}
+    linhas = []
+    for u in unidades:
+        if u["status"] == "backlog":
+            if u["id"] in prontas_ids:
+                linhas.append({"unidade": u, "estado": "ready", "motivo": "pronta para começar"})
+            else:
+                faltando = con.execute(
+                    "SELECT dep.chave, dep.status FROM dependencia d "
+                    "JOIN unidade dep ON dep.id = d.depende_de "
+                    "WHERE d.unidade_id = ? AND dep.status != 'pronto'", (u["id"],)).fetchall()
+                nomes = ", ".join(f"{d['chave']} ({d['status']})" for d in faltando)
+                linhas.append({"unidade": u, "estado": "blocked", "motivo": f"espera: {nomes}"})
+        elif u["status"] == "em_progresso":
+            viva = sessao_viva(con, u["id"])
+            linhas.append({"unidade": u, "estado": "running" if viva else "stalled",
+                           "motivo": "sessão viva" if viva else "sem sessão viva"})
+        elif u["status"] == "revisao":
+            motivo = f"PR #{u['pr_numero']}" if u["pr_numero"] else "aguardando abertura do PR"
+            linhas.append({"unidade": u, "estado": "revisao", "motivo": motivo})
+        elif u["status"] == "bloqueado":
+            linhas.append({"unidade": u, "estado": "bloqueado", "motivo": u["motivo"] or ""})
+        elif u["status"] == "pronto":
+            linhas.append({"unidade": u, "estado": "pronto", "motivo": "concluída"})
+    linhas.sort(key=lambda l: (ORDEM_ESTADO.get(l["estado"], 9), l["unidade"]["chave"]))
+    return linhas
+
+
+# ---- resolução do banco — a conveniência que OA-02 adiou para cá: sem --db
+# explícito, procura o banco DESTA máquina que governa o repositório onde
+# você está (mesma checagem de divergência de máquina do pipeline.toml de
+# hoje), e por último cai no último banco usado.
+
+ULTIMO_BANCO = STATE / "last-db"
+
+
+def _repo_declarado_do_banco(caminho: Path) -> Path | None:
+    """O `repo` de um banco, sem carregar mais nada. None se ilegível."""
+    try:
+        con = sqlite3.connect(caminho)
+        row = con.execute("SELECT valor FROM config WHERE chave = 'repo'").fetchone()
+        con.close()
+        return Path(row[0]).expanduser() if row and row[0] else None
+    except Exception:
+        return None
+
+
+def resolver_banco(explicito: str | None) -> Path:
+    """Resolve o banco da esteira. Ordem: --db (ou $ORQ_DB) → o banco desta
+    máquina cujo 'repo' bate com o repositório onde você está → o último
+    usado. Mesma filosofia de `find_config` para o pipeline.toml — mundos
+    separados até OA-04 fundir os dois."""
+    p = None
+    if explicito:
+        p = Path(explicito).expanduser().resolve()
+    elif os.environ.get("ORQ_DB"):
+        p = Path(os.environ["ORQ_DB"]).expanduser().resolve()
+    else:
+        git_dir = git_dir_comum()
+        if git_dir is not None and BANCOS.is_dir():
+            candidatos = []
+            for c in sorted(BANCOS.glob("*.db")):
+                repo = _repo_declarado_do_banco(c)
+                if repo is not None and divergencia_de_maquina(repo, git_dir) is None:
+                    candidatos.append(c)
+            if len(candidatos) == 1:
+                p = candidatos[0]
+            elif len(candidatos) > 1:
+                die("mais de um banco governa este repositório. Escolha um:\n"
+                    + "\n".join(f"    --db {c}" for c in candidatos))
+        if p is None and ULTIMO_BANCO.exists():
+            cand = Path(ULTIMO_BANCO.read_text().strip())
+            if cand.exists():
+                p = cand
+                print(f"{C['d']}(usando o último banco: {p}){C['r']}", file=sys.stderr)
+    if p is None:
+        die("nenhum banco encontrado. Use --db, defina $ORQ_DB, ou rode "
+            "'orq init' de dentro do repositório.")
+    if not p.exists():
+        die(f"banco não encontrado: {p}")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        ULTIMO_BANCO.write_text(str(p))
+    except Exception:
+        pass
+    return p
+
+
+# ---- comandos de leitura
+
+def cmd_board(cfg, args):
+    con = abrir_banco(Path(args.db))
+    linhas = classificar(con)
+    con.close()
+    if not linhas:
+        print("nenhuma unidade declarada.")
+        return
+    largura = max(len(l["unidade"]["chave"]) for l in linhas)
+    for l in linhas:
+        u = l["unidade"]
+        icone = ICONE_ESTADO.get(l["estado"], "❓")
+        motivo = (l["motivo"] or "")[:70]
+        print(f"{icone} {u['chave']:<{largura}}  {u['status']:<12}  {motivo}")
+
+
+def cmd_next(cfg, args):
+    con = abrir_banco(Path(args.db))
+    prontas = unidades_prontas(con)
+    con.close()
+    if args.n:
+        prontas = prontas[:args.n]
+    if not prontas:
+        print("nada pronto agora.")
+        return
+    for r in prontas:
+        print(f"{r['chave']:<10} prioridade={r['prioridade']}  "
+              f"desbloqueia={r['desbloqueia']}  {r['titulo']}")
+
+
+def cmd_status(cfg, args):
+    con = abrir_banco(Path(args.db))
+    linhas = classificar(con)
+    con.close()
+    vivas = [l for l in linhas if l["estado"] == "running"]
+    esperando = [l for l in linhas if l["estado"] == "bloqueado"]
+    if not vivas and not esperando:
+        print("nada vivo, nada esperando você.")
+        return
+    if vivas:
+        print(f"{C['cyn']}vivas:{C['r']}")
+        for l in vivas:
+            print(f"  ▶ {l['unidade']['chave']}")
+    if esperando:
+        print(f"{C['yel']}esperando você:{C['r']}")
+        for l in esperando:
+            print(f"  ✋ {l['unidade']['chave']}: {l['motivo']}")
+
+
+def cmd_show(cfg, args):
+    con = abrir_banco(Path(args.db))
+    u = con.execute("SELECT * FROM unidade WHERE chave = ?", (args.chave,)).fetchone()
+    if u is None:
+        con.close()
+        die(f"{args.chave} não existe.")
+    deps = con.execute(
+        "SELECT unidade.chave AS chave, unidade.status AS status FROM dependencia "
+        "JOIN unidade ON unidade.id = dependencia.depende_de "
+        "WHERE dependencia.unidade_id = ? ORDER BY unidade.chave", (u["id"],)).fetchall()
+    eventos = con.execute(
+        "SELECT tipo, de_status, para_status, texto, ts FROM evento "
+        "WHERE unidade_id = ? ORDER BY id DESC LIMIT 10", (u["id"],)).fetchall()
+    con.close()
+    print(f"{C['b']}{u['chave']}{C['r']} — {u['titulo']}")
+    linha_status = f"status: {u['status']}"
+    if u["motivo"]:
+        linha_status += f"  ·  motivo: {u['motivo']}"
+    print(linha_status)
+    if u["pr_numero"]:
+        print(f"PR: #{u['pr_numero']}" + (f" {u['pr_url']}" if u["pr_url"] else ""))
+    if deps:
+        print("depende de: " + ", ".join(f"{d['chave']} ({d['status']})" for d in deps))
+    if u["clickup_id"]:
+        print(f"ClickUp: https://app.clickup.com/t/{u['clickup_id']}")
+    if eventos:
+        print(f"{C['d']}últimos eventos:{C['r']}")
+        for e in eventos:
+            seta = f" {e['de_status']}→{e['para_status']}" if e["para_status"] else ""
+            print(f"  {e['ts']}  {e['tipo']}{seta}  {e['texto'][:80]}")
+
+
+# ---- transições sem lançador — hold/release/reopen/advance não precisam de
+# worktree nem tmux, só do banco. `orq run` continua sem existir aqui.
+
+def cmd_hold(cfg, args):
+    if not args.motivo or len(args.motivo.strip()) < 10:
+        die("--motivo é obrigatório e precisa dizer o que trava (mín. 10 caracteres).")
+    with transacao(Path(args.db)) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        try:
+            transicionar(con, uid, "bloqueado", motivo=args.motivo, tipo_evento="bloqueada")
+        except ErroTransicaoIlegal as e:
+            die(str(e))
+    print(f"{C['yel']}✋{C['r']} {args.chave} bloqueada: {args.motivo}")
+
+
+def cmd_release(cfg, args):
+    with transacao(Path(args.db)) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        # strikes zera e o bilhete `solta_em` nasce ANTES da transição: é o
+        # que impede o próprio `recolher_sessoes_mortas` de contar falta na
+        # primeira vez que encontrar esta unidade sem sessão viva.
+        con.execute("UPDATE unidade SET strikes = 0, solta_em = ? WHERE id = ?",
+                   (_agora(), uid))
+        try:
+            transicionar(con, uid, "backlog", tipo_evento="liberada")
+        except ErroTransicaoIlegal as e:
+            die(str(e))
+    print(f"{C['grn']}✓{C['r']} {args.chave} liberada — volta para a fila.")
+
+
+def cmd_reopen(cfg, args):
+    if not args.forcar:
+        die("reabrir uma unidade 'pronto' exige --forcar — é a única saída de um "
+            "estado terminal, e precisa ser decisão explícita.")
+    with transacao(Path(args.db)) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        con.execute("UPDATE unidade SET pr_numero = NULL, pr_url = NULL WHERE id = ?", (uid,))
+        transicionar(con, uid, "backlog", motivo="reaberta por decisão humana",
+                    tipo_evento="reaberta", forcar=True)
+    print(f"{C['yel']}↺{C['r']} {args.chave} reaberta — volta para a fila.")
+
+
+def _numero_e_url_do_pr(con: sqlite3.Connection, valor: str):
+    m = re.search(r"(\d+)/?$", valor.rstrip("/"))
+    if not m:
+        die(f"não consegui achar o número do PR em '{valor}'. Use um número ou a URL.")
+    numero = int(m.group(1))
+    if valor.startswith("http"):
+        return numero, valor
+    gh = obter_config(con, "github_repo")
+    return numero, (f"https://github.com/{gh}/pull/{numero}" if gh else None)
+
+
+def cmd_advance(cfg, args):
+    """PR aberto → 'revisão'. Não confere se o PR existe de verdade no GitHub
+    — essa é a única chamada de rede fora do vigia, e fica para OA-05, que é
+    quem sabe o `github_repo` no contexto certo de uma sessão."""
+    with transacao(Path(args.db)) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        numero, url = _numero_e_url_do_pr(con, args.pr)
+        con.execute("UPDATE unidade SET pr_numero = ?, pr_url = ? WHERE id = ?",
+                   (numero, url, uid))
+        try:
+            transicionar(con, uid, "revisao", tipo_evento="pr_aberto",
+                        motivo=f"PR #{numero}")
+        except ErroTransicaoIlegal as e:
+            die(str(e))
+        encerrar_sessao(con, uid, "advance")
+    print(f"{C['grn']}✓{C['r']} {args.chave}: revisão — PR #{numero}"
+          + (f" {url}" if url else ""))
+
+
+def cmd_tick(cfg, args):
+    """SÓ recolhe sessão morta. Despachar (preencher vaga, lançar sessão) é
+    `orq run`/`orq dispatch`, e eles continuam sem lançador de verdade até
+    OA-05 — chamá-los aqui seria fingir que a esteira anda sozinha quando
+    ela ainda não anda."""
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    max_strikes = int(obter_config(con, "max_strikes", "2") or 2)
+    con.close()
+    with transacao(caminho) as con:
+        recolhidas = recolher_sessoes_mortas(con, max_strikes)
+    if not recolhidas:
+        print("nada para recolher.")
+    else:
+        for r in recolhidas:
+            extra = f" ({r['strikes']}/{max_strikes})" if "strikes" in r else ""
+            print(f"  {r['chave']}: {r['desfecho']}{extra}")
+    print(f"{C['d']}(isto só recolhe — despachar ainda é orq run/orq dispatch){C['r']}")
 
 
 def git_dir_comum(cwd=None):
@@ -2239,7 +2672,12 @@ def load(cfg: Config):
 
 # ---------------------------------------------------------------- comandos
 
-def cmd_board(cfg, args):
+# LEGADO — desregistrados do argparse em 22/09/2026 (OA-03). Estes oito
+# comandos foram SUBSTITUÍDOS pelos de mesmo nome que leem o banco SQLite
+# (ver a seção "estado — máquina de cinco estados" mais acima). O código
+# continua aqui só até OA-04 remover o pipeline.toml por inteiro; nada mais
+# os chama.
+def cmd_board_toml_legado(cfg, args):
     units, board, live, order = load(cfg)
     rows = classify(cfg, units, board, live, order)
     rows.sort(key=lambda r: (ORDER[r.state], PRIO.get(r.unit.priority, 4),
@@ -2370,7 +2808,8 @@ def cmd_capacity(cfg, args):
             print(f"  {key:<12} {gb} GB")
 
 
-def cmd_next(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_next_toml_legado(cfg, args):
     units, board, live, order = load(cfg)
     rows = classify(cfg, units, board, live, order)
     q = ready_queue(rows, args.stage)
@@ -2452,7 +2891,8 @@ def cmd_dispatch(cfg, args):
             print(f"{C['red']}pulou {r.unit.key}{C['r']}: {e}")
 
 
-def cmd_advance(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_advance_toml_legado(cfg, args):
     r, _ = _row(cfg, args.unit)
     u = r.unit
     stage = cfg.stage(args.stage) if args.stage else None
@@ -2492,7 +2932,8 @@ def cmd_describe(cfg, args):
     print(f"{C['grn']}✓{C['r']} descrição de {r.unit.key} atualizada ({len(md)} caracteres)")
 
 
-def cmd_show(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_show_toml_legado(cfg, args):
     """Tarefa + comentários.
 
     Os comentários carregam o que a descrição não tem: achados de revisão,
@@ -2528,7 +2969,8 @@ def cmd_show(cfg, args):
         print()
 
 
-def cmd_status(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_status_toml_legado(cfg, args):
     while True:
         live = running_sessions(cfg)
         print(f"\n{C['b']}{time.strftime('%H:%M:%S')}{C['r']}  {len(live)} sessão(ões) viva(s)")
@@ -2723,7 +3165,8 @@ def cmd_reject(cfg, args):
           f"(retrabalho {n}/{max_rework})")
 
 
-def cmd_hold(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_hold_toml_legado(cfg, args):
     """Marca a unidade como bloqueada por decisão humana.
 
     Diferente de reprovar: aqui a sessão não consegue concluir por algo que só
@@ -2792,7 +3235,8 @@ def cmd_hold(cfg, args):
               f"O laço não vai tocar nela até `orq release {r.unit.key}`.")
 
 
-def cmd_release(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_release_toml_legado(cfg, args):
     st = loop_state(cfg)
     r, _ = _row(cfg, args.unit)
     was = []
@@ -3079,7 +3523,8 @@ def tick(cfg: Config, max_new: int = 0, quiet: bool = False) -> dict:
     return out
 
 
-def cmd_tick(cfg, args):
+# LEGADO (ver nota acima de cmd_board_toml_legado)
+def cmd_tick_toml_legado(cfg, args):
     o = tick(cfg, max_new=args.n)
     if o["fatal"]:
         die(o["fatal"])
@@ -3545,14 +3990,17 @@ def main():
                                "--pipeline até OA-04 fundir os dois.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, help, sem_config=False, banco=False):
+    def add(name, fn, help, sem_config=False, banco=False, banco_explicito=False):
         s = sub.add_parser(name, help=help)
         # `host` fala da MÁQUINA, não de uma esteira: precisa responder num
         # diretório qualquer, inclusive antes de existir qualquer pipeline.toml.
-        # `banco=True` marca os verbos novos (OA-02): não tocam pipeline.toml,
-        # exigem --db, e chegam à função como (None, args) — cfg não existe
-        # para eles.
-        s.set_defaults(fn=fn, sem_config=sem_config, banco=banco)
+        # `banco=True` marca os verbos novos (OA-02/OA-03): não tocam
+        # pipeline.toml, resolvem o banco (explícito ou não — ver
+        # `resolver_banco`), e chegam à função como (None, args) — cfg não
+        # existe para eles. `banco_explicito=True` (só `init`) desliga a
+        # resolução automática: não há o que descobrir antes de o banco existir.
+        s.set_defaults(fn=fn, sem_config=sem_config, banco=banco,
+                       banco_explicito=banco_explicito)
         return s
 
     # ---- OA-02: verbos de declaração — o estado vive no banco (OA-01), nunca
@@ -3561,7 +4009,8 @@ def main():
     # docs/specs/orquestrador-agil/OA-02-verbos-de-declaracao.md. O código do
     # comando antigo continua no arquivo, sem registro aqui, até OA-04 remover
     # o pipeline.toml por inteiro.
-    s = add("init", cmd_init, "cria o banco de uma esteira nova", sem_config=True, banco=True)
+    s = add("init", cmd_init, "cria o banco de uma esteira nova", sem_config=True,
+            banco=True, banco_explicito=True)
     s.add_argument("--nome", help="nome da esteira (padrão: o nome do arquivo do banco)")
     s.add_argument("--repo", required=True, help="raiz do repositório git")
     s.add_argument("--base", required=True, help="branch de publicação (ex.: main)")
@@ -3622,21 +4071,51 @@ def main():
     add("validate", cmd_validate, "recusa esteira incoerente, sem escrever nada",
         sem_config=True, banco=True)
 
+    # ---- OA-03: máquina de cinco estados — SUBSTITUEM board/next/status/show/
+    # hold/release/advance/tick de hoje (TOML). Mesmo padrão de OA-02: código
+    # velho vira _toml_legado, sem registro aqui, até OA-04 remover
+    # pipeline.toml por inteiro. `orq run`/`orq dispatch` NÃO entram nesta
+    # unidade — o botão continua sendo o antigo até OA-05 dar a eles um
+    # lançador de verdade; despachar sem lançar seria um comando que promete
+    # e não faz.
+    s = add("board", cmd_board, "quadro: o que está pronto, travado, rodando, bloqueado",
+            sem_config=True, banco=True)
+    s = add("next", cmd_next, "fila priorizada do que pode começar agora",
+            sem_config=True, banco=True)
+    s.add_argument("-n", type=int, default=0)
+    s = add("status", cmd_status, "o que está vivo e o que pede decisão",
+            sem_config=True, banco=True)
+    s = add("show", cmd_show, "detalhes da unidade: status, dependências, PR, eventos",
+            sem_config=True, banco=True)
+    s.add_argument("chave")
+    s = add("advance", cmd_advance, "PR aberto → 'revisão' (o agente chama ao terminar)",
+            sem_config=True, banco=True)
+    s.add_argument("chave"); s.add_argument("--pr", required=True, metavar="NUMERO|URL")
+    s = add("hold", cmd_hold, "marca a unidade como bloqueada por decisão humana",
+            sem_config=True, banco=True)
+    s.add_argument("chave"); s.add_argument("--motivo", required=True)
+    s = add("release", cmd_release, "libera uma unidade bloqueada — volta para a fila",
+            sem_config=True, banco=True)
+    s.add_argument("chave")
+    s = add("reopen", cmd_reopen,
+            "reabre uma unidade 'pronto' — único jeito de sair de um estado terminal",
+            sem_config=True, banco=True)
+    s.add_argument("chave")
+    s.add_argument("--forcar", action="store_true", help="obrigatório — confirma a reabertura")
+    s = add("tick", cmd_tick,
+            "recolhe sessão morta (isto NÃO despacha — ver orq run/orq dispatch)",
+            sem_config=True, banco=True)
+
     s = add("doctor", cmd_doctor, "pré-voo: prova cada dependência por chamada real")
     s.add_argument("--rapido", action="store_true",
                    help="pula a chamada ao agente (a mais demorada). NÃO é prova: "
                         "use só quando já provou o agente há pouco.")
-    s = add("board", cmd_board, "quadro completo por estágio")
-    s.add_argument("-a", "--all", action="store_true", help="inclui concluídas")
     add("capacity", cmd_capacity, "recursos e limite de sessões simultâneas")
     s = add("host", cmd_host, "o que limita esta máquina agora (dispensa esteira)",
             sem_config=True)
     s.add_argument("--json", action="store_true")
     s.add_argument("--check", action="store_true",
                    help="só alerta; sai com 1 quando há alerta")
-    s = add("next", cmd_next, "fila priorizada do que pode começar")
-    s.add_argument("-n", type=int, default=0)
-    s.add_argument("--stage", help="restringe a um estágio")
     s = add("run", cmd_run, "inicia a sessão do estágio atual de uma unidade")
     s.add_argument("unit"); s.add_argument("--stage")
     s.add_argument("--attach", action="store_true")
@@ -3644,11 +4123,6 @@ def main():
     s = add("dispatch", cmd_dispatch, "dispara as N prontas de maior prioridade")
     s.add_argument("-n", type=int, default=0); s.add_argument("--stage")
     s.add_argument("-y", "--yes", action="store_true")
-    s = add("advance", cmd_advance,
-            "move a unidade para o fim do estágio atual e arquiva a sessão")
-    s.add_argument("unit"); s.add_argument("--stage")
-    s.add_argument("--keep", action="store_true",
-                   help="não arquivar nem encerrar a sessão")
     s = add("sweep", cmd_sweep, "arquiva os artefatos de sessões que já terminaram")
     s.add_argument("--stalled", action="store_true",
                    help="arquiva também as travadas (perde o rastro para diagnóstico)")
@@ -3658,8 +4132,6 @@ def main():
     s.add_argument("unit")
     s = add("reset", cmd_reset, "devolve a unidade à fila do estágio (desfaz um arranque falho)")
     s.add_argument("unit"); s.add_argument("--stage")
-    s = add("tick", cmd_tick, "um ciclo do laço: colhe o que morreu, preenche a capacidade")
-    s.add_argument("-n", type=int, default=0, help="teto de novos lançamentos neste ciclo")
     s = add("loop", cmd_loop, "roda a esteira sozinha até acabar ou ficar ociosa")
     s.add_argument("--interval", type=int, default=0)
     s.add_argument("--detach", action="store_true", help="roda em tmux próprio")
@@ -3667,29 +4139,12 @@ def main():
     s = add("reject", cmd_reject, "REPROVADO: devolve a unidade ao estágio anterior com os achados")
     s.add_argument("unit"); s.add_argument("--to", help="estágio de destino (padrão: o anterior)")
     s.add_argument("--text"); s.add_argument("--file")
-    s = add("hold", cmd_hold, "marca a unidade como bloqueada por decisão humana")
-    s.add_argument("unit"); s.add_argument("--reason", required=True)
-    s.add_argument("--until-unit", metavar="UNIDADE",
-                   help="espera por OUTRA unidade, não por uma pessoa: o laço "
-                        "confere a cada ciclo e solta sozinho")
-    s.add_argument("--until-stage", metavar="ESTAGIO",
-                   help="até onde essa unidade precisa chegar (padrão: o último "
-                        "estágio da esteira)")
-    s = add("release", cmd_release, "libera de quarentena ou de espera humana")
-    s.add_argument("unit")
-    s.add_argument("--reset-rework", action="store_true", help="zera o contador de retrabalho")
     s = add("unquarantine", cmd_unquarantine, "atalho antigo para release")
     s.add_argument("unit")
     s = add("note", cmd_note, "publica um comentário na tarefa")
     s.add_argument("unit"); s.add_argument("--text"); s.add_argument("--file")
     s = add("describe", cmd_describe, "substitui a descrição da tarefa por um arquivo")
     s.add_argument("unit"); s.add_argument("--file", required=True)
-    s = add("show", cmd_show, "imprime a tarefa e seus comentários")
-    s.add_argument("unit")
-    s.add_argument("--no-comments", action="store_true")
-    s = add("status", cmd_status, "o que está vivo e o que pede decisão")
-    s.add_argument("-w", "--watch", action="store_true")
-    s.add_argument("--interval", type=int, default=30)
     s = add("attach", cmd_attach, "entra na sessão (tmux)"); s.add_argument("unit")
     s = add("log", cmd_log, "lê o log da sessão")
     s.add_argument("unit"); s.add_argument("-f", "--follow", action="store_true")
@@ -3699,9 +4154,16 @@ def main():
     s.add_argument("unit"); s.add_argument("--stage")
 
     args = p.parse_args()
-    if getattr(args, "banco", False) and not args.db:
-        die("--db é obrigatório para este comando: o caminho do banco SQLite "
-            "desta esteira (não há resolução automática ainda — ver OA-02/OA-03).")
+    if getattr(args, "banco", False):
+        if getattr(args, "banco_explicito", False):
+            # `init`: o banco ainda não existe — não há o que `resolver_banco`
+            # descobrir, e ele MORRERIA ao conferir que o arquivo existe.
+            if not args.db:
+                die("--db é obrigatório para criar um banco novo — não há o que "
+                    "descobrir antes de ele existir.")
+            args.db = str(Path(args.db).expanduser())
+        else:
+            args.db = str(resolver_banco(args.db))
     cfg = None if getattr(args, "sem_config", False) else find_config(args.pipeline)
     # ANTES de qualquer comando agir. `doctor` é a exceção porque ele é a
     # ferramenta de diagnóstico: morrer aqui esconderia dele justamente o achado

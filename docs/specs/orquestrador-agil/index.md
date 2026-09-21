@@ -32,7 +32,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | --- | --- | --- | --- | --- |
 | [OA-01](OA-01-nucleo-sqlite.md) | Núcleo de estado em SQLite | P0 | — | concluído (`bin/orq`, `testes/test_estado.py`) |
 | [OA-02](OA-02-verbos-de-declaracao.md) | Verbos de declaração e configuração | P0 | OA-01 | concluído (`bin/orq`, `testes/test_verbos.py`) |
-| [OA-03](OA-03-maquina-de-cinco-estados.md) | Máquina de cinco estados e quadro derivado | P0 | OA-01, OA-02 | não iniciado |
+| [OA-03](OA-03-maquina-de-cinco-estados.md) | Máquina de cinco estados e quadro derivado | P0 | OA-01, OA-02 | concluído (`bin/orq`, `testes/test_maquina.py`) |
 | [OA-04](OA-04-motor-sem-clickup.md) | O motor deixa de falar com o ClickUp | P0 | OA-03 | não iniciado |
 | [OA-05](OA-05-papel-unico-auto-contido.md) | O papel único auto-contido | P0 | OA-03, OA-04 | não iniciado |
 | [OA-06](OA-06-cerca-do-papel-unico.md) | A cerca do papel único | P0 | OA-05 | não iniciado |
@@ -136,6 +136,8 @@ errada, o conserto agora é barato.
 | 8 | A prova de ClickUp sai do `orq doctor` e vira `orq-clickup doctor` | OA-12 | Deixá-la fatal impediria despacho por indisponibilidade de ferramenta de gestão |
 | 9 | O encerramento fixo de ambiente só conhece Docker Compose (busca por `docker-compose*.yml`/`compose*.yml`) | OA-08 | Projeto que suba serviço por outro meio fica sem encerramento automático; o sinal aparece em `orq sweep`, não em silêncio |
 | 10 | `orq validate` exige `CLAUDE.md`/`AGENTS.md` na raiz do projeto — é o único lugar de onde o agente tira os portões agora | OA-02 | Projeto sem nenhum dos dois nunca teria portão nenhum; a recusa antecipa isso em vez de deixar o agente descobrir sozinho |
+| 11 | `orq run`/`orq dispatch` ficam de fora de OA-03 — só entram quando OA-05 der a eles um lançador de verdade | OA-03 | Despachar sem lançar seria um comando que promete e não faz; melhor não ter o verbo agora |
+| 12 | `orq advance`/`orq hold`/`orq release`/`orq reopen`/`orq tick` (só recolhimento) e `orq board/next/status/show` SUBSTITUEM os de mesmo nome do motor TOML, mesma decisão já aplicada a `orq init` em OA-02 | OA-03 | Reabre oito comandos de uma vez; se a substituição em massa incomodar, o caminho é reverter comando a comando, não a decisão |
 
 ## A perda que esta entrega aceita
 

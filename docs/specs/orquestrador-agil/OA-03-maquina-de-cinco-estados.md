@@ -111,3 +111,26 @@ cartão para quem quiser o resto. Ler o cartão passa a ser trabalho do agente, 
 - **`pronto` é terminal e depende do GitHub.** Se o PR for fundido fora do fluxo (merge na
   mão, squash local), o vigia de OA-08 nunca vê `merged` e a unidade fica em `revisao`.
   `orq advance <unidade> --forcar` existe para isso, e grava evento dizendo que foi humano.
+
+## Nota de implementação (22/09/2026)
+
+Duas decisões tomadas ao codificar, não previstas na letra do spec original:
+
+1. **`orq run` e `orq dispatch` NÃO entram nesta unidade.** O spec atribui `backlog →
+   em_progresso` a "o laço despacha, ou `orq run`", mas despachar sem lançar (o lançador —
+   worktree, tmux, briefing — é OA-05) seria um comando que promete e não faz. Os dois
+   continuam apontando para o motor antigo (TOML) até OA-05 lhes dar um lançador de
+   verdade. Em compensação, **`orq advance`, `orq hold`, `orq release`, `orq reopen` e
+   `orq tick` (só recolhimento) entram**, porque nenhum deles depende de lançar nada — são
+   leitura e escrita de estado puras, e é exatamente isso que permite ao ciclo de vida
+   inteiro (backlog→em_progresso→revisão→pronto) ser provado de ponta a ponta nesta
+   unidade, com `transicionar()` fazendo o papel de `orq run`/`orq advance` de dentro do
+   teste. `orq board/next/status/show` também SUBSTITUEM os comandos TOML de mesmo nome —
+   mesma decisão de 22/09/2026 já aplicada a `orq init` em OA-02.
+2. **A resolução de banco fica completa aqui**, como a nota de OA-02 já sinalizava: `--db`
+   (ou `$ORQ_DB`) → banco desta máquina cujo `repo` bate com o repositório onde você está
+   → o último banco usado (`~/.claude/orchestrator/state/last-db`). `orq init` continua
+   exigindo `--db` explícito — não há o que descobrir antes de o banco existir.
+
+O `solta_em` do texto original virou uma coluna de fato (`ALTER` direto no esquema de
+OA-01, sem migração — nada em produção usa a versão anterior).

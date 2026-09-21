@@ -1,10 +1,7 @@
 # Medição
 
-A esteira produz rastro em vários lugares que não conversam entre si — o mais rico deles,
-desde o modelo de papel único, é o próprio banco SQLite da esteira: cada fato vira um evento
-gravado na mesma transação, com hora exata. Isto junta tudo num armazém só e responde, por
-unidade de trabalho, quanto tempo levou, quantas vezes voltou, quanto esperou por uma
-pessoa, quantos tokens consumiu e quanto código produziu.
+A esteira rodou uma corrida inteira e não sabia dizer quanto produziu. O rastro
+existia — em seis lugares que não conversavam. Isto junta.
 
 ## Os cinco comandos
 
@@ -16,11 +13,10 @@ orq-medir exportar    # o JSON bruto de tudo
 orq-medir servir      # o painel, no endereço local
 ```
 
-Comece pelo `resumo`. Ele responde "o que esta esteira produziu até agora" — incluindo as
-três métricas que o gate humano criou (abaixo).
+Comece pelo `resumo`. Ele responde "o que esta esteira produziu até agora".
 
-`coletar --sem-rede` pula a consulta ao ClickUp (comentários), quando você quiser rodar sem
-internet ou sem gastar chamada. A leitura do banco da esteira não depende de rede.
+`coletar --sem-rede` pula a consulta ao quadro, quando você quiser rodar sem
+internet ou sem gastar chamada.
 
 ## O painel
 
@@ -48,38 +44,30 @@ systemctl --user list-timers orq-medir.timer        # a próxima coleta
 Abrir o arquivo do painel direto no navegador **não funciona**: ele busca os
 dados por HTTP, de propósito, para não precisar ser regerado a cada mudança.
 
-## As três métricas que o gate humano criou (OA-13)
+## Memória por sessão e por etapa
 
-Com o humano no caminho crítico — não há mais sessão de revisão, só uma pessoa olhando o
-PR —, o que determina a vazão da esteira é a espera por ela. Três perguntas novas:
+A coleta lê o consumo real de cada sessão viva — pelo tmux, somando o grupo de
+processos — e guarda uma amostra por tarefa por minuto.
 
-**Tempo em revisão.** Do evento `pr_aberto` ao `pr_fundido`, por unidade. É a espera humana
-de verdade, medida, não deduzida.
+**Isto só existe daqui para a frente.** O rastro antigo nunca guardou consumo por
+sessão, e nada recupera o que jamais foi escrito. A vista
+`v_memoria_por_etapa` fica vazia até a primeira coleta com sessão rodando.
 
-**Taxa de devolução.** Quantos PRs voltaram com `CHANGES_REQUESTED` (evento `retrabalho`), e
-quantas rodadas até fundir. É o termômetro da auto-revisão que o papel único assume: se
-subir, a resposta é considerar um revisor automático antes do PR — nunca afrouxar o gate
-humano.
+Vale registrar por que foi feito assim: o motor **sabe** medir isso e não grava.
+Medir por fora, a partir do tmux, é aditivo — não toca numa linha do motor, e
+por isso pôde ser feito com a esteira em voo.
 
-**Duração da sessão de papel único.** A mediana por estágio (spec/implement/review/
-integrate) deixou de existir — não há mais estágio. O que fica é a distribuição da sessão
-inteira, de ponta a ponta.
-
-## De onde cada número sai
+## O que ele mede
 
 | Pergunta | De onde a resposta sai |
 | --- | --- |
-| Quantas sessões houve e como terminaram | a tabela `sessao` do banco da esteira (medido: início e fim são a mesma transação do despacho e do encerramento) |
-| Tempo em revisão, taxa de devolução, quando cada coisa aconteceu | a tabela `evento` do banco da esteira — append-only, com hora exata |
+| Quantas sessões houve e como terminaram | as pastas de sessão arquivadas |
+| Quando cada sessão começou | o registro de despachos |
+| Quantas vezes a unidade voltou | os desfechos de reprovação, mais o estado do laço |
+| Quanto tempo ficou esperando uma pessoa | as esperas registradas no laço |
 | Quantos tokens custou, por modelo | as transcrições das cópias de trabalho |
-| Quanto código saiu, e de qual PR | o commit que integrou cada PR — achado pelo **número do PR**, não pelo nome do branch, cobrindo merge tradicional e squash |
-| O histórico dos comentários da tarefa | os comentários no ClickUp, lidos direto (aprendizado nº 21: é o relógio que já se paga) |
-
-**Rastro do modelo antigo** (pastas de sessão arquivadas, `runs.jsonl`, o estado do laço em
-JSON) continua sendo lido — para não perder o que já foi coletado antes da troca —, mas
-nunca é a fonte para uma unidade nova. As duas populações não se somam: sessão do modelo
-antigo entra marcada por etapa; sessão do modelo novo entra com a sentinela
-`auto-contido`, e o resumo mostra as duas separadas.
+| Quanto código saiu | os merges no repositório do produto |
+| Quem decidiu o quê, e quando | os comentários das tarefas no quadro |
 
 ## Onde as coisas ficam
 
@@ -87,8 +75,8 @@ O armazém é um arquivo em `~/.claude/orchestrator/state/medicao.db`. É um ban
 SQLite: se você tem o `sqlite3` instalado, consulta direto; se não, o Python da
 casa lê sem instalar nada.
 
-Vistas prontas incluem `v_ciclo_por_unidade`, `v_retrabalho`, `v_espera_humana`,
-`v_consumo_por_unidade`, `v_producao_por_unidade`, `v_tempo_revisao` e `v_devolucao`.
+Cinco vistas prontas: `v_ciclo_por_unidade`, `v_retrabalho`, `v_espera_humana`,
+`v_consumo_por_unidade` e `v_producao_por_unidade`.
 
 ## A coleta automática
 
@@ -100,12 +88,18 @@ systemctl --user start orq-medir.service         # rodar agora
 journalctl --user -u orq-medir.service -n 30     # o que aconteceu
 ```
 
-Ele **abre o banco da esteira em modo somente leitura** e escreve exclusivamente no próprio
-armazém. Não disputa memória com as sessões e nunca toca no estado da esteira.
+Ele **só lê o que já terminou** — pasta de sessão arquivada e transcrição
+encerrada — e escreve exclusivamente no próprio armazém. Não disputa memória com
+as sessões e não toca no estado da esteira.
 
 ## O que ele NÃO mede, e por quê
 
-**Resultado de portão fica de fora.** Ele só existe dentro da captura de
+**Duração de sessão é deduzida, não medida.** O motor não grava início e fim; o
+que existe é a hora do despacho e a hora do arquivamento. As sessões em que nem
+isso existe aparecem marcadas, e o resumo diz quantas são. Medir de verdade exige
+o motor passar a gravar — é o passo seguinte.
+
+**Resultado de portão fica de fora.** Hoje ele só existe dentro da captura de
 terminal, em texto corrido com códigos de cor. Interpretar aquilo é caro e
 frágil. As capturas continuam guardadas como evidência de última instância.
 
@@ -115,10 +109,6 @@ não sabe, em vez de inventar um número. Tokens continuam contados.
 
 **Nada anterior a 31/08/2026** tem rastro. A esteira só passou a arquivar sessão
 a partir dali.
-
-**Integração por rebase não é atribuída pelo PR.** Rebase não carimba o número do PR em
-lugar nenhum; a atribuição cai no caminho antigo, por nome de branch, que só acerta se o
-branch não tiver sido apagado.
 
 ## Duas armadilhas que já custaram tempo
 
@@ -130,5 +120,5 @@ graça e ainda dizem o que aconteceu e quem assinou.
 **A base local do repositório envelhece sem avisar.** Atribuir commit a unidade
 pelo intervalo `base..branch` parece certo e está errado: com a base atrasada, o
 intervalo devolve o trabalho de todas as unidades, e a atribuição fica com quem
-rodou por último. A atribuição sai do **merge** — hoje, de preferência, achado pelo número
-do PR que já está na unidade, não por regex no assunto do commit.
+rodou por último. A atribuição sai do **merge**, que diz de qual branch veio o
+que entrou.

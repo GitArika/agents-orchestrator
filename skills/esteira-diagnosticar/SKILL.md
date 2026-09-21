@@ -1,6 +1,6 @@
 ---
 name: esteira-diagnosticar
-description: Use quando a esteira não está fazendo o que deveria — nada é despachado, a sessão morre logo depois de nascer, o laço parou sozinho no meio do trabalho, o vigia de PR não avança nada, o ClickUp diz que alguém está trabalhando e não há ninguém, a máquina está arrastando, o acompanhamento remoto sumiu, o Telegram não chega, ou a escrita no ClickUp saiu com o nome de outra pessoa. Use também para caçar processo abandonado comendo memória, conferir o que limita o host, e antes de concluir que o problema é do projeto e não da esteira.
+description: Use quando a esteira não está fazendo o que deveria — nada é despachado, a sessão morre logo depois de nascer, o laço parou sozinho no meio do trabalho, o ClickUp diz que alguém está revisando e não há ninguém, a máquina está arrastando, o acompanhamento remoto sumiu, ou a escrita no ClickUp saiu com o nome de outra pessoa. Use também para caçar processo abandonado comendo memória, conferir o que limita o host, e antes de concluir que o problema é do projeto e não da esteira.
 ---
 
 # Diagnosticar a esteira
@@ -13,14 +13,14 @@ sintoma parecido.
 
 ```bash
 orq doctor      # prova cada dependência por chamada real
-orq board       # o quadro: backlog, em_progresso, revisão, pronto, bloqueado
+orq board       # o quadro: pronto, bloqueado, rodando, travado, deriva
 orq status      # o que está vivo e o que espera uma pessoa
 orq host        # o que limita esta máquina agora
 ```
 
 ## Autenticação e sessão
 
-**A sessão nasce e morre em dois segundos. O cartão marca "em progresso" e nada acontece.**
+**A sessão nasce e morre em dois segundos. O ClickUp marca "revisando" e nada acontece.**
 O token do agente está inválido. Viva para o tmux, morta para o trabalho.
 `claude -p "responda apenas: ok"` — se não responder, é isto.
 Nunca diagnostique por `claude auth status`: ele responde que está logado só por existir
@@ -45,28 +45,23 @@ você. Abra o repositório base uma vez e aceite.
 
 ## Esteira e laço
 
-**Uma unidade sumiu do radar, parada em `em_progresso`.**
-A sessão terminou sem `advance` nem `hold`. `orq board` mostra as marcas de qualidade do
-dado; ela volta sozinha a `backlog` (com falta contada) quando o laço ou `orq tick`
-recolherem. Não é preciso um comando manual — se estiver com pressa, rode `orq tick`.
+**Uma unidade sumiu do radar, parada num status de trabalho.**
+A sessão terminou sem concluir, reprovar nem travar. `orq board` mostra como travada.
+`orq reset <UNIDADE>` devolve à fila.
 
 **O laço encerrou sozinho com sessões vivas.**
 Contagem de ociosidade que não olhava se havia sessão viva: uma revisão longa gerava dezenas
-de ciclos "sem mudança" e o laço desistia. Releia a tela da sessão `tmux` do laço, ou o
-último evento `laco_parou`/`esteira_concluida` no banco — sempre registra o motivo.
+de ciclos "sem mudança" e o laço desistia. `cat ~/.claude/orchestrator/state/notify.log`
+sempre registra o motivo da parada — comece por ele.
 
 **Foi despachada e não achou o código de que dependia.**
-Com um papel só, dependência **sempre** é de código: a cópia de trabalho nasce do branch de
-publicação, e o código de que ela depende só existe ali quando a dependência chegou a
-`pronto` (fundida). `orq show <unidade>` mostra as dependências e o status de cada uma.
+Dependência de código precisa esperar a **integração**, não a revisão: a cópia de trabalho
+nasce do branch de publicação. Confira `[pipeline.dependency]` — tem de ser
+`after = "integrate"`.
 
-**Uma unidade em `revisão` está lá há muito tempo, e o vigia não faz nada.**
-Confira se o laço está rodando (`ps`/`tmux ls`) e se `gh auth status` responde — o vigia só
-avança quando o laço está de pé E o `gh` autentica. `orq doctor` prova as duas coisas.
-
-**Nada é despachado, mas há unidades prontas em `backlog`.**
-`orq capacity`. O teto pode estar em zero por memória, processador ou carga — o orçamento é
-um só agora, não mais por estágio.
+**Nada é despachado, mas há unidades prontas.**
+`orq capacity`. O teto pode estar em zero por memória. Veja também se o estágio é serial
+(`serial_stages`) e já tem uma rodando.
 
 ## Host e memória
 
@@ -78,13 +73,12 @@ Lembre também que **containers rodam fora da fatia**: eles são filhos do servi
 que é root. Conte-os à parte.
 
 **Memória presa e ninguém sabe de quem.**
-Ambiente de teste que ninguém derrubou. O encerramento é fixo agora — busca
-`docker-compose*.yml`/`compose*.yml` na raiz da worktree e derruba sempre que a unidade sai
-de trabalho. Se o ambiente não usa Docker Compose, ele não tem reaper nenhum: já foram 27
-pilhas, 147 processos, 8,8 GB, uma noite inteira, antes desse mecanismo existir.
+Ambiente de teste que ninguém derrubou. Já foram 27 pilhas, 147 processos, 8,8 GB, uma
+noite inteira.
 
 ```bash
 orq host --check
+orq sweep                     # cobra o encerramento que falhou
 ps -eo pid,ppid,etimes,args --no-headers | awk '$2==1' | grep -E 'pnpm|node|vite|nest'
 ```
 
@@ -93,12 +87,7 @@ ps -eo pid,ppid,etimes,args --no-headers | awk '$2==1' | grep -E 'pnpm|node|vite
 cria grupo novo. Confira antes: `ps -o pgid= -p <PID>` — só mate o grupo se o resultado for
 igual ao próprio número.
 
-## Telegram e ClickUp
-
-**Nenhum aviso chega, e a esteira parece travada sem motivo.**
-Credencial do Telegram ausente ou inválida. `orq-avisar --testar` manda de verdade e diz se
-falhou — ao contrário do resto do avisador, que nunca lança exceção para não derrubar quem
-chamou.
+## ClickUp
 
 **A escrita saiu com o nome de outra pessoa.**
 A escrita não saiu pelo cliente com o token pessoal. Aprovação atribuída a quem não aprovou
@@ -109,9 +98,9 @@ A escrita não saiu pelo cliente com o token pessoal. Aprovação atribuída a q
 Id de lista já apagada, devolvido por rota de navegação. Resolva pelo nome:
 `orq-clickup find-list "<trecho>"`.
 
-**Padronizei os status e a lista continua igual, mas a API respondeu sucesso.**
-A lista **herda** os status da pasta ou do espaço. Sem `--substituir`, o PUT é aceito e
-ignorado. `orq-clickup list <id> --json` mostra `override_statuses`.
+**Provisionei os status e a lista continua igual, mas a API respondeu sucesso.**
+A lista **herda** os status da pasta ou do espaço. Sem ligar a substituição, o PUT é aceito
+e ignorado. `orq-clickup list <id> --json` mostra `override_statuses`.
 Lição maior: a API responde sucesso sem ter feito nada — sempre releia depois de escrever.
 
 **Apontamento de hora responde 403.**
@@ -124,11 +113,5 @@ Confira a versão do gerenciador de pacotes **antes** de acusar o projeto. Vers�
 recusam lockfile com dependência sem hash de integridade, e o erro parece do projeto.
 
 **Um comando meu foi barrado e eu não entendo por quê.**
-A cerca barrou. Ela diz o motivo e o que fazer. Ela julga pelo **branch**, não mais por
-estágio: publicar o seu branch passa; publicar a base, fundir, ou publicar o branch de outra
-unidade, nunca. Não contorne — a saída é `orq advance` ou `orq hold`.
-
-**`orq doctor` fica vermelho em "declaração coerente (orq validate)".**
-Rode `orq validate` sozinho para ver a lista completa de problemas — falta `CLAUDE.md`/
-`AGENTS.md` na raiz, `worktree_root` dentro do repositório, `github_repo` não declarado, ou
-um ciclo de dependência entre unidades são as causas mais comuns.
+A cerca barrou. Ela diz o motivo e o que fazer. Ela conhece o estágio: publicar e fundir só
+passam na integração. Não contorne — a saída é concluir, reprovar ou travar.

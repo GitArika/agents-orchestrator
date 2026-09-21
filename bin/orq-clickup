@@ -263,65 +263,7 @@ const STATUS_CANONICOS = [
   { status: 'pronto',                type: 'closed' },
 ]
 
-// Os cinco status da esteira NOVA (OA-07) — espelho exato da máquina de
-// cinco estados de OA-03, mesmo nome dos dois lados. Substitui inteiro,
-// nunca preserva um status estranho: diferente de STATUS_CANONICOS (que
-// convive com o que já existe), aqui "padronizar" quer dizer exatamente
-// estes cinco, nem um a mais.
-const STATUS_CINCO = [
-  { status: 'backlog',      type: 'open' },
-  { status: 'em progresso', type: 'custom' },
-  { status: 'revisão',      type: 'custom' },
-  { status: 'bloqueado',    type: 'custom' },
-  { status: 'pronto',       type: 'closed' },
-]
-
 const commands = {
-  // O pré-voo do ClickUp — OA-12 tira esta prova de dentro de `orq doctor`
-  // (bin/orq): o motor não depende mais do ClickUp para despachar, e um
-  // pré-voo que falha por uma ferramenta de gestão fora do ar impediria
-  // trabalho sem necessidade. Quem ainda precisa da prova (o agente, a
-  // instalação) chama aqui, com o `--lista` que quiser conferir.
-  //
-  // Chamadas cruas (não `api()`, que sai do processo em qualquer erro HTTP):
-  // um pré-voo precisa terminar as DUAS provas mesmo se a primeira falhar.
-  async doctor([...flags]) {
-    const listId = flagVal(flags, 'lista')
-    let ok = true
-    const chk = async (rotulo, fn) => {
-      try {
-        linha(`  ✓ ${rotulo}: ${await fn()}`)
-      } catch (e) {
-        ok = false
-        linha(`  ✗ ${rotulo}: ${e.message}`)
-      }
-    }
-    linha('Pré-voo do ClickUp')
-    await chk('token/autenticação', async () => {
-      if (!KEY) throw new Error(AJUDA_CREDENCIAL.split('\n')[0])
-      const res = await fetch(`${API}/user`, {
-        headers: { Authorization: KEY }, signal: AbortSignal.timeout(15000),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const d = await res.json()
-      return `${d.user.username} <${d.user.email}>`
-    })
-    if (listId) {
-      await chk('lista responde', async () => {
-        const res = await fetch(`${API}/list/${resolveId('LIST', listId)}`, {
-          headers: { Authorization: KEY }, signal: AbortSignal.timeout(15000),
-        })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const l = await res.json()
-        const status = (l.statuses || []).map((s) => s.status).join(' · ')
-        return `"${l.name}" (${l.id}) — status: ${status || '(nenhum)'}`
-      })
-    } else {
-      linha('  (sem --lista — pulei a checagem da lista)')
-    }
-    if (!ok) process.exit(1)
-  },
-
   // Antes de QUALQUER escrita, saber de quem é a autoria. Em 27/08/2026 uma
   // aprovação foi publicada assinada por outra pessoa porque a escrita saiu por
   // uma sessão autenticada que não era a do dono do projeto. Aprovação atribuída
@@ -428,92 +370,6 @@ const commands = {
         + 'Não confie na resposta dela; foi por isso que esta conferência existe.')
     }
     linha(`✓ os dez status da esteira estão na lista.`)
-  },
-
-  // O espelho de cinco status (OA-07): substitui a lista pelos CINCO status
-  // exatos da esteira nova — nenhum sobra, nenhum falta. Diferente de
-  // `status-provisionar` (preserva status estranhos, junta ao invés de
-  // substituir): aqui a conversão é CONSCIENTE — recusa enquanto houver
-  // tarefa presa num status que vai desaparecer, porque sumir com o lugar
-  // onde uma tarefa está é pior que recusar o comando.
-  async padronizar([id, ...flags]) {
-    if (!id || !flag(flags, 'cinco')) {
-      die('uso: padronizar <listId|alias> --cinco [--aplicar] [--substituir]\n'
-        + '  --cinco é obrigatório — é o único conjunto que este comando sabe escrever hoje.')
-    }
-    const listId = resolveId('LIST', id)
-    const antes = await api('GET', `/list/${listId}`)
-    const canonicos = STATUS_CINCO.map((s) => s.status)
-    const existentes = (antes.statuses || []).map((s) => s.status.toLowerCase())
-
-    linha(`lista: ${antes.name} (${antes.id})`)
-    linha(`já tem: ${existentes.join(' · ') || '(nenhum)'}`)
-
-    // Conta tarefa por status ÓRFÃO (fora dos cinco) — precisa ver TODAS as
-    // tarefas, abertas e fechadas, paginando: um falso negativo aqui
-    // apagaria o lugar de uma tarefa de verdade.
-    const tarefas = []
-    for (let page = 0; ; page++) {
-      const resp = await api('GET', `/list/${listId}/task?include_closed=true&page=${page}`)
-      tarefas.push(...(resp.tasks || []))
-      if (resp.last_page || !resp.tasks || resp.tasks.length === 0) break
-    }
-    const orfaos = new Map()
-    for (const t of tarefas) {
-      const s = (t.status?.status || '').toLowerCase()
-      if (!canonicos.includes(s)) {
-        if (!orfaos.has(s)) orfaos.set(s, [])
-        orfaos.get(s).push(t)
-      }
-    }
-    if (orfaos.size) {
-      linha('')
-      linha('RECUSADO: há tarefa em status que vai desaparecer:')
-      for (const [status, ts] of orfaos) {
-        linha(`  ${status}: ${ts.length} tarefa(s)`)
-        for (const t of ts.slice(0, 5)) linha(`    - ${t.name} (${t.id})`)
-        if (ts.length > 5) linha(`    ... e mais ${ts.length - 5}`)
-      }
-      die('\nMova essas tarefas para um dos cinco status antes de padronizar — '
-        + 'decisão de quem toca o quadro, não da ferramenta.')
-    }
-    linha('nenhuma tarefa órfã — nenhum status vai desaparecer com trabalho dentro.')
-
-    const conjunto = STATUS_CINCO.map((s, i) => ({ ...s, orderindex: i }))
-    linha('')
-    linha('a lista ficaria assim:')
-    for (const s of conjunto) linha(`  ${String(s.orderindex).padStart(2)}. ${s.status}  (${s.type})`)
-
-    const herda = !antes.override_statuses
-    if (herda) {
-      linha('')
-      linha(`ATENÇÃO: esta lista HERDA os status da pasta "${antes.folder?.name}"`)
-      linha(`(espaço "${antes.space?.name}"). Padronizar aqui liga a substituição`)
-      linha('de status, e a lista deixa de acompanhar mudanças feitas na pasta.')
-    }
-
-    if (!flag(flags, 'aplicar')) {
-      return linha('\nsimulação — nada foi escrito. Para aplicar de verdade: --aplicar')
-    }
-    if (herda && !flag(flags, 'substituir')) {
-      die('\nPAREI: a lista herda os status. Releia o aviso acima e, se for isso\n'
-        + 'mesmo que você quer, repita com --substituir.')
-    }
-
-    await api('PUT', `/list/${listId}`, { override_statuses: true, statuses: conjunto })
-
-    // Conferir. A API já respondeu sucesso sem aplicar nada (aprendizado nº 17).
-    const depois = await api('GET', `/list/${listId}`)
-    const agora = (depois.statuses || []).map((s) => s.status.toLowerCase())
-    const exato = agora.length === canonicos.length && canonicos.every((s) => agora.includes(s))
-    linha('')
-    linha(`a lista tem agora: ${agora.join(' · ')}`)
-    if (!exato) {
-      die('FALHOU: a API respondeu sucesso, mas a lista não ficou com exatamente '
-        + `os cinco status esperados (${canonicos.join(' · ')}).\n`
-        + 'Não confie na resposta dela; foi por isso que esta conferência existe.')
-    }
-    linha('✓ a lista tem exatamente os cinco status da esteira.')
   },
 
   async lists([folder]) {
@@ -882,41 +738,6 @@ const commands = {
     console.log(max > 0 ? body.slice(0, max) : body)
   },
 
-  // A ordem de serviço inteira de uma sessão do papel único (OA-05, passo 1
-  // do BRIEFING em bin/orq): descrição E todos os comentários, do mais antigo
-  // ao mais recente. `desc` só tem a descrição; os comentários são onde mora
-  // o que ela não tem — divergência registrada por uma sessão anterior,
-  // ambiguidade deixada em aberto de propósito, pedido de mudança de uma
-  // revisão. Tratar só a descrição como a tarefa inteira já foi o erro mais
-  // caro desta esteira (aprendizado nº 1).
-  async show([taskId, ...flags]) {
-    if (!taskId) die('usage: show <taskId> [--max=N]')
-    const max = Number(flagVal(flags, 'max') || 0)
-    const [t, c] = await Promise.all([
-      api('GET', `/task/${taskId}?include_markdown_description=true`),
-      api('GET', `/task/${taskId}/comment`),
-    ])
-    const body = t.markdown_description || t.description || t.text_content || ''
-    console.log(`# ${t.name}  [${t.status?.status}]  ${t.id}`)
-    console.log(max > 0 ? body.slice(0, max) : body)
-
-    const comentarios = [...(c.comments || [])].reverse()   // a API devolve do mais novo
-    console.log('')
-    console.log(`── comentários (${comentarios.length}, do mais antigo ao mais recente) ──`)
-    if (!comentarios.length) {
-      console.log('(nenhum)')
-      return
-    }
-    for (const com of comentarios) {
-      const quando = Number(com.date)
-      const carimbo = Number.isFinite(quando)
-        ? new Date(quando).toISOString().replace(/\.\d+Z$/, 'Z') : '(sem data)'
-      console.log('')
-      console.log(`[${carimbo}] ${com.user?.username || '(desconhecido)'}:`)
-      console.log(com.comment_text || '')
-    }
-  },
-
   // --- Dependências ----------------------------------------------------------
   // O bloqueio real do ClickUp (waiting on / blocking), que é coisa DIFERENTE do
   // `relate` (task link, sem semântica de ordem). Sem isto não dá para responder
@@ -960,27 +781,6 @@ const commands = {
     const key = flag(flags, 'blocks') ? 'dependency_of' : 'depends_on'
     await api('DELETE', `/task/${taskId}/dependency?${key}=${other}`)
     out({ task: taskId, removed: other, ok: true })
-  },
-
-  // Apontamento de hora. O endpoint só aceita {tid, start, duration} de forma
-  // confiável — descrição e etiqueta são recurso pago do workspace e devolvem
-  // 403. `start` é ISO local (YYYY-MM-DDTHH:MM:SS[-03:00]); `duration` é
-  // minutos. A entrega sai assinada pelo dono de CLICKUP_API_KEY (whoami).
-  async ['time-entry']([taskId, start, minutes, ...flags]) {
-    if (!taskId || !start || !minutes) {
-      die('usage: time-entry <taskId> <startISO> <minutos>')
-    }
-    const startMs = Date.parse(start)
-    if (Number.isNaN(startMs)) die(`start inválido: "${start}" (esperado ISO 8601)`)
-    const durationMs = Math.round(Number(minutes) * 60000)
-    if (!Number.isFinite(durationMs) || durationMs <= 0) die(`minutos inválido: "${minutes}"`)
-    const teamId = await getTeamId()
-    const { data } = await api('POST', `/team/${teamId}/time_entries`, {
-      tid: taskId,
-      start: startMs,
-      duration: durationMs,
-    })
-    out({ task: taskId, entry_id: data?.id, start_ms: startMs, duration_ms: durationMs, ok: true })
   },
 
   // --- Auditoria de lista -----------------------------------------------------
@@ -1046,11 +846,9 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   node .claude/skills/clickup-api/clickup.mjs <command> ...
 
  read
-  doctor      [--lista=<id>]                            pré-voo do ClickUp (OA-12) — token e lista, chamada real
   whoami      [--json]                                  de quem é a autoria     <- ANTES de escrever
   list        <listId|alias> [--json]                   a lista e seus status
   status-provisionar <listId> [--aplicar]               cria os 10 status da esteira (simula por padrão)
-  padronizar  <listId|alias> --cinco [--aplicar]         substitui pelos 5 status da esteira nova (OA-07, recusa tarefa órfã)
   lists       <folderId|alias>                          lists in a folder       -> NDJSON {id,name}
   tasks       <listId|alias> [--closed --desc --page=N] open tasks in a list    -> NDJSON {id,name,status,url}
   search      <keyword> [--list=<id> ...] [--closed]    name+desc match (anti-dup) -> NDJSON matches
@@ -1060,7 +858,6 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   branch      <taskId>                                  the task's "branch" field value
   types                                                 workspace task types     -> NDJSON {id,name}
   desc        <taskId> [--max=N]                        descricao COMPLETA (a spec) -> markdown
-  show        <taskId> [--max=N]                        desc + TODOS os comentarios, do mais antigo ao mais recente (a ordem de servico inteira)
   spaces                                                spaces do workspace      -> NDJSON {id,name}
   folders     <spaceId|alias>                           folders + suas listas    -> NDJSON {id,name,lists[]}
   space-lists <spaceId|alias>                           listas soltas do space   -> NDJSON {id,name}
@@ -1081,7 +878,6 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   attach      <taskId> <arquivo> [arquivo...]           anexa prova ao cartao    -> NDJSON {id,title,url}
   dep         <taskId> <otherId> [--blocks]             cria bloqueio (padrao: taskId espera por otherId) -> {ok}
   undep       <taskId> <otherId> [--blocks]             remove o bloqueio        -> {ok}
-  time-entry  <taskId> <startISO> <minutos>              aponta hora (so tid/start/duration) -> {entry_id,ok}
  sprints
   sprints                                               list sprint lists (FOLDER_SPRINTS) -> NDJSON {id,name,start,due}
   sprint      <taskId>                                  add a task to the CURRENT sprint (LIST_SPRINT) -> {ok}

@@ -4,21 +4,12 @@
 O motor chama assim:  orq-avisar "<título>" "<mensagem>"
 (e também põe ORQ_NOTIFY_TITLE / ORQ_NOTIFY_MSG no ambiente).
 
-`orq-avisar --canal local "<título>" "<mensagem>"` grava só em `avisos.log` —
-NENHUM destino externo, nem Telegram nem o resto de ORQ_AVISO_DESTINO. É o
-que `hooks/notificar.sh` usa para os ganchos Notification/Stop (OA-11): a
-sessão pedindo decisão já chega pelo app do Claude, avisar de novo pelo
-Telegram seria o mesmo fato duas vezes. Não confundir com ORQ_AVISO_CANAL
-(abaixo) — aquele é o id do canal de conversa do ClickUp; este `--canal` é o
-seletor de destino deste programa.
-
 Duas regras que este arquivo não pode quebrar:
 
   * NUNCA derrubar quem chamou. O Claude Code trata saída diferente de zero num
     gancho como erro do turno, e o laço do motor chama isto nos pontos terminais
     — quarentena, reprovação, espera humana. Sai 0 sempre, aconteça o que
-    acontecer. A ÚNICA exceção é `--testar` (ver abaixo): ali É o diagnóstico,
-    então falhar alto é o comportamento certo.
+    acontecer.
   * Autoria correta. Usa o token PESSOAL do dono, o mesmo que assina os
     comentários das tarefas. Uma mensagem que chega com o nome de outra pessoa é
     pior do que mensagem nenhuma.
@@ -27,39 +18,21 @@ Numa máquina sem tela, o aviso do sistema não existe e o registro em arquivo n
 é lido por ninguém: a espera humana só se descobria consultando o quadro à mão.
 Por isso os destinos são configuráveis.
 
-  ORQ_AVISO_DESTINO       clickup,macos,webhook,telegram  (lista com vírgula)
-                          Sem configurar nada: 'telegram' se as duas
-                          credenciais abaixo existirem, senão 'macos' — o
-                          padrão de sempre. Decisão de 22/09/2026: quem só
-                          copiou o token para credenciais.env não devia
-                          também precisar lembrar de exportar uma variável.
+  ORQ_AVISO_DESTINO       clickup,macos,webhook  (lista separada por vírgula)
   ORQ_AVISO_CANAL         id do canal de conversa do ClickUp
   ORQ_AVISO_WORKSPACE     id do espaço de trabalho
   ORQ_AVISO_MENCIONAR     id da pessoa a mencionar (opcional)
   ORQ_AVISO_WEBHOOK       endereço que recebe um POST em JSON
   ORQ_AVISO_RODAPE        uma linha dizendo onde a esteira mora
-
-  TELEGRAM_BOT_TOKEN      em ~/.config/orquestrador/credenciais.env — fale
-                          com @BotFather no Telegram para criar o bot
-  TELEGRAM_CHAT_ID        idem — descubra o seu com a API `getUpdates` depois
-                          de mandar uma mensagem qualquer para o bot
-
-`orq-avisar --testar` manda uma mensagem de verdade ao Telegram e CONFERE a
-resposta da API (`ok: true`, `message_id`) — não basta o HTTP responder 200.
-Ao contrário do resto deste arquivo, --testar FALHA ALTO: é o próprio
-diagnóstico, e diagnóstico que engole erro não serve para nada.
 """
 import json
 import os
 import pathlib
 import subprocess
 import sys
-import time
-import urllib.error
 import urllib.request
 
-CREDENCIAIS = pathlib.Path(os.environ.get(
-    "ORQ_CREDENCIAIS", pathlib.Path.home() / ".config" / "orquestrador" / "credenciais.env"))
+CREDENCIAIS = pathlib.Path.home() / ".config" / "orquestrador" / "credenciais.env"
 REGISTRO = pathlib.Path(os.environ.get(
     "ORQ_LOG_DIR", pathlib.Path.home() / ".claude" / "orchestrator" / "state")) / "avisos.log"
 
@@ -75,38 +48,11 @@ def token() -> str:
     raise RuntimeError(f"CLICKUP_API_KEY não está em {CREDENCIAIS}")
 
 
-def _credencial(chave: str) -> str:
-    """Lê UMA chave do arquivo de credenciais pessoal — fora de qualquer
-    repositório, permissão 600. Usada pelas credenciais do Telegram; o
-    ClickUp mantém a leitura própria acima (`token()`) por compatibilidade,
-    já que ela aceita duas chaves diferentes para o mesmo valor."""
-    if not CREDENCIAIS.exists():
-        raise RuntimeError(f"{CREDENCIAIS} não existe")
-    for linha in CREDENCIAIS.read_text().splitlines():
-        linha = linha.strip()
-        if linha.startswith("#") or "=" not in linha:
-            continue
-        k, v = linha.split("=", 1)
-        if k.strip().upper() == chave:
-            valor = v.strip().strip('"').strip("'")
-            if not valor:
-                raise RuntimeError(f"{chave} está vazia em {CREDENCIAIS}")
-            return valor
-    raise RuntimeError(f"{chave} não está em {CREDENCIAIS}")
-
-
-def token_telegram() -> str:
-    return _credencial("TELEGRAM_BOT_TOKEN")
-
-
-def chat_id_telegram() -> str:
-    return _credencial("TELEGRAM_CHAT_ID")
-
-
 def registrar(unidade, titulo, msg):
     """O canal que sempre existe. Acontece antes de qualquer entrega."""
     REGISTRO.parent.mkdir(parents=True, exist_ok=True)
     with REGISTRO.open("a") as f:
+        import time
         f.write(f"{time.strftime('%FT%TZ', time.gmtime())}\t{unidade}\t{titulo}\t"
                 f"{msg.replace(chr(10), ' ')}\n")
 
@@ -157,94 +103,10 @@ def para_webhook(unidade, titulo, msg):
         return f"HTTP {r.status}"
 
 
-def _escapar_html(t: str) -> str:
-    """Só os três caracteres que o modo HTML do Telegram trata como marcação.
-    Underscore NÃO entra aqui — é exatamente o que faz HTML valer mais que
-    Markdown neste arquivo: nome de branch tem `_` aos montes, e o analisador
-    de Markdown do Telegram quebra nisso com erro 400 em vez de entregar."""
-    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def para_telegram(unidade, titulo, msg):
-    """POST https://api.telegram.org/bot<token>/sendMessage.
-
-    Até quatro linhas: título em negrito, a mensagem, a unidade (se houver) e
-    o rodapé (se configurado) — aviso que não cabe na tela de bloqueio não é
-    aviso. `parse_mode=HTML`: ver `_escapar_html`.
-
-    A resposta é CONFERIDA, não só o código HTTP — Telegram pode responder
-    200 com `ok: false` (chat_id errado, bot removido da conversa etc.), e o
-    aprendizado nº 17 desta casa é exatamente sobre API que diz sucesso e não
-    faz nada.
-    """
-    tok = token_telegram()
-    chat_id = chat_id_telegram()
-    linhas = [f"<b>{_escapar_html(titulo)}</b>"] if titulo else []
-    if msg:
-        linhas.append(_escapar_html(msg))
-    if unidade:
-        linhas.append(f"unidade: {_escapar_html(unidade)}")
-    rodape = os.environ.get("ORQ_AVISO_RODAPE", "")
-    if rodape:
-        linhas.append(_escapar_html(rodape))
-    texto = "\n".join(linhas) or "(aviso vazio)"
-
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{tok}/sendMessage",
-        data=json.dumps({"chat_id": chat_id, "text": texto,
-                         "parse_mode": "HTML"}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            resposta = json.load(r)
-    except urllib.error.HTTPError as e:
-        # Telegram devolve o motivo no corpo mesmo em erro HTTP (chat_id
-        # inválido, token revogado) — vale mais que só o código.
-        try:
-            detalhe = json.load(e).get("description", "")
-        except Exception:
-            detalhe = ""
-        raise RuntimeError(f"HTTP {e.code}{': ' + detalhe if detalhe else ''}") from e
-    if not resposta.get("ok"):
-        raise RuntimeError(f"Telegram recusou: {resposta.get('description', resposta)}")
-    return f"message_id={resposta['result']['message_id']}"
-
-
-def _destino_padrao() -> str:
-    """O que usar quando ninguém configurou ORQ_AVISO_DESTINO: telegram se as
-    duas credenciais existirem, senão o padrão de sempre (macos). Ver a nota
-    no topo do arquivo — decisão de 22/09/2026."""
-    try:
-        token_telegram()
-        chat_id_telegram()
-        return "telegram"
-    except Exception:
-        return "macos"
-
-
-def _extrair_canal(argv: list) -> tuple:
-    """Tira `--canal <valor>` de `argv`, devolvendo o resto intacto (título e
-    mensagem continuam posicionais, como sempre). Existe só para
-    `hooks/notificar.sh` ter um jeito EXPLÍCITO de dizer "só o registro" que
-    nenhuma variável de ambiente ambígua reintroduza por engano (OA-11) —
-    `--canal local` pula QUALQUER destino externo, ponto."""
-    resto = list(argv)
-    canal = None
-    if "--canal" in resto:
-        i = resto.index("--canal")
-        if i + 1 < len(resto):
-            canal = resto[i + 1]
-            del resto[i:i + 2]
-        else:
-            del resto[i:i + 1]
-    return resto, canal
-
-
 def principal():
-    argv, canal = _extrair_canal(sys.argv)
-    titulo = (argv[1] if len(argv) > 1
+    titulo = (sys.argv[1] if len(sys.argv) > 1
               else os.environ.get("ORQ_NOTIFY_TITLE", "")).strip()
-    msg = (argv[2] if len(argv) > 2
+    msg = (sys.argv[2] if len(sys.argv) > 2
            else os.environ.get("ORQ_NOTIFY_MSG", "")).strip()
     if not (titulo or msg):
         return
@@ -255,12 +117,8 @@ def principal():
     except Exception as e:
         print(f"orq-avisar: nem o registro funcionou ({e})", file=sys.stderr)
 
-    if canal == "local":
-        return   # só o registro acima — nenhum destino externo, nunca
-
-    destinos = [d.strip() for d in
-               os.environ.get("ORQ_AVISO_DESTINO", _destino_padrao()).split(",")
-               if d.strip()]
+    destinos = [d.strip() for d in os.environ.get("ORQ_AVISO_DESTINO", "macos").split(",")
+                if d.strip()]
     for d in destinos:
         try:
             if d == "clickup":
@@ -269,8 +127,6 @@ def principal():
                 print(f"macos: {para_macos(titulo, msg)}")
             elif d == "webhook":
                 print(f"webhook: {para_webhook(unidade, titulo, msg)}")
-            elif d == "telegram":
-                print(f"telegram: {para_telegram(unidade, titulo, msg)}")
             else:
                 print(f"orq-avisar: destino desconhecido '{d}'", file=sys.stderr)
         except Exception as e:
@@ -278,34 +134,8 @@ def principal():
             print(f"orq-avisar: não entreguei em '{d}' ({e})", file=sys.stderr)
 
 
-def testar():
-    """`orq-avisar --testar` — o único caminho deste arquivo que PODE falhar
-    alto. É o próprio diagnóstico: engolir o erro aqui esconderia dele
-    justamente o que ele existe para relatar (mesmo raciocínio do `orq doctor`
-    em bin/orq)."""
-    try:
-        token_telegram()
-        chat_id_telegram()
-    except RuntimeError as e:
-        print(f"Telegram não configurado: {e}", file=sys.stderr)
-        return 1
-    try:
-        resultado = para_telegram(
-            "", "🔔 orq-avisar --testar",
-            "Se esta mensagem chegou, o canal do Telegram está configurado "
-            "corretamente. Pode ignorá-la.")
-    except Exception as e:
-        print(f"falhou: {e}", file=sys.stderr)
-        return 1
-    print(f"ok: {resultado}")
-    return 0
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--testar":
-        sys.exit(testar())
-    try:
-        principal()
-    except Exception as e:
-        print(f"orq-avisar: {e}", file=sys.stderr)
-    sys.exit(0)
+try:
+    principal()
+except Exception as e:
+    print(f"orq-avisar: {e}", file=sys.stderr)
+sys.exit(0)

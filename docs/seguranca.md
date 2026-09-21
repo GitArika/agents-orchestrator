@@ -7,19 +7,16 @@ pode barrar. Ela vê o comando inteiro.
 
 | Não passa | Por quê |
 | --- | --- |
-| Publicar em qualquer branch que não seja o próprio da unidade | Publicar o seu branch é permitido; publicar a base ou o branch de outra unidade, nunca. |
-| Fundir (`gh pr merge`), sob qualquer forma | Fundir é do gate humano, sem exceção — nenhuma sessão funde, mesmo dentro do próprio branch. |
-| `git merge` trazendo a base para dentro de si mesma | Fundir dentro da base é integração, e integração é do gate humano agora. |
-| Publicar com força, espelho ou remoção de branch | Reescrever histórico é decisão humana, mesmo no próprio branch. |
-| Abrir PR para uma base diferente da declarada na esteira | PR para o lugar errado é trabalho perdido descoberto tarde. |
+| Publicar ou fundir fora da etapa de integração | Publicar é de uma etapa só. As outras commitam na própria cópia e param. |
+| Publicar com força, espelho ou remoção de branch | Reescrever histórico é decisão humana. Nem a integração faz isso. |
 | Elevar privilégio (`sudo`) | Se a tarefa exige administrador, ela exige uma pessoa. |
-| Publicar pacote, publicar uma release | Irreversível. |
-| Baixar e executar script da internet | Se a ferramenta é necessária, ela se declara no `CLAUDE.md` do projeto, onde alguém revisa. |
+| Publicar pacote | Irreversível. |
+| Baixar e executar script da internet | Se a ferramenta é necessária, ela se declara no preparo, onde alguém revisa. |
 | Apagar recursivamente fora da própria cópia de trabalho | O dano fica contido no que é descartável. |
-| Ler ou escrever a credencial pessoal, o registro de confiança de pastas, ou o banco da esteira | Uma sessão que pode reescrever a cerca ou o estado não tem cerca nem estado confiável. |
+| Ler ou escrever a credencial pessoal e o registro de confiança de pastas | Uma sessão que pode reescrever a cerca não tem cerca. |
 
-Quando a cerca barra, ela diz **o motivo e o que fazer** — a sessão deve concluir
-(`orq advance`) ou travar (`orq hold`), nunca contornar.
+Quando a cerca barra, ela diz **o motivo e o que fazer** — a sessão deve concluir, reprovar
+ou travar, nunca contornar.
 
 ## Por que um gancho, e não uma lista de permissões
 
@@ -34,11 +31,8 @@ trivial.
 
 O gancho vê o comando inteiro, roda sempre, e não é anulável por permissão de ninguém.
 
-**A regra de publicação mudou de "por etapa" para "por branch da própria unidade".** No
-modelo antigo, só a sessão de integração publicava. Com um papel só, não existe mais sessão
-de integração: qualquer sessão pode publicar o **seu próprio** branch — é o passo 6 do
-briefing — mas nenhuma funde. A distinção deixou de ser "quem você é" e passou a ser "para
-onde você está publicando".
+**E ele conhece a etapa** — o que corrigiu um segundo erro: barrar `git push` por inteiro
+quebraria justamente a integração, que é quem publica.
 
 ## As outras travas
 
@@ -88,11 +82,10 @@ container, máquina descartável, rede fechada. A esteira não substitui isso.
 ## Se algo der errado
 
 ```bash
-tmux kill-session -t orq-loop-<esteira>   # para de despachar
-orq status                                # o que ainda está vivo
-orq stop <unidade>                        # encerra uma sessão sem mudar o status
+orq loop-stop            # para de despachar
+orq status               # o que ainda está vivo
+orq stop <tarefa>        # encerra uma sessão
 ```
 
-O trabalho feito fica: cada unidade tem seu branch publicado (se chegou a publicar), e a
-worktree só é removida quando a unidade chega a `pronto` ou `bloqueado` — nunca por parar o
-laço.
+O trabalho feito fica: cada tarefa tem seu branch, e as cópias de trabalho não são apagadas
+ao parar.

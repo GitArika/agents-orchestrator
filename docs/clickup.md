@@ -1,30 +1,30 @@
 # Organização no ClickUp
 
-## Os cinco status
+## Os dez status
 
-| Status | O que significa |
-| --- | --- |
-| **backlog** | declarada, esperando dependência ou vaga para começar |
-| **em progresso** | uma sessão está trabalhando nela agora |
-| **revisão** | o PR está aberto, esperando uma pessoa |
-| **bloqueado** | parou por decisão humana, ou o PR voltou o limite de vezes |
-| **pronto** | o PR foi fundido — estado terminal |
+| Etapa | A tarefa espera em | Enquanto trabalham, ela fica em | Quando termina, vai para |
+| --- | --- | --- | --- |
+| Especificação | backlog | especificando | spec pronta |
+| Implementação | spec pronta | em progresso | aguardando revisão |
+| Revisão | aguardando revisão | revisando | aguardando integração |
+| Integração | aguardando integração | integrando | pronto |
 
-São os mesmos cinco do banco SQLite (`backlog`, `em_progresso`, `revisao`, `bloqueado`,
-`pronto`) — este é o espelho que o time lê no quadro do ClickUp. Um agente nunca escreve o
-status pensando nele mesmo: escreve pensando em quem abrir o cartão sem saber nada do
-orquestrador.
+Repare que **onde uma etapa termina é onde a próxima começa**. É só isso que faz a esteira
+andar: ninguém precisa empurrar a tarefa de uma etapa para a outra.
+
+O décimo status é **parado**. É para onde a tarefa vai quando trava esperando uma resposta
+sua. Sem ele, quem abre o quadro vê "revisando" e acha que alguém está revisando — quando
+na verdade ninguém está fazendo nada e todo mundo espera você.
 
 ## Criar os status na sua lista
 
 ```bash
-orq-clickup padronizar <id da lista> --cinco              # mostra o que faria
-orq-clickup padronizar <id da lista> --cinco --aplicar    # substitui
+orq-clickup status-provisionar <id da lista>              # mostra o que faria
+orq-clickup status-provisionar <id da lista> --aplicar    # cria
 ```
 
-Diferente do antigo `status-provisionar` (que só acrescentava, para o modelo de dez status),
-`padronizar --cinco` **substitui a lista inteira** pelos cinco de cima — nem um a mais. Ele
-recusa aplicar se houver tarefa num status que não é nenhum dos cinco: mova-a antes.
+Ele **só acrescenta**. Nunca renomeia nem apaga status que já existe — pode haver tarefa
+dentro, e mexer nisso é decisão de quem é dono do processo.
 
 **Uma coisa para saber antes:** listas costumam **herdar** os status da pasta em que estão.
 Se a sua herda, criar status só nela exige ligar a substituição — e a partir daí ela deixa
@@ -36,22 +36,20 @@ Se a esteira vai ocupar a pasta inteira, o mais limpo é definir os status **na 
 
 Duas fontes, e elas não se sobrepõem:
 
-**O ClickUp manda no conteúdo.** O que a tarefa pede, o que foi decidido nos comentários, o
-histórico de idas e vindas de uma revisão. É o quadro do time.
+**O ClickUp manda no status e no conteúdo.** Em que etapa a tarefa está, o que ela pede, o
+que foi decidido nos comentários. É o quadro do time.
 
-**O banco da esteira manda no status e no grafo.** Em que status a unidade está de verdade,
-o que depende de quê, o PR aberto, quantas devoluções já teve. O ClickUp só **espelha** o
-status — nunca é ele quem decide a transição.
+**O arquivo da esteira manda no desenho.** Quais tarefas a esteira conhece, o que depende de
+quê, o que precisa passar antes de concluir. Esse arquivo vive no repositório do projeto e é
+revisado junto com o código.
 
-**A escrita no ClickUp é sempre do AGENTE, nunca do motor.** `bin/orq` não fala com a API do
-ClickUp em nenhum momento: quem lê e escreve o cartão é a própria sessão, através de
-`orq-clickup`, seguindo os passos do seu briefing. Se o cartão e o banco divergirem — a
-escrita falhou no meio, por exemplo — o banco é a autoridade; o cartão é só o que uma pessoa
-lê primeiro.
+Por que não pôr as dependências no ClickUp? Porque dependência é decisão técnica, e decisão
+técnica tem de ser revisada por quem entende do código. Campo de ferramenta de gestão muda
+sozinho, sem revisão, e ninguém vê.
 
-**Tarefa que está no ClickUp e não foi declarada (`orq task add`) nunca é executada.** Isso é
-proposital: uma esteira que executa o que aparece na lista é uma esteira que qualquer pessoa
-dispara sem querer.
+**Tarefa que está no ClickUp e não está no arquivo nunca é executada.** Ela aparece marcada
+no quadro, para você notar. Isso é proposital: uma esteira que executa o que aparece na
+lista é uma esteira que qualquer pessoa dispara sem querer.
 
 ## Escrever no ClickUp
 
@@ -73,22 +71,10 @@ cartão **assinado por outra pessoa** — porque a escrita saiu por um caminho a
 a sessão de outra pessoa na mesma máquina. Aprovação atribuída a quem não aprovou é
 falsificação de registro, mesmo sem ninguém ter tido má intenção.
 
-## Ler a ordem de serviço inteira
-
-```bash
-orq-clickup show <tarefa>
-```
-
-Descrição **e** todos os comentários, do mais antigo ao mais recente — é o primeiro comando
-de toda sessão. Os comentários não são conversa paralela: é onde mora divergência registrada
-por quem veio antes, ambiguidade deixada em aberto de propósito, ou o pedido de mudança de
-uma revisão devolvida. Tratar só a descrição como a tarefa inteira já foi o erro mais caro
-desta esteira.
-
 ## Como escrever os cartões
 
 **O título é uma frase em português comum.** "A tela de frota trava sozinha e os botões
-param de responder", não "FE-16". O código da unidade vive no banco da esteira; o título é
+param de responder", não "FE-16". O código da tarefa vive no arquivo da esteira; o título é
 para pessoas lerem no quadro.
 
 **A descrição é a especificação.** É ela que a sessão lê como ordem de serviço. Vale o
@@ -96,16 +82,11 @@ tempo que você investir: descrição vaga vira trabalho vago.
 
 ## Apontar hora
 
-```bash
-orq-clickup time-entry <tarefa> <início ISO> <minutos>
-```
-
 Envie apenas o essencial: a tarefa, o começo e a duração. Descrição e etiqueta em
 apontamento de hora são recurso pago, e mandá-los faz a operação inteira ser recusada com um
 erro que não explica isso.
 
-## Fundir e fechar é seu
+## Fechar cartão é seu
 
-A sessão nunca funde o PR, e nunca move o cartão para `pronto` por conta própria — a cerca
-barra `gh pr merge` sem exceção. Fechar é decisão humana; o vigia só marca `pronto` **depois**
-de ver o merge de verdade no GitHub.
+A sessão nunca move um cartão para o status final por conta própria. Ela deixa em
+"aguardando integração" ou "pronto" conforme configurado, e o fechamento é decisão humana.

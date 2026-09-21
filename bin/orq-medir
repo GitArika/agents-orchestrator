@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """O medidor da esteira.
 
-A esteira deixa rastro farto em vários lugares que não conversam entre si. Este
+A esteira deixa rastro farto em oito lugares que não conversam entre si. Este
 programa os lê e responde, por unidade de trabalho, quanto tempo levou, quantas
 vezes voltou, quanto esperou por uma pessoa, quantos tokens consumiu e quanto
 código produziu.
 
-Desde o modelo de papel único (OA-01/OA-08/OA-09/OA-11), a fonte mais rica é o
-banco da própria esteira (`~/.config/orquestrador/esteiras/*.db`): a tabela
-`evento` é gravada na mesma transação do fato, o que nenhum arquivo separado
-consegue prometer. `state/loop-<esteira>.json` e a etapa (spec/implement/
-review/integrate) do modelo de quatro estágios só existem em rastro ANTIGO —
-lidos aqui, mas nunca produzidos pelo modelo novo. Ver
-docs/specs/orquestrador-agil/OA-13-medicao-adaptada.md.
-
-Ele SÓ LÊ. Escreve exclusivamente no próprio armazém, nunca no banco da
-esteira nem no estado da esteira, e nunca toca em sessão que ainda está em
-curso.
+Ele SÓ LÊ. Escreve exclusivamente no próprio armazém, nunca no estado da esteira,
+e nunca toca em sessão que ainda está em curso.
 
 Desenho: docs/especificacoes/2026-09-02-medicao-desenho.md
 """
@@ -27,7 +18,6 @@ import os
 import pathlib
 import re
 import sqlite3
-import statistics
 import subprocess
 import sys
 import tomllib
@@ -36,16 +26,6 @@ import urllib.error
 import urllib.request
 
 ARMAZEM_PADRAO = pathlib.Path.home() / ".claude/orchestrator/state/medicao.db"
-
-# Onde o modelo novo guarda o banco de cada esteira (OA-01) — mesma constante
-# de `BANCOS` em bin/orq. Um arquivo por esteira; este programa só lê.
-BANCO_ESTEIRAS = pathlib.Path.home() / ".config/orquestrador/esteiras"
-
-# A etapa de toda sessão do modelo novo: não há mais spec/implement/review/
-# integrate, e a coluna `etapa` (que o esquema do armazém mantém — o modelo de
-# dado não muda, só o que alimenta) recebe esta sentinela fixa em vez de um
-# valor real. Sessão com `etapa` diferente disto é sempre rastro ANTIGO.
-PAPEL_UNICO = "auto-contido"
 
 # --------------------------------------------------------------------------- #
 # O esquema
@@ -69,10 +49,7 @@ CREATE TABLE IF NOT EXISTS unidade (
   id         INTEGER PRIMARY KEY,
   esteira_id INTEGER NOT NULL REFERENCES esteira(id),
   codigo     TEXT NOT NULL,
-  -- Nula é normal no modelo novo: `clickup_id` (OA-01) é opcional lá também
-  -- — nem toda unidade nasce ligada a uma tarefa do ClickUp. NOT NULL aqui
-  -- faria a coleta explodir na primeira unidade sem ela.
-  tarefa     TEXT,
+  tarefa     TEXT NOT NULL,
   titulo     TEXT,
   branch     TEXT,
   UNIQUE (esteira_id, codigo)
@@ -82,9 +59,6 @@ CREATE TABLE IF NOT EXISTS sessao (
   id              INTEGER PRIMARY KEY,
   unidade_id      INTEGER NOT NULL REFERENCES unidade(id),
   maquina_id      INTEGER NOT NULL REFERENCES maquina(id),
-  -- spec/implement/review/integrate é rastro ANTIGO (modelo de quatro
-  -- estágios). Toda sessão do modelo novo entra com a sentinela
-  -- PAPEL_UNICO ('auto-contido') — ver comentário na constante.
   etapa           TEXT NOT NULL,
   inicio          TEXT,
   inicio_deduzido INTEGER NOT NULL DEFAULT 0,
@@ -181,14 +155,10 @@ SELECT u.codigo, u.titulo,
   FROM unidade u JOIN sessao s ON s.unidade_id = u.id
  GROUP BY u.id;
 
--- 'espera_humana' é o tipo do modelo antigo (estado do laço); 'bloqueada' é o
--- tipo que o roteamento de eventos do modelo novo emite (OA-11) sempre que uma
--- unidade para por decisão humana — inclusive a devolução que esgotou o
--- retrabalho. Os dois descrevem o mesmo fato: alguém precisa decidir.
 CREATE VIEW IF NOT EXISTS v_espera_humana AS
 SELECT u.codigo, u.titulo, e.ts, e.texto
   FROM evento e JOIN unidade u ON u.id = e.unidade_id
- WHERE e.tipo IN ('espera_humana', 'bloqueada');
+ WHERE e.tipo = 'espera_humana';
 
 CREATE VIEW IF NOT EXISTS v_consumo_por_unidade AS
 SELECT u.codigo, u.titulo, c.modelo,
@@ -208,8 +178,6 @@ SELECT u.codigo, u.titulo, count(*) AS commits,
 
 -- Memoria por etapa so existe daqui para a frente: o rastro antigo nao guarda
 -- consumo por sessao, e nenhum esforco recupera o que nunca foi escrito.
--- Sessao do modelo novo entra com etapa = PAPEL_UNICO: aparece aqui como um
--- balde so, nao como estagio.
 CREATE VIEW IF NOT EXISTS v_memoria_por_etapa AS
 SELECT COALESCE(etapa, '(sem etapa)') AS etapa,
        count(*)                    AS amostras,
@@ -237,9 +205,7 @@ SELECT s.id, u.codigo AS unidade, u.tarefa, u.titulo, m.nome AS maquina,
   JOIN maquina m ON m.id = s.maquina_id;
 
 -- Só sessão com início MEDIDO entra: misturar deduzido com medido produziria
--- uma média que ninguém pode defender. `etapa` só distingue estágio no rastro
--- ANTIGO; sessão do modelo novo entra inteira no balde PAPEL_UNICO — é a
--- distribuição da sessão inteira, que substitui a mediana por estágio.
+-- uma média que ninguém pode defender.
 CREATE VIEW IF NOT EXISTS v_tempo_por_etapa AS
 SELECT etapa,
        count(*)                 AS sessoes,
@@ -261,36 +227,6 @@ SELECT s.etapa,
        sum(c.tokens_cache_escrita)   AS cache_escrito
   FROM sessao s JOIN consumo c ON c.sessao_id = s.id
  GROUP BY s.etapa;
-
--- As três métricas que o gate humano cria (OA-13). O humano está no caminho
--- crítico agora, e é a espera por ele — não mais uma etapa — que determina a
--- vazão da esteira.
-
--- Do evento 'pr_aberto' ao 'pr_fundido': a espera humana em revisão. Só a
--- primeira abertura e a fusão mais recente entram — um PR pode reabrir com
--- retrabalho no meio, e é o ciclo inteiro que interessa aqui.
-CREATE VIEW IF NOT EXISTS v_tempo_revisao AS
-SELECT u.codigo, u.titulo,
-       min(CASE WHEN e.tipo = 'pr_aberto'  THEN e.ts END) AS pr_aberto_em,
-       max(CASE WHEN e.tipo = 'pr_fundido' THEN e.ts END) AS pr_fundido_em,
-       round((julianday(max(CASE WHEN e.tipo = 'pr_fundido' THEN e.ts END))
-            - julianday(min(CASE WHEN e.tipo = 'pr_aberto'  THEN e.ts END))) * 24, 2)
-                                                           AS horas
-  FROM unidade u JOIN evento e ON e.unidade_id = u.id
- WHERE e.tipo IN ('pr_aberto', 'pr_fundido')
- GROUP BY u.id
-HAVING pr_aberto_em IS NOT NULL AND pr_fundido_em IS NOT NULL;
-
--- Quantos PRs voltaram com CHANGES_REQUESTED ('retrabalho', OA-08/OA-09), e
--- quantas rodadas até fundir. Só entra unidade que chegou a abrir PR — sem
--- isso, "devolução" não tem contra o que ser taxa.
-CREATE VIEW IF NOT EXISTS v_devolucao AS
-SELECT u.codigo, u.titulo,
-       sum(CASE WHEN e.tipo = 'retrabalho' THEN 1 ELSE 0 END) AS devolucoes
-  FROM unidade u JOIN evento e ON e.unidade_id = u.id
- WHERE u.id IN (SELECT unidade_id FROM evento WHERE tipo = 'pr_aberto')
-   AND e.tipo IN ('pr_aberto', 'retrabalho')
- GROUP BY u.id;
 """
 
 
@@ -330,16 +266,8 @@ def chave_evento(maquina, origem, tipo, ts, alvo):
 
 
 # --------------------------------------------------------------------------- #
-# As sessões arquivadas — RASTRO ANTIGO (modelo de quatro estágios)
+# As sessões
 # --------------------------------------------------------------------------- #
-#
-# `sessoes_arquivadas`, `despachos` e `casar` só enxergam o que o modelo
-# antigo escreveu: pasta `archive/*/*/meta.json` com `stage`, e
-# `runs.jsonl`. O modelo novo não escreve nenhum dos dois — a sessão nasce e
-# morre dentro da transação SQLite da esteira (OA-01), e é `sessoes_da_esteira`
-# mais abaixo que a lê. Este bloco continua existindo só para não perder o
-# rastro que já foi coletado antes da troca de modelo (e o que sobrar em
-# `historico-mac`, cópia única de uma máquina anterior que nunca vai crescer).
 
 # Ordem importa: "loop-reset:1" tem de casar com "loop-reset" antes de chegar
 # perto de "reset", que significa outra coisa.
@@ -513,12 +441,7 @@ def _id_unidade(con, esteira_id, codigo, tarefa, branch=None):
 
 
 def gravar_sessoes(con, maquina, papel, sessoes):
-    """Grava por acréscimo com substituição. Repetir não duplica.
-
-    `etapa` continua exigida — sessão do modelo novo chega com a sentinela
-    PAPEL_UNICO (`sessoes_da_esteira`), então a exigência segue válida para
-    as duas populações.
-    """
+    """Grava por acréscimo com substituição. Repetir não duplica."""
     maquina_id = _id_maquina(con, maquina, papel)
     n = 0
     for s in sessoes:
@@ -545,85 +468,6 @@ def gravar_sessoes(con, maquina, papel, sessoes):
         n += 1
     con.commit()
     return n
-
-
-# --------------------------------------------------------------------------- #
-# As sessões e os eventos do modelo novo — o banco da esteira (OA-01)
-# --------------------------------------------------------------------------- #
-
-def bancos_de_esteira(raiz=BANCO_ESTEIRAS):
-    """Um arquivo por esteira. Vazio (ou pasta ausente) é normal numa máquina
-    que nunca rodou o modelo novo — não é erro, é fonte sem nada ainda."""
-    raiz = pathlib.Path(raiz)
-    if not raiz.exists():
-        return []
-    return sorted(raiz.glob("*.db"))
-
-
-def abrir_banco_esteira(caminho):
-    """Abre o banco da esteira em modo SOMENTE LEITURA. Nunca escreve nele —
-    é o estado de verdade de outro programa (`bin/orq`), e a promessa deste
-    aqui é ler, não interferir."""
-    con = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def config_do_banco(con):
-    """As chaves de config que este programa usa: nome da esteira e onde o
-    repositório mora."""
-    fora = {}
-    for r in con.execute("SELECT chave, valor FROM config"):
-        fora[r["chave"]] = r["valor"]
-    return fora
-
-
-def sessoes_da_esteira(unidades, sessoes, esteira_nome):
-    """As sessões do modelo novo, já no formato que `gravar_sessoes` espera.
-
-    Início e fim vêm MEDIDOS — o despacho e a abertura da sessão são o mesmo
-    evento, gravado na mesma transação SQLite (OA-01); não há o que deduzir.
-    Toda sessão entra com a etapa sentinela PAPEL_UNICO: não existe mais
-    spec/implement/review/integrate.
-    """
-    por_id = {u["id"]: u for u in unidades}
-    fora = []
-    for s in sessoes:
-        u = por_id.get(s["unidade_id"])
-        if not u:
-            continue
-        fora.append({
-            "esteira": esteira_nome, "unidade": u["chave"], "tarefa": u["clickup_id"],
-            "branch": s["branch"], "etapa": PAPEL_UNICO,
-            "inicio": s["iniciada_em"], "inicio_deduzido": False,
-            "fim": s["encerrada_em"], "fim_deduzido": False,
-            "desfecho": s["desfecho"], "desfecho_bruto": s["desfecho"],
-            "status_final": u["status"], "pasta": s["worktree"],
-        })
-    return fora
-
-
-def eventos_da_esteira(unidades, eventos, esteira_nome, maquina):
-    """Os eventos do banco da esteira, traduzidos para o vocabulário do
-    armazém. O tipo viaja sem tradução — despachada, pr_aberto, pr_fundido,
-    retrabalho, bloqueada e os demais que o roteamento de avisos já nomeia
-    (OA-11) — porque são o próprio fato, não uma leitura de mais baixo nível
-    que precisasse de interpretação.
-
-    A chave usa o id interno do evento: é auto-incremento DENTRO do banco da
-    esteira, então o nome da esteira entra na chave para não colidir com o id
-    de outro banco.
-    """
-    por_id = {u["id"]: u for u in unidades}
-    fora = []
-    for e in eventos:
-        u = por_id.get(e["unidade_id"])
-        fora.append({
-            "unidade": u["chave"] if u else None, "ts": e["ts"], "origem": "evento",
-            "tipo": e["tipo"], "autor": None, "texto": e["texto"] or None,
-            "chave": _chave(maquina, esteira_nome, "evento-esteira", e["id"]),
-        })
-    return fora
 
 
 # --------------------------------------------------------------------------- #
@@ -789,11 +633,6 @@ def _chave(*partes):
 
 def eventos_do_laco(estado, esteira, maquina):
     """Retrabalho, quarentena e espera humana, a partir do estado do laço.
-
-    RASTRO ANTIGO: `state/loop-<esteira>.json` é exatamente o arquivo que o
-    modelo novo (OA-01) aposentou — a mesma informação vira eventos com hora
-    exata na tabela `evento` da esteira, lidos por `eventos_da_esteira`. Esta
-    função só serve para o que já foi escrito antes da troca.
 
     Retrabalho e quarentena são fatos SEM hora: o estado é uma fotografia, não um
     histórico. A hora fica vazia em vez de receber um carimbo inventado — e a
@@ -1000,64 +839,6 @@ def producao_por_merge(repo, ref):
     return fora
 
 
-RE_PR_MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+) from")
-RE_PR_SQUASH_SUBJECT = re.compile(r"\(#(\d+)\)\s*$")
-
-
-def commit_do_pr(repo, ref, pr_numero):
-    """A sha exata que integrou o PR — achada pelo NÚMERO, não pelo nome do
-    branch.
-
-    O modelo novo já sabe o número do PR de cada unidade (`unidade.pr_numero`,
-    OA-08); com ele, a busca é pelo commit cujo assunto o cita, o que funciona
-    tanto para merge tradicional ("Merge pull request #35 from …") quanto para
-    squash — o padrão do GitHub, que `branch_do_merge` não alcança porque
-    squash não cria commit de merge nenhum, só um commit comum cujo assunto
-    termina em "(#35)". Integração por rebase não carimba o número em lugar
-    nenhum e fica de fora — limite conhecido, documentado em LIMITES.
-    """
-    saida = _git(repo, ["log", "--format=%H%x02%s", ref])
-    for linha in saida.splitlines():
-        sha, _, assunto = linha.partition("\x02")
-        m = RE_PR_MERGE_SUBJECT.match(assunto) or RE_PR_SQUASH_SUBJECT.search(assunto)
-        if m and m.group(1) == str(pr_numero):
-            return sha
-    return None
-
-
-def commits_do_merge(repo, sha):
-    """Os commits que uma sha de integração trouxe, pelo número de pais: dois
-    pais é merge de verdade (o intervalo é `sha^1..sha^2`, como
-    `producao_por_merge`); um pai só é squash ou rebase — a sha É o commit, e
-    o intervalo vira só ela mesma."""
-    pais = _git(repo, ["rev-list", "--parents", "-n", "1", sha]).split()[1:]
-    if len(pais) >= 2:
-        return _commits_do_intervalo(repo, f"{sha}^1", f"{sha}^2")
-    if len(pais) == 1:
-        return _commits_do_intervalo(repo, pais[0], sha)
-    return []
-
-
-def coletar_producao_pr(con, repo, ref, unidades_com_pr):
-    """Atribui produção pelo PR, para toda unidade que já tem `pr_numero`
-    (OA-08) — mais preciso que `coletar_producao`, que só enxerga merge
-    tradicional pelo nome do branch."""
-    n = 0
-    for u in unidades_com_pr:
-        sha = commit_do_pr(repo, ref, u["pr_numero"])
-        if not sha:
-            continue
-        commits = commits_do_merge(repo, sha)
-        if not commits:
-            continue
-        r = con.execute("SELECT id FROM unidade WHERE codigo=?", (u["chave"],)).fetchone()
-        if not r:
-            continue
-        n += gravar_commits(con, r[0], commits)
-    con.commit()
-    return n
-
-
 def branches_de_unidade(repo):
     saida = _git(repo, ["for-each-ref", "--format=%(refname:short)", "refs/heads/CU-*"])
     return [b.strip() for b in saida.splitlines() if b.strip()]
@@ -1252,45 +1033,6 @@ def cmd_coletar(args):
             k = coletar_producao(con, cfg["repo"], cfg.get("base") or "homol")
             print(f"{maquina}: {k} commits atribuídos a uma unidade")
 
-    bancos = bancos_de_esteira()
-    if not bancos:
-        print(f"modelo novo: nenhum banco de esteira em {BANCO_ESTEIRAS} — "
-              "nada a coletar dali")
-    for caminho in bancos:
-        con_esteira = abrir_banco_esteira(caminho)
-        try:
-            cfg_esteira = config_do_banco(con_esteira)
-            nome = cfg_esteira.get("name") or caminho.stem
-            unidades = [dict(r) for r in con_esteira.execute("SELECT * FROM unidade")]
-            sessoes = [dict(r) for r in con_esteira.execute("SELECT * FROM sessao")]
-            eventos = [dict(r) for r in con_esteira.execute("SELECT * FROM evento")]
-        finally:
-            con_esteira.close()
-
-        n = gravar_sessoes(con, "servidor", "corrente",
-                           sessoes_da_esteira(unidades, sessoes, nome))
-        m = gravar_eventos(con, "servidor",
-                           eventos_da_esteira(unidades, eventos, nome, "servidor"))
-        esteira_id = _id_esteira(con, nome)
-        for u in unidades:
-            if u.get("titulo"):
-                con.execute(
-                    "UPDATE unidade SET titulo = COALESCE(?, titulo)"
-                    " WHERE esteira_id=? AND codigo=?",
-                    (u["titulo"], esteira_id, u["chave"]))
-        con.commit()
-        total += n
-        print(f"{nome}: {len(unidades)} unidades, {n} sessões, {m} eventos "
-              f"— banco {caminho.name}")
-
-        repo = cfg_esteira.get("repo")
-        com_pr = [u for u in unidades if u.get("pr_numero")]
-        if repo and pathlib.Path(repo).exists() and com_pr:
-            ref = ref_de_base(repo, cfg_esteira.get("base_branch") or "homol")
-            k = coletar_producao_pr(con, repo, ref, com_pr)
-            if k:
-                print(f"{nome}: {k} commits atribuídos por PR")
-
     estado = estado_vivo(con, FONTES[0][2], _nome_da_esteira(con))
     n_mem = gravar_amostras(con, estado["sessoes"])
     print(f"vivo: {len(estado['sessoes'])} sessões rodando, {n_mem} amostras de memória, "
@@ -1335,44 +1077,11 @@ def cmd_resumo(args):
             " FROM sessao GROUP BY d ORDER BY n DESC"):
         print(f"  {r['n']:4d}  {r['d']}")
 
-    # 'auto-contido' é a sentinela do papel único (modelo novo, sem etapa de
-    # verdade); qualquer outro valor aqui é rastro ANTIGO.
-    print(f"\npor etapa e desfecho (etapa != '{PAPEL_UNICO}' é rastro antigo):")
+    print("\npor etapa e desfecho:")
     for r in con.execute(
             "SELECT etapa, COALESCE(desfecho,'(sem desfecho)') AS d, count(*) AS n"
             " FROM sessao GROUP BY etapa, d ORDER BY etapa, n DESC"):
         print(f"  {r['n']:4d}  {r['etapa']:<12} {r['d']}")
-
-    print("\ntempo em revisão (pr_aberto → pr_fundido):")
-    revisoes = list(con.execute(
-        "SELECT codigo, titulo, horas FROM v_tempo_revisao ORDER BY horas DESC"))
-    if not revisoes:
-        print("  nada — nenhum PR com abertura e fusão conhecidas")
-    for r in revisoes:
-        print(f"  {r['codigo']:<7} {r['horas']:>7.2f}h  {(r['titulo'] or '')[:48]}")
-
-    print("\ntaxa de devolução (PRs com CHANGES_REQUESTED):")
-    r = con.execute(
-        "SELECT count(*) AS total,"
-        " sum(CASE WHEN devolucoes > 0 THEN 1 ELSE 0 END) AS com_devolucao,"
-        " sum(devolucoes) AS rodadas FROM v_devolucao").fetchone()
-    if not r["total"]:
-        print("  nada — nenhum PR aberto ainda")
-    else:
-        taxa = 100 * (r["com_devolucao"] or 0) / r["total"]
-        print(f"  {r['com_devolucao'] or 0}/{r['total']} PRs devolvidos "
-              f"({taxa:.1f}%), {r['rodadas'] or 0} rodadas de devolução ao todo")
-
-    print("\nduração da sessão de papel único:")
-    minutos = [r[0] for r in con.execute(
-        "SELECT minutos FROM v_sessao WHERE etapa=? AND minutos IS NOT NULL"
-        " AND inicio_deduzido=0", (PAPEL_UNICO,))]
-    if not minutos:
-        print("  nada — nenhuma sessão do modelo novo com início e fim medidos")
-    else:
-        acima_3h = sum(1 for m in minutos if m > 180)
-        print(f"  {len(minutos)} sessões · mediana {statistics.median(minutos):.0f} min · "
-              f"{acima_3h}/{len(minutos)} acima de 3 horas")
 
     print("\ntokens por modelo:")
     for r in con.execute(
@@ -1437,10 +1146,6 @@ def cmd_resumo(args):
 # de rede, para o painel poder atualizar de segundo em segundo sem gastar
 # chamada de API nem disputar nada com a esteira.
 
-# RASTRO ANTIGO: só a ordem de serviço do modelo de quatro estágios nomeia o
-# arquivo com a etapa no fim. O modelo novo despacha `<esteira>-<id>.brief.md`
-# sem etapa nenhuma — `etapa_do_brief` devolve None para ela, o que é correto:
-# não inventa etapa onde não há.
 RE_BRIEF = re.compile(r"^[^/]*?-([0-9A-Za-z]+)-(spec|implement|review|integrate)\.brief\.md$")
 
 
@@ -1550,10 +1255,8 @@ def estado_vivo(con, raiz_estado, nome_esteira):
     raiz = pathlib.Path(raiz_estado)
     vivas = sessoes_vivas(prefixo_da_esteira(nome_esteira), raiz)
     for v in vivas:
-        # O sufixo do nome da sessão é a tarefa (ClickUp) no modelo antigo e o
-        # código da unidade (`chave`) no modelo novo — tenta os dois.
-        r = con.execute("SELECT codigo, titulo FROM unidade WHERE tarefa=? OR codigo=?",
-                        (v["tarefa"], v["tarefa"])).fetchone()
+        r = con.execute("SELECT codigo, titulo FROM unidade WHERE tarefa=?",
+                        (v["tarefa"],)).fetchone()
         v["unidade"] = r["codigo"] if r else v["tarefa"]
         v["titulo"] = r["titulo"] if r else None
 
@@ -1595,34 +1298,17 @@ LIMITES = (
     "Memoria por sessao ou por etapa NAO existe. O motor sabe medir o consumo "
     "real de cada sessao viva, mas nao grava; o unico registro de memoria e da "
     "maquina inteira, com tres amostras de 02/09/2026.",
-    "Duracao e DEDUZIDA, nao medida, SO no rastro antigo (arquivo + "
-    "runs.jsonl): e o intervalo entre o despacho e o arquivamento, e sessao "
-    "sem despacho correspondente vem com inicio_deduzido=1, fora das medias "
-    "de tempo. No modelo novo (banco da esteira, OA-01) inicio e fim sao "
-    "sempre medidos — nascem na mesma transacao do despacho e do encerramento.",
+    "Duracao e DEDUZIDA, nao medida: e o intervalo entre o despacho e o "
+    "arquivamento. As sessoes sem despacho correspondente vem com "
+    "inicio_deduzido=1 e ficam fora das medias de tempo.",
     "Resultado de portao nao foi extraido: ele so existe dentro da captura de "
     "terminal, em texto corrido com codigos de cor.",
     "Custo em dinheiro nao e calculado enquanto a tabela preco_modelo estiver "
     "vazia. Tokens estao contados.",
     "Nada anterior a 31/08/2026 tem rastro: a esteira so passou a arquivar "
     "sessao a partir dali.",
-    "Retrabalho e quarentena do MODELO ANTIGO vem do estado do laco, que e "
-    "uma fotografia do momento da coleta e nao um historico; por isso nao tem "
-    "hora. No modelo novo, retrabalho e bloqueio sao eventos com hora exata "
-    "('retrabalho', 'bloqueada' — evento append-only, OA-01); quarentena como "
-    "conceito separado nao existe mais, virou strikes na propria unidade.",
-    "Etapa (spec/implement/review/integrate) so existe no rastro antigo. "
-    "Sessao do modelo novo entra com etapa = 'auto-contido': media/mediana "
-    "'por etapa' descreve so o rastro antigo, e o balde 'auto-contido' e a "
-    "distribuicao da sessao inteira, nao um estagio.",
-    "Tempo em revisao e taxa de devolucao (v_tempo_revisao, v_devolucao) so "
-    "existem para unidade com evento pr_aberto — PR aberto pelo vigia "
-    "(OA-08). Unidade que nunca abriu PR nao entra em nenhum dos dois.",
-    "Atribuicao de commit por PR (coletar_producao_pr) cobre merge "
-    "tradicional e squash, que carimbam o numero do PR no assunto do commit. "
-    "Integracao por rebase nao carimba nada e fica de fora — cai no "
-    "fallback por nome de branch (coletar_producao), que so acerta se o "
-    "branch nao tiver sido apagado.",
+    "Retrabalho e quarentena vem do estado do laco, que e uma fotografia do "
+    "momento da coleta e nao um historico; por isso nao tem hora.",
 )
 
 
@@ -1689,7 +1375,6 @@ def dados_do_painel(con):
         "memoria": ler("v_memoria_por_etapa"),
         "retrabalho": ler("v_retrabalho"), "ciclo": ler("v_ciclo_por_unidade"),
         "producao": ler("v_producao_por_unidade"), "espera": ler("v_espera_humana"),
-        "tempo_revisao": ler("v_tempo_revisao"), "devolucao": ler("v_devolucao"),
     }
 
 

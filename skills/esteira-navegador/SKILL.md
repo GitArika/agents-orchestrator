@@ -54,9 +54,5 @@ Guarde as capturas de tela junto com o resultado — quem revisa precisa ver, n�
 
 ## 4. Ligue ao encerramento
 
-O encerramento da esteira é fixo agora: ele só derruba `docker-compose*.yml`/`compose*.yml`
-encontrado na raiz da worktree, nada mais. Se a prova sobe um servidor (o preview do
-produto, por exemplo) por fora do Docker Compose, ele **não** tem reaper automático — ou
-você o embute no mesmo `docker-compose.yml` do ambiente fechado (`esteira-sandbox`), ou o
-agente precisa derrubá-lo por conta própria antes de encerrar a sessão. Navegador headless
-que ninguém fecha também é processo abandonado.
+Se a prova sobe um servidor, ele entra no `teardown` da esteira. Navegador headless que
+ninguém fecha também é processo abandonado.

@@ -1,99 +1,95 @@
 ---
 name: esteira-instalar
-description: Use para pôr a esteira para funcionar num projeto que ainda não a tem — examinar o repositório, propor os estágios e os portões a partir do que ele já declara, criar os status no ClickUp, e só entregar quando o pré-voo fechar verde. Use quando pedirem para "instalar a esteira aqui", "configurar o orquestrador neste projeto", "adotar isso no nosso repositório", ou quando alguém quiser saber se este projeto tem como rodar sessões governadas.
+description: Use para pôr a esteira para funcionar num projeto que ainda não a tem — criar o banco, declarar as unidades e dependências, criar os cinco status no ClickUp, e só entregar quando o pré-voo fechar verde. Use quando pedirem para "instalar a esteira aqui", "configurar o orquestrador neste projeto", "adotar isso no nosso repositório", ou quando alguém quiser saber se este projeto tem como rodar sessões governadas.
 ---
 
 # Instalar a esteira num projeto
 
-Você vai escrever no repositório de outra pessoa. Vale a regra das skills que constroem:
-**examinar primeiro, apresentar o que pretende escrever, escrever só depois do sim.**
+Você vai escrever no repositório de outra pessoa e no banco da esteira dela. Vale a regra
+das skills que constroem: **examinar primeiro, apresentar o que pretende escrever, escrever
+só depois do sim.**
 
-## 1. Examinar antes de perguntar
+## 1. Examinar o projeto antes de perguntar
 
-```bash
-cd <raiz do repositório>
-orq init --simular
-```
+`orq init` não lê nada do projeto sozinho — desde a decisão de 22/09/2026, o orquestrador
+não declara mais portão nenhum. Quem examina é você:
 
-Ele lê o repositório e mostra o que descobriu, dizendo de onde tirou cada coisa: branch
-base, diretório de trabalho, gerenciador de pacotes, e os scripts que o projeto **já**
-declara. Nada é escrito.
+| Pergunta | Onde procurar |
+| --- | --- |
+| Qual é o branch de publicação? | `git branch --show-current` na base, ou pergunte |
+| O projeto tem `CLAUDE.md` ou `AGENTS.md` na raiz? | Se não tiver, **é bloqueador** — sem um dos dois o agente não tem de onde tirar setup/verificação, e `orq validate` recusa a esteira |
+| Como se prepara o ambiente, e o que verifica antes de concluir? | O `CLAUDE.md`/`AGENTS.md` já declara — não é você quem decide isso, é conferir se está lá |
+| O produto sobe serviço para trabalhar (banco, cache, fila)? | `docker-compose*.yml`/`.env.example` — se sim, `esteira-sandbox` |
+| Qual o `owner/repo` no GitHub? | Necessário para o vigia de PR (OA-08) consultar `gh` |
 
 ## 2. Apresentar a proposta a uma pessoa
 
-Em português comum, sem código como sujeito de frase. Quatro coisas:
+Em português comum, sem código como sujeito de frase:
 
-- quais estágios a esteira vai ter, e o que cada um significa;
-- quais portões — e **de onde saíram**;
 - onde ficam as cópias de trabalho (fora do repositório, e por quê);
-- quanta memória por estágio, e que esse número se corrige por medida depois;
-- **o que prova que a publicação passou**, depois do merge — veja abaixo.
+- que o setup e a verificação passam a ser o que o `CLAUDE.md`/`AGENTS.md` do projeto já
+  diz — não algo que a esteira vai inventar ou manter à parte;
+- que o encerramento de ambiente é fixo: se o produto sobe algo via
+  `docker-compose*.yml`/`compose*.yml` na raiz da worktree, ele é derrubado sozinho quando a
+  unidade sai de trabalho; qualquer outra coisa fica por conta do agente, na própria sessão;
+- que a revisão passa a ser humana, no PR — não há mais uma sessão dedicada a revisar.
 
-## 2b. Pergunte quem faz o quê, e o que prova
-
-A ferramenta não adivinha estas quatro, e errar qualquer uma gasta sessão:
-
-- **Tem verificação automática?** Se sim, qual comando a consulta
-  (`gh run list --branch main --limit 3`, um script de deploy, um webhook). Isso vira
-  `verificacao_automatica` e é o passo 7 do integrador. **Se não tem, deixe vazio** —
-  a ordem de serviço passa a dizer que não há o que procurar. Nunca presuma que tem.
-- **Como se publica?** Se existe um comando só para isso, nomeie-o no
-  `publish_note` do estágio de integração. Ele vence o procedimento genérico, e é a
-  diferença entre o integrador executar e o integrador improvisar `rsync`.
-- **Tem ambiente fechado para provar comportamento?** Se sim, `esteira-sandbox`.
-- **Quais estágios são de gente?** Um estágio que uma pessoa faz não deve ser
-  despachado: declare-o fora dos estágios da esteira ou marque as unidades como
-  `hands-on` e ponha o modo em `skip_modes`.
-
-## 3. Portões descobertos, nunca inventados
-
-Se o projeto não declara um comando de teste, **o portão de teste não existe**. Diga isso à
-pessoa em vez de inventar um comando: portão inventado falha por motivo errado na primeira
-sessão, e o time conclui que a ferramenta não presta.
-
-## 4. Escrever, depois do sim
+## 3. Criar o banco
 
 ```bash
-orq init --lista <listId>
+orq init --repo . --base <branch de publicação> --worktrees <caminho FORA do repo> \
+          --lista <id da lista> --github <owner>/<repo>
 ```
 
-Sai um `.orchestrator/pipeline.toml` comentado, para revisão humana. Os comentários
-explicam cada escolha — não os apague.
+`--worktrees` tem de ficar fora do repositório: worktree dentro dele faz o `git status` do
+repositório pai listar milhares de arquivos não rastreados.
 
-**Uma decisão precisa de atenção especial:** se as dependências entre as unidades forem de
-**código**, `[pipeline.dependency]` tem de ser `after = "integrate"`. Com `after = "review"`
-a unidade é despachada antes de o código da dependência existir na base, e a sessão é gasta
-à toa. Isso já aconteceu.
+## 4. Portões descobertos, nunca inventados
 
-## 5. Os status no ClickUp
+Se o `CLAUDE.md`/`AGENTS.md` não declara comando de verificação, **o portão não existe** —
+diga isso à pessoa em vez de a esteira inventar um. Portão inventado falha por motivo
+errado na primeira sessão, e o time conclui que a ferramenta não presta. Se não houver
+nenhum dos dois arquivos, a esteira nem chega a ficar pronta: resolva isso primeiro.
+
+## 5. Declarar as unidades e as dependências
 
 ```bash
-orq-clickup status-provisionar <listId>              # simula e mostra tudo
-orq-clickup status-provisionar <listId> --aplicar
+orq task add <CHAVE> --clickup <id da tarefa> --titulo "..." [--prioridade normal] [--modo autonomous]
+orq dep add <CHAVE> --precisa <OUTRA-CHAVE>    # pode repetir --precisa
 ```
 
-Leia o aviso sobre herança de status antes de aplicar. Se a lista herda da pasta, criar
-status nela muda a lista — e talvez o certo seja definir na pasta.
+Tarefa que existe no ClickUp e não foi declarada **nunca é executada** — não aparece nem
+como deriva, simplesmente não existe para a esteira. Isso é proposital.
 
-## 6. Encerramento é obrigatório se o projeto sobe serviço
+Dependência é sempre de **código**: a cópia de trabalho de uma unidade nasce do branch de
+publicação, e o código de que ela depende só existe ali quando a dependência chegou a
+`pronto` (fundida). Não há mais o conceito de dependência "de decisão" liberando mais cedo —
+um papel só faz o ciclo inteiro, então todo o trabalho é código.
 
-Se trabalhar neste projeto exige subir banco, servidor ou qualquer processo, o bloco
-`teardown` **não é opcional**. Chame a skill `esteira-sandbox` para construí-lo. Sem isso,
-cada sessão deixa um ambiente vivo para trás: já foram 27 pilhas segurando 8,8 GB e uma
-esteira inteira travada.
-
-## 7. Entregar com o pré-voo verde
+## 6. Os status no ClickUp
 
 ```bash
-orq doctor
+orq-clickup padronizar <listId> --cinco              # simula e mostra tudo
+orq-clickup padronizar <listId> --cinco --aplicar
 ```
 
-Ele prova cada dependência por chamada real e mostra a evidência. Só entregue quando fechar
-verde — e mostre a saída para a pessoa, linha por linha. Se algo ficar vermelho, diga o que
-é e o que falta, em português comum.
+Ele recusa aplicar se houver tarefa em status que não é um dos cinco — mova-a antes. Leia o
+aviso sobre herança de status: se a lista herda da pasta, `--substituir` liga a substituição
+e ela deixa de acompanhar a pasta.
 
-## O que declarar depois
+## 7. Ambiente fechado, se o projeto sobe serviço
 
-As unidades (`[[task]]`) são declaradas por uma pessoa, no fim do arquivo. Tarefa que existe
-no ClickUp e não está declarada aparece no quadro como deriva e **nunca** é executada. Isso
-é proposital.
+Se trabalhar neste projeto exige subir banco, servidor ou qualquer processo, chame a skill
+`esteira-sandbox` para construir o ambiente. **O encerramento não é mais configurável** — é
+fixo, e só cobre o que subir por `docker-compose*.yml`/`compose*.yml` na raiz da worktree.
+Se o comando que sobe o ambiente não usa Docker Compose, ele não tem reaper automático.
+
+## 8. Entregar com o pré-voo verde
+
+```bash
+orq validate      # recusa uma esteira incoerente, sem escrever nada
+orq doctor         # prova cada dependência por chamada real
+```
+
+Só entregue quando `orq doctor` fechar verde — e mostre a saída para a pessoa, linha por
+linha. Se algo ficar vermelho, diga o que é e o que falta, em português comum.

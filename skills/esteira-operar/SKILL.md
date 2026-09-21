@@ -1,12 +1,12 @@
 ---
 name: esteira-operar
-description: Use para conduzir uma esteira de tarefas do ClickUp com o comando `orq` — ver o que está pronto e o que está bloqueado por dependência, saber quantas sessões a máquina aguenta agora, despachar sessões governadas em cópias de trabalho isoladas, acompanhar, e descobrir o que espera decisão humana. Use quando pedirem para rodar, despachar, priorizar ou conferir o andamento de uma esteira; quando perguntarem "o que eu devo tocar agora", "quantas sessões cabem aqui", "o que está travado", "dispare as próximas", "tem algo me esperando"; ou antes de abrir qualquer sessão longa em segundo plano para trabalho rastreado — a esteira dá a ela cópia de trabalho, ordem de serviço e canal de aviso que um lançamento improvisado não dá.
+description: Use para conduzir uma esteira de tarefas do ClickUp com o comando `orq` — ver o que está pronto e o que está bloqueado por dependência, saber quantas sessões a máquina aguenta agora, despachar sessões governadas em cópias de trabalho isoladas, acompanhar o vigia de PR, e descobrir o que espera o gate humano. Use quando pedirem para rodar, despachar, priorizar ou conferir o andamento de uma esteira; quando perguntarem "o que eu devo tocar agora", "quantas sessões cabem aqui", "o que está travado", "dispare as próximas", "tem algo me esperando"; ou antes de abrir qualquer sessão longa em segundo plano para trabalho rastreado — a esteira dá a ela cópia de trabalho, ordem de serviço e canal de aviso que um lançamento improvisado não dá.
 ---
 
 # Operar a esteira
 
-`orq` transforma uma lista do ClickUp numa esteira que anda. Referência completa dos
-comandos: `orq --help` e o `README.md` do repositório do orquestrador.
+`orq` transforma uma lista do ClickUp numa esteira de agentes auto-contidos. Referência
+completa dos comandos: `orq --help` e o `README.md` do repositório do orquestrador.
 
 ## Antes de qualquer coisa
 
@@ -14,11 +14,11 @@ comandos: `orq --help` e o `README.md` do repositório do orquestrador.
 orq doctor
 ```
 
-Ele **prova** cada dependência por chamada real: o agente responde a um prompt, o ClickUp
-devolve usuário e lista, o git cria e remove uma cópia de trabalho, o tmux abre e fecha uma
-sessão. Nunca despache com o pré-voo vermelho — a versão antiga dele acreditava em
-declaração, dava verde com token morto, e cada sessão morria dois segundos depois de
-nascer enquanto o quadro ficava marcado como se alguém estivesse trabalhando.
+Ele **prova** cada dependência por chamada real: o agente responde a um prompt, o `gh`
+autentica, o git abre e fecha uma worktree, a cerca está íntegra, o Telegram entrega. Nunca
+despache com o pré-voo vermelho — a versão antiga dele acreditava em declaração, dava verde
+com token morto, e cada sessão morria dois segundos depois de nascer enquanto o quadro
+ficava marcado como se alguém estivesse trabalhando.
 
 ## A divisão de autoridade — diga isto em voz alta quando importar
 
@@ -27,47 +27,46 @@ embaralhá-las:
 
 | Pergunta | Quem manda | Por que não em outro lugar |
 | --- | --- | --- |
-| O que é esta unidade, em que estágio está, o que ela diz? | **ClickUp** | É o quadro do time, e o status **é** o estágio. Cópia local envelhece no instante em que alguém arrasta um cartão. |
-| Qual a cadeia de estágios? O que depende de quê? O que barra? | **`<repo>/.orchestrator/pipeline.toml`** | Versionado junto com o código que governa, revisável em pull request. E o ClickUp não tem lugar bom para um grafo de dependências. |
-| O que está rodando agora? | **Os processos vivos** | Uma marca de "rodando" gravada em disco sobrevive a um travamento e mente. O `orq` deriva isso a cada comando. |
+| Em que status a unidade está, o que depende de quê, PR aberto, devoluções | **O banco SQLite da esteira** (`~/.config/orquestrador/esteiras/<nome>.db`) | É a única escrita transacional: dois processos não pisam um no outro, e uma queda no meio nunca deixa estado pela metade. |
+| O que a tarefa pede, o que foi decidido nos comentários | **ClickUp** | É o quadro do time. O status ali é só um espelho do banco — nunca é ele quem decide a transição. |
+| O que está rodando agora | **Os processos vivos** | Uma marca de "rodando" gravada em disco sobrevive a um travamento e mente. O `orq` deriva isso a cada comando (tmux, PID). |
 
 Nada em `~/.claude/orchestrator/state/` é autoridade: são ordens de serviço, logs e um
-histórico só-acrescenta para auditoria. Pode apagar tudo.
+histórico só-acrescenta para auditoria. Pode apagar tudo (menos o banco, que fica em
+`~/.config/orquestrador/esteiras/`).
 
-## A esteira é uma máquina de estados
+## A esteira é uma máquina de cinco estados
 
-Cada estágio nomeia três status do ClickUp:
+```
+backlog ──> em_progresso ──> revisão ──> pronto
+   ^              │              │
+   └── bloqueado ─┴──────────────┘
+```
 
-| | |
-| --- | --- |
-| **fila** | onde a unidade espera; é daqui que o `orq` pega |
-| **trabalho** | marcado ao lançar; prova que uma sessão é dona dela |
-| **conclusão** | marcado ao terminar — e **é** a fila do estágio seguinte |
+Uma unidade nasce em `backlog`. `orq dispatch` lança uma sessão, que faz o ciclo inteiro —
+lê o cartão, implementa, revisa o próprio trabalho, roda a verificação do projeto, abre um
+PR — e sai por um de dois caminhos: `orq advance --pr <n>` (vai para `revisão`) ou
+`orq hold --motivo "..."` (vai para `bloqueado`). Não há mais um "reprovar": quem reprova
+agora é o gate humano, no PR.
 
-A cadeia anda porque a conclusão de um é a fila do outro. Não há segunda contabilidade.
-
-**Dependência barra por estágio, não por unidade.** Para entrar no estágio S, cada
-dependência precisa já ter passado do fim de S. Então B pode ser especificada enquanto A
-ainda é implementada — é daí que vem quase toda a largura da esteira. A regra ingênua
-("espere o bloqueador terminar") serializa uma esteira que poderia correr três de frente.
-
-**Mas dependência de CÓDIGO é diferente.** A cópia de trabalho nasce do branch de
-publicação: enquanto a dependência não estiver INTEGRADA, o código dela não existe na base.
-Por isso as esteiras de código declaram `after = "integrate"`. Uma unidade já foi despachada
-com `after = "review"`, encontrou a base sem nada do que precisava, e a sessão foi gasta à
-toa.
+**Dependência libera só quando a dependência chega em `pronto`.** A cópia de trabalho nasce
+do branch de publicação; enquanto a dependência não estiver fundida, o código dela
+simplesmente não existe na base da worktree. Não há mais o conceito de "libera antes,
+dependência de decisão vs. de código": com um papel só, todo o trabalho é código, e `pronto`
+é o único ponto em que ele está garantidamente na base.
 
 ## O ciclo
 
 ```bash
-orq board           # o quadro inteiro, por estágio
-orq next            # o que pode começar, em ordem de prioridade
+orq board           # o quadro inteiro, os cinco status
+orq next             # o que pode começar, em ordem de prioridade
 orq dispatch -n 2   # dispara as duas de maior prioridade (confirma antes)
-orq status -w       # acompanha; as linhas com ⚠ esperam uma pessoa
+orq status           # acompanha o que está vivo e o que pede decisão
 ```
 
-`orq run <unidade>` lança o estágio em que a unidade **está** — quem escolhe é o quadro,
-não você. `--stage` só para refazer um.
+`orq run <unidade>` lança uma sessão para uma unidade específica, pronta ou não
+(`--force` ignora status/dependência/vaga — decisão sua, não da esteira). `orq attach
+<unidade>` entra na sessão tmux já lançada; `orq log <unidade> -f` acompanha sem entrar.
 
 ## Capacidade: corrija por medida, nunca por palpite
 
@@ -76,39 +75,46 @@ orq capacity        # quantas sessões cabem, e por quê
 orq host            # o que limita esta máquina agora
 ```
 
-O teto sai do menor entre memória, processadores e carga. O orçamento é **por estágio**:
-uma sessão de especificação lê código; uma de implementação dispara instalação, verificação
-de tipos e testes. `orq capacity` mostra o consumo real das sessões vivas — ajuste o
-`pipeline.toml` a partir dele. Um orçamento inventado, sete vezes acima do medido, já
-serializou uma esteira inteira: a máquina admitia uma sessão por vez e o teto configurado
-nunca era alcançado.
+O teto sai do menor entre memória, processadores e carga. O orçamento é **um só** — com um
+papel único não há mais "por estágio". `orq capacity` mostra o consumo real das sessões
+vivas; um orçamento inventado, sete vezes acima do medido, já serializou uma esteira
+inteira: a máquina admitia uma sessão por vez e o teto configurado nunca era alcançado.
 
 Em Linux com systemd, `orq host` lê a **fatia do usuário**, não a máquina. É o número que
 importa: uma fatia pode estar sufocada com o medidor da máquina mostrando memória de sobra.
 
-## O laço autônomo
+## O laço autônomo e o vigia de PR
 
 ```bash
-orq loop --detach   # a esteira anda sozinha
-orq loop-stop       # para o laço; as sessões em curso continuam
+orq loop                 # roda em primeiro plano; Ctrl-C para
+tmux new-session -d -s orq-loop-<esteira> "cd <repo> && orq loop"   # deixar rodando
+tmux kill-session -t orq-loop-<esteira>                              # para; sessões em curso continuam
 ```
 
-A cada ciclo ele reconsulta o ClickUp, recolhe unidades que ficaram em status de trabalho
-sem sessão viva (arranque falho), devolve-as à fila e preenche a capacidade livre. Duas
-falhas seguidas põem a unidade em quarentena, com aviso, em vez de repetir para sempre.
+A cada ciclo (60s por padrão) ele:
 
-Ele para sozinho quando não há nada vivo nem pronto, quando fica ocioso demais, ou quando
-o login cai. **Se parar sozinho, o primeiro lugar a olhar é `state/notify.log`**, que
-registra o motivo.
+1. **Vigia os PRs abertos** (`gh`, a cada ciclo): merge → `pronto` e libera dependentes;
+   `CHANGES_REQUESTED` → relança a mesma sessão com os comentários da revisão; fechado sem
+   merge → `bloqueado`.
+2. **Recolhe sessão morta** — status de trabalho sem sessão viva —, devolve para `backlog`
+   com uma falta (`strikes`) contada.
+3. **Preenche a capacidade livre** com o que está pronto para começar.
+
+Ele para sozinho quando não há nada vivo nem pronto por `idle_ticks_to_stop` ciclos (padrão
+20), ou quando a esteira inteira fica sem trabalho pendente. **Se parar sozinho, o motivo é
+um evento no banco** (`laco_parou` ou `esteira_concluida`) — releia a tela da sessão tmux, ou
+consulte a tabela `evento` diretamente.
 
 ## Quando parar e chamar uma pessoa
 
-- A mesma unidade voltou reprovada duas vezes: o defeito provavelmente está na
-  especificação, e isso é decisão humana.
-- Uma unidade está em `parado`: alguém precisa responder algo. `orq status` mostra o quê.
+- Um PR está em `revisão` há tempo demais: ninguém mais anda até você olhar. O Telegram já
+  avisou quando ele abriu.
+- A mesma unidade voltou com `CHANGES_REQUESTED` duas vezes: a terceira bloqueia sozinha —
+  o defeito provavelmente está no requisito, não na implementação.
+- Uma unidade está em `bloqueado`: alguém precisa responder algo. `orq show <unidade>`
+  mostra o quê.
 - O pré-voo está vermelho.
 - `orq host` acusa memória ou swap no teto.
-- Uma tarefa aparece no quadro marcada como deriva: existe no ClickUp e não foi declarada.
-  A esteira **nunca** executa o que não foi declarado — quem declara é uma pessoa.
 
-Nunca feche um cartão por conta própria. Fechar é decisão humana.
+Nunca funda um PR por conta própria dentro de uma sessão, e nunca feche um cartão por conta
+própria. Fundir e fechar são decisão humana, sempre.

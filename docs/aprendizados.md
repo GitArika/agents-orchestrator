@@ -1,6 +1,6 @@
 # Aprendizados
 
-Vinte e duas coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
+Vinte e quatro coisas que custaram tempo descobrir. Cada uma no mesmo formato: o sintoma, o que
 parecia ser, o que era, o comando que confirma, e como não repetir.
 
 Não é lista de dicas. É o que já deu errado, com os números.
@@ -386,6 +386,11 @@ ferramenta antes de acusar o projeto**. Vale também para o navegador de teste: 
 **fora** do repositório, porque acrescentá-lo às dependências quebraria a instalação
 congelada de toda cópia de trabalho em voo.
 
+**Onde isso virou decisão.** [OA-05](specs/orquestrador-agil/OA-05-papel-unico-auto-contido.md):
+o orquestrador parou de declarar portões (setup/verify) numa cópia à parte que podia divergir
+do comando real — quem manda agora é o `CLAUDE.md`/`AGENTS.md` que o próprio projeto já
+declara, a mesma fonte que qualquer sessão do Claude Code segue.
+
 ---
 
 ## 21. O quadro não vende o relógio, mas dá ele de graça em outro lugar
@@ -412,6 +417,11 @@ transição de etapa deixou um comentário com hora, autor e o commit citado. El
 também **o que** aconteceu, não só quando. Antes de assumir que falta um recurso, procure o
 mesmo fato num rastro que você já produz.
 
+**Onde isso virou decisão.** [OA-13](specs/orquestrador-agil/OA-13-medicao-adaptada.md)
+manteve os comentários do ClickUp como fonte, sem mudança, mesmo trocando as outras quatro
+fontes da medição pelo banco da esteira — é o único lugar em que ele continua sendo o
+relógio mais barato.
+
 ---
 
 ## 22. A base local envelhece sem avisar e faz a medição mentir
@@ -437,3 +447,88 @@ git rev-list --count homol..origin/homol      # quanto a base local está atrasa
 **Como não repetir.** Atribuir pelo **merge**, que diz de qual branch veio o que entrou, e
 não pelo intervalo. E, sempre que houver referência remota, preferir a remota à local: a
 local só anda quando alguém puxa.
+
+**Onde isso virou decisão.** [OA-13](specs/orquestrador-agil/OA-13-medicao-adaptada.md) foi
+além: com o número do PR já conhecido pela unidade (OA-08), a atribuição por merge passou a
+achar o commit pelo **número do PR** no assunto — o que também cobre squash, que não cria
+commit de merge nenhum e escapava por completo da regra antiga.
+
+---
+
+## 23. O laço disse "sem login" quando a máquina é que não conseguia mais criar processo
+
+**O sintoma.** Em 04/09/2026, às 22:35Z, o laço da esteira do front parou dois ciclos
+seguidos com `💥 Laço parado — sessão do Claude Code sem login (claude auth login)`. A
+sessão de revisão despachada minutos antes continuava viva e trabalhando, e o `orq doctor`
+tinha fechado verde às 19:33 local, incluindo a chamada real ao ClickUp e a criação de
+worktree.
+
+**O que parecia ser.** Credencial do agente expirada no meio da corrida — o aprendizado 1
+outra vez, agora pego pelo laço em vez do pré-voo.
+
+**O que era.** A máquina bateu no limite de criação de processo. O painel da sessão viva
+mostrava, em sequência, `PreToolUse:Bash hook error … EAGAIN: resource temporarily
+unavailable, posix_spawn '/bin/sh'` e `hooks/cerca.sh: fork: Resource temporarily
+unavailable`. Quem não consegue dar fork não consegue rodar o teste de login do laço — e o
+teste, ao não conseguir *executar* o `claude`, conclui que não há sessão. O diagnóstico saiu
+com o nome da última coisa que a checagem toca, não com o nome do que falhou.
+
+Nada aqui era escassez de memória: no mesmo minuto havia 13,1 GB disponíveis, 235 processos
+para um teto de 2.666 por usuário e 1.303 threads. Foi um pico simultâneo de forks — o laço,
+a sessão viva, o gancho da cerca e o proxy de linha de comando disputando ao mesmo tempo — e
+passou sozinho em poucos minutos.
+
+**O comando que confirma.**
+
+```bash
+tmux capture-pane -p -t <sessão viva> | grep -E "EAGAIN|fork: Resource"
+```
+
+E, para separar limite de processo de falta de memória:
+
+```bash
+echo "$(ps -u $(id -u) -o pid= | wc -l) de $(sysctl -n kern.maxprocperuid)"
+```
+
+**Como não repetir.** Antes de acreditar em "sem login", confira se a máquina ainda cria
+processo: com `fork` falhando, TODA checagem que executa alguma coisa devolve o erro da
+última coisa que ela ia executar. E o remédio é o mesmo do teto de capacidade — parar de
+despachar por alguns minutos, não trocar credencial. Um laço que morre por isso é seguro de
+reerguer: ele reconsulta o ClickUp e reconhece a sessão viva em vez de duplicá-la.
+
+---
+
+## 24. O navegador de prova não pinta borrão, e a sessão mediu duas rodadas com o defeito desligado
+
+**O sintoma.** Um cartão dizia que a comparação de equipamentos lado a lado não funciona no
+Safari: a página fica borrada e a comparação não aparece. Duas rodadas de sessão mediram o
+mesmo roteiro nos dois motores do arnês e devolveram 38 medidas idênticas, 0 divergências,
+0 violações de acessibilidade, nenhum erro de página. O relato do usuário e o instrumento se
+contradiziam, e o instrumento parecia estar ganhando.
+
+**O que parecia ser.** Versão: o WebKit do arnês é 26.5 e o Safari relatado era 26.6.2 — quase
+o mesmo motor, então "não reproduz" parecia significar "o defeito não existe mais" ou "está
+na camada da Apple, fora do motor".
+
+**O que era.** O WebKit headless **não pinta `backdrop-filter`**. A terceira rodada mediu a
+nitidez do fundo com o borrão ligado e desligado: **29,1 nos dois casos**, e as duas capturas
+saíram byte a byte idênticas. No Chromium a mesma medida dá **1,6 borrado contra 27,4 nítido**.
+O sintoma relatado *começa* por "a página inteira fica borrada" — ou seja, o instrumento não
+produzia nem a metade visível do sintoma. As duas rodadas anteriores mediram um motor com a
+suspeita principal desligada e concluíram, de boa-fé, que estava tudo bem.
+
+**O comando que confirma.** Medir o efeito, não olhar a captura: tirar duas capturas do mesmo
+estado, uma com a propriedade ligada e outra desligada, e comparar os arquivos.
+
+```bash
+cmp com-efeito.png sem-efeito.png && echo "ESTE MOTOR NÃO PINTA O EFEITO"
+```
+
+**Como não repetir.** O motor de prova serve para **layout, estrutura, acessibilidade e
+rolagem**. Não serve para **efeito visual composto** — borrão, sombra composta,
+`mix-blend-mode`, camada de composição. Nesses casos ele devolve um "está tudo bem" falso, que
+é pior do que não medir: fecha a investigação. Antes de aceitar um "não reproduz" sobre efeito
+visual, prove que o instrumento **produz o efeito**; se as duas capturas forem idênticas, o
+resultado inteiro é inválido. E, quando o motor não alcança, o desfecho honesto é uma página
+isolada extraída da aplicação em pé para um olho humano abrir no navegador relatado — não um
+conserto guiado por hipótese.

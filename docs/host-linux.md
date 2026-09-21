@@ -25,15 +25,18 @@ Automatizar qualquer uma delas significaria guardar credencial de alguém num sc
 daquele usuário. Um comando vindo de sessão de root escapa da fatia, e o teto deixa de
 valer — a máquina inteira fica exposta a algo que deveria estar contido.
 
-**Configure um destino de aviso.** Sem tela, a notificação do sistema não existe e o
-registro em arquivo ninguém lê: a espera humana fica silenciosa e a esteira parece travada
-sem motivo.
+**Configure o Telegram como destino de aviso.** Sem tela, a notificação do sistema não
+existe e o registro em arquivo ninguém lê: a espera humana fica silenciosa e a esteira
+parece travada sem motivo. É o destino **padrão** — basta preencher as duas credenciais em
+`~/.config/orquestrador/credenciais.env`:
+
+```
+TELEGRAM_BOT_TOKEN=123456789:AAExemploDoTokenAqui
+TELEGRAM_CHAT_ID=-1001234567890
+```
 
 ```bash
-export ORQ_AVISO_DESTINO=clickup
-export ORQ_AVISO_CANAL=...        # a sua conversa direta serve
-export ORQ_AVISO_WORKSPACE=...
-export ORQ_AVISO_MENCIONAR=...    # seu id, para a mensagem te marcar
+orq-avisar --testar      # manda uma mensagem de verdade e confere que chegou
 ```
 
 **Trave a versão do gerenciador de pacotes.** Quando o preparo de uma cópia de trabalho

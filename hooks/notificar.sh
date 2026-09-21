@@ -38,7 +38,13 @@ printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$KIND" "${msg:0:300}" >> "$LOGDIR/${
 # O entregador do repositório é o padrão. Ele conhece os três destinos e nunca
 # derruba quem chamou; $ORQ_NOTIFY_CMD continua vencendo, para quem já montou o
 # próprio caminho.
+#
+# --canal local, SEMPRE: gancho de sessão (aguardando decisão, ou fim de
+# turno) nunca sai daqui para Telegram/ClickUp/webhook — já chega pelo app do
+# Claude, e avisar de novo pelo mesmo fato ensina a ignorar os dois (OA-11).
+# Explícito por decisão, não por ORQ_AVISO_DESTINO vazio: ninguém reintroduz
+# isto por engano ao mexer no padrão de destino.
 ENTREGADOR="${ORQ_NOTIFY_CMD:-$(cd "$(dirname "$0")/../bin" && pwd)/orq-avisar}"
 ORQ_NOTIFY_TITLE="$title" ORQ_NOTIFY_MSG="$msg" \
-  $ENTREGADOR "$title" "$msg" >/dev/null 2>&1 || true
+  $ENTREGADOR --canal local "$title" "$msg" >/dev/null 2>&1 || true
 exit 0

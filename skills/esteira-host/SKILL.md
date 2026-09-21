@@ -42,12 +42,16 @@ que diz que está logado nos dois casos.
 
 **Aviso não chega sozinho num servidor.** Sem tela, notificação de sistema não existe e o
 registro em arquivo ninguém lê: a espera humana fica silenciosa e a esteira parece travada
-sem motivo. Configure um destino de verdade:
+sem motivo. Configure o Telegram — é o destino **padrão**, basta preencher as credenciais em
+`~/.config/orquestrador/credenciais.env`:
+
+```
+TELEGRAM_BOT_TOKEN=123456789:AAExemploDoTokenAqui
+TELEGRAM_CHAT_ID=-1001234567890
+```
 
 ```bash
-export ORQ_AVISO_DESTINO=clickup
-export ORQ_AVISO_CANAL=...      # a sua conversa direta serve
-export ORQ_AVISO_WORKSPACE=...
+orq-avisar --testar      # manda de verdade e confere que chegou
 ```
 
 **Olhe a fatia, não a máquina.** `orq host` lê o teto do usuário em Linux com systemd. Já

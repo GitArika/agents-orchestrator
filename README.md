@@ -140,7 +140,6 @@ segunda coluna.
 | Morreram sem se despedir | 3 |
 | Tempo de sessão medido | 141 h |
 | Código integrado | +97.609 / −23.112 linhas em 157 commits |
-| Tokens gerados | 19 milhões |
 
 Mediana por etapa: especificação 18 min, revisão 15 min, integração 21 min e implementação
 **36 min — com uma em cada dez passando de três horas**. É o único estágio em que estimar

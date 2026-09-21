@@ -1322,14 +1322,11 @@ def cmd_tick(cfg, args):
 # run`/`orq dispatch` que OA-04 tirou, com lançador de verdade contra o banco.
 # Ver docs/specs/orquestrador-agil/OA-05-papel-unico-auto-contido.md.
 #
-# A CERCA NÃO FOI TOCADA AQUI — decisão de 22/09/2026. `hooks/cerca.sh` ainda
-# só libera `git push`/`gh pr merge` com `ORQ_STAGE=integrate`, e este
-# lançador não injeta `ORQ_STAGE` (estágio não existe mais). Consequência
-# ACEITA, não escondida: uma sessão lançada consegue implementar e comitar
-# localmente, mas a cerca barra a publicação do próprio branch — o passo 6 do
-# briefing — até OA-06 trocar a regra de "por estágio" para "por branch". O
-# briefing instrui a sessão a `orq hold` se for barrada, como sempre foi: a
-# saída de ser barrado nunca é contornar.
+# A cerca (`hooks/cerca.sh`) recebe `ORQ_BRANCH`/`ORQ_UNIT`/`ORQ_WORKTREE`/
+# `ORQ_BASE` por `settings_json()` — regra de publicação por BRANCH da
+# própria unidade desde OA-06, não mais por estágio. O briefing instrui a
+# sessão a `orq hold` se for barrada de qualquer jeito: a saída de ser
+# barrado nunca é contornar.
 
 CERCA = ORQ_REPO / "hooks" / "cerca.sh"
 HOOK = ORQ_REPO / "hooks" / "notificar.sh"
@@ -1406,18 +1403,22 @@ def ensure_trusted(repo: Path, path: Path) -> None:
     tmp.replace(CLAUDE_JSON)
 
 
-def settings_json(label: str, worktree: str) -> str:
+def settings_json(label: str, worktree: str, branch: str, base: str) -> str:
     """A cerca (PreToolUse) e os avisos (Notification/Stop) que a sessão
     recebe. A CERCA É UM GANCHO, não uma lista de negação — decidido por
     experimento em 02/09/2026: uma negação `Bash(git push:*)` por --settings
     NÃO venceu um `allow` idêntico que a pessoa já tinha nas próprias
     configurações. O gancho vê o comando inteiro, roda sempre, não é anulável.
+
+    `ORQ_BRANCH`/`ORQ_BASE` (OA-06) substituem o `ORQ_STAGE` de antes: a regra
+    de publicação da cerca passou a ser por branch da própria unidade, não
+    por papel — não há mais sessão de integração para autorizar.
     """
     if not CERCA.exists():
         die(f"a cerca sumiu: {CERCA}\n"
             f"  Nenhuma sessão sobe sem ela. Restaure com:\n"
             f"    git -C {ORQ_REPO} checkout hooks/cerca.sh")
-    amb = f"ORQ_UNIT={label} ORQ_WORKTREE={worktree}"
+    amb = f"ORQ_UNIT={label} ORQ_WORKTREE={worktree} ORQ_BRANCH={branch} ORQ_BASE={base}"
     return json.dumps({"hooks": {
         "PreToolUse": [{"hooks": [{"type": "command", "command": f"{amb} {CERCA}"}]}],
         "Notification": [{"hooks": [{"type": "command",
@@ -1578,13 +1579,14 @@ def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False) -> str
     STATE.mkdir(parents=True, exist_ok=True)
     wt, branch = ensure_worktree(con, u)
     repo = Path(obter_config(con, "repo")).expanduser()
+    base = obter_config(con, "base_branch") or "main"
     ensure_trusted(repo, wt)
     label = u["chave"]
     nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
     brief_path = STATE / f"{nome_esteira}-{u['id']}.brief.md"
     brief_path.write_text(build_brief(con, u, wt, branch))
     setts = STATE / f"{nome_esteira}-{u['id']}.settings.json"
-    setts.write_text(settings_json(label, str(wt)))
+    setts.write_text(settings_json(label, str(wt), branch, base))
     logf = STATE / f"{nome_esteira}-{u['id']}.log"
 
     permission_mode = obter_config(con, "permission_mode") or "auto"

@@ -98,3 +98,35 @@ para instalar, e a impressão SHA da cerca é conferida pelo pré-voo
 - **`--force-with-lease` é novo na lista.** Não estava na regex de hoje
   ([hooks/cerca.sh:66](../../../hooks/cerca.sh:66)) e reescreve histórico igual. Entra com
   caso de teste próprio.
+
+## Nota de implementação (22/09/2026)
+
+**O alvo do `git push` é resolvido por um parser de verdade (Python/`shlex`), não por
+regex.** Refspec pode vir de formas diferentes — `origin BRANCH`, `origin BRANCH:BRANCH`,
+`origin :BRANCH` (apaga), `origin HEAD`, ou nada (o branch corrente decide) — e regex não
+distingue essas formas com segurança. Quando o comando não cita um branch explícito, a
+cerca confere o branch CORRENTE de verdade via `git -C "$ORQ_WORKTREE" symbolic-ref --short
+HEAD`, nunca confiando no texto do comando sozinho.
+
+**`git merge` ganhou uma regra própria**, não prevista em detalhe pelo desenho original:
+passa trazendo `origin/$ORQ_BASE` para dentro do branch da unidade (o `--ff-only` de
+sempre), mas barra se o comando primeiro troca para o branch de publicação
+(`git checkout $ORQ_BASE && …`) ou se a worktree já está nele — fundir DENTRO da base é
+integração, e integração é gate humano agora.
+
+**`--delete` como flag também barra**, não só o refspec `:branch` — o desenho original
+listava as duas formas de apagar um branch remoto na tabela de aceite, mas a regex de
+força/reescrita do rascunho inicial só cobria uma; corrigido e testado com as duas formas.
+
+O SHA da cerca (`cerca_impressao()`, citado no risco de referência original) não existe
+mais — `orq doctor` saiu inteiro em OA-04 e volta com essa prova em OA-12. `testes/cerca.sh`
+segue sendo a prova de integridade que o instalador exige (`instalar.sh` já recusa instalar
+se ela falhar).
+
+`hooks/cerca.sh`: a lógica de push/merge/PR foi reescrita; as demais travas (privilégio,
+pacote, script da rede, `rm -rf`, credenciais, e agora o banco explicitamente) não mudaram.
+`testes/cerca.sh`: 38 casos, contra um repositório git de verdade com o branch da "unidade"
+de fato checado out (necessário porque a cerca agora confere o branch corrente real, não um
+caminho de mentira). `bin/orq`: `settings_json()` ganhou os parâmetros `branch`/`base` e
+injeta `ORQ_BRANCH`/`ORQ_BASE`; `launch()` os repassa. `testes/test_lancador.py` prova a
+integração de ponta a ponta com um repositório real.

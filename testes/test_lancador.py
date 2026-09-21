@@ -13,12 +13,12 @@ Duas camadas, como o resto da suíte:
 Nenhum teste aqui sobe uma sessão real do Claude Code nem fala com a API do
 GitHub — `gh` também é o de mentira (testes/fixtures/bin/gh, OA-03/04).
 
-O QUE NÃO É TESTADO AQUI, de propósito: que a cerca bloqueia `git push` numa
-sessão de verdade — isso exigiria o Claude Code real chamando o hook. O que
-É testado é a PROVA ESTRUTURAL do buraco aceito em 22/09/2026: o ambiente que
-`launch()` injeta não tem `ORQ_STAGE`, e passado direto para
-`hooks/cerca.sh` (a mesma forma que `testes/cerca.sh` já usa), o `git push`
-é barrado. Ver a nota no topo da seção OA-05 em bin/orq.
+O QUE NÃO É TESTADO AQUI, de propósito: a bateria completa da cerca (força,
+delete, PR para base errada, merge dentro da base etc.) — isso é
+testes/cerca.sh (OA-06). Aqui só a integração: que `launch()`/`settings_json`
+entregam à cerca o ambiente (`ORQ_BRANCH`/`ORQ_BASE`) que ela precisa para
+deixar passar o branch da própria unidade e continuar barrando a base e o
+merge, com um repositório git de verdade.
 """
 import importlib.machinery
 import importlib.util
@@ -167,19 +167,21 @@ class EnsureTrusted(unittest.TestCase):
 
 
 class SettingsJson(unittest.TestCase):
-    def test_aponta_para_a_cerca_sem_orq_stage(self):
-        bruto = orq.settings_json("FE-01", "/tmp/wt")
+    def test_aponta_para_a_cerca_com_branch_e_base(self):
+        # OA-06: ORQ_BRANCH/ORQ_BASE substituem o antigo ORQ_STAGE — a regra
+        # de publicação da cerca passou a ser por branch, não por papel.
+        bruto = orq.settings_json("FE-01", "/tmp/wt", "CU-1-x", "main")
         d = json.loads(bruto)
         cmd_pretooluse = d["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertIn(str(orq.CERCA), cmd_pretooluse)
         self.assertIn("ORQ_UNIT=FE-01", cmd_pretooluse)
         self.assertIn("ORQ_WORKTREE=/tmp/wt", cmd_pretooluse)
-        # A prova do buraco aceito em 22/09/2026: SEM ORQ_STAGE, a regra de
-        # publicação da cerca de hoje nunca libera `git push`.
+        self.assertIn("ORQ_BRANCH=CU-1-x", cmd_pretooluse)
+        self.assertIn("ORQ_BASE=main", cmd_pretooluse)
         self.assertNotIn("ORQ_STAGE", cmd_pretooluse)
 
     def test_tem_notification_e_stop(self):
-        d = json.loads(orq.settings_json("FE-01", "/tmp/wt"))
+        d = json.loads(orq.settings_json("FE-01", "/tmp/wt", "CU-1-x", "main"))
         self.assertIn("Notification", d["hooks"])
         self.assertIn("Stop", d["hooks"])
 
@@ -307,29 +309,42 @@ class ArquivarArtefatos(unittest.TestCase):
         self.assertEqual(meta["artefatos"], [])
 
 
-class CercaSemOrqStageBarraPush(unittest.TestCase):
-    """A prova estrutural do buraco aceito: o AMBIENTE que `launch()` injeta,
-    passado direto para a cerca de verdade, barra `git push`."""
+class CercaComOAmbienteDoLancador(unittest.TestCase):
+    """A prova estrutural de que `launch()` entrega à cerca o que ela
+    precisa: publicar o PRÓPRIO branch passa, publicar a base ou fundir
+    continua barrado. A bateria completa (força, delete, PR para base
+    errada, merge dentro da base etc.) mora em testes/cerca.sh — aqui só a
+    integração com o ambiente exato que `settings_json()` produz."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.wt = Path(self.tmp.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.wt, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=self.wt, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=self.wt, check=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "x"],
+                       cwd=self.wt, check=True)
+        subprocess.run(["git", "checkout", "-qb", "CU-1-x"], cwd=self.wt, check=True)
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def _rodar_cerca(self, comando):
         evento = json.dumps({"tool_name": "Bash", "tool_input": {"command": comando}})
-        env = {**os.environ, "ORQ_UNIT": "FE-01", "ORQ_WORKTREE": str(self.wt)}
-        env.pop("ORQ_STAGE", None)
+        env = {**os.environ, "ORQ_UNIT": "FE-01", "ORQ_WORKTREE": str(self.wt),
+              "ORQ_BRANCH": "CU-1-x", "ORQ_BASE": "main"}
         return subprocess.run(["bash", str(CERCA)], input=evento, capture_output=True,
                               text=True, env=env)
 
-    def test_git_push_e_barrado_sem_orq_stage(self):
-        r = self._rodar_cerca(f"git push -u origin CU-1-x")
+    def test_publicar_o_proprio_branch_passa(self):
+        r = self._rodar_cerca("git push -u origin CU-1-x")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_publicar_a_base_e_barrado(self):
+        r = self._rodar_cerca("git push origin main")
         self.assertEqual(r.returncode, 2)
 
-    def test_gh_pr_merge_continua_barrado(self):
+    def test_gh_pr_merge_e_barrado(self):
         r = self._rodar_cerca("gh pr merge --squash")
         self.assertEqual(r.returncode, 2)
 

@@ -34,14 +34,20 @@ autentica, **pergunte**; não invente um fluxo de login.
 
 ## 2. O que você produz
 
-Em `<projeto>/.orchestrator/sandbox/`: os serviços em Docker, um semeador de usuários, um
-subidor da aplicação e o encerramento. E a ligação no `pipeline.toml`:
+Em `<projeto>/.orchestrator/sandbox/`: os serviços em Docker, um semeador de usuários e um
+subidor da aplicação. E a ligação com a esteira — que mudou de figura: o orquestrador não
+declara mais `setup`/`teardown` (decisão de 22/09/2026). Os dois lados agora são:
 
-```toml
-[gates]
-setup    = ["...", "orq-sandbox up && orq-sandbox seed"]
-teardown = ["orq-sandbox parar --worktree $PWD"]
-```
+- **Subir e semear é responsabilidade do agente**, dentro do preparo que o
+  `CLAUDE.md`/`AGENTS.md` do projeto já manda (passo 2 do papel único): `orq-sandbox up &&
+  orq-sandbox seed` entra ali, não em configuração da esteira.
+- **Derrubar é automático, mas só se o arquivo estiver no lugar certo.** O encerramento
+  fixo do orquestrador (`encerramento_fixo`, `bin/orq`) procura QUALQUER
+  `docker-compose*.yml`/`.yaml` ou `compose*.yml`/`.yaml` **na raiz da worktree** — não em
+  `.orchestrator/sandbox/` — e roda `down` sempre que a unidade sai de `em_progresso`.
+  Ponha (ou linke) o `docker-compose.yml` do ambiente fechado na raiz da worktree para ele
+  ser encontrado. Nada encontrado não é falha: é nada para encerrar, e nesse caso
+  **ninguém** derruba o ambiente sozinho.
 
 ## Regras que não se negociam
 
@@ -85,9 +91,10 @@ com o medidor da máquina mostrando 16 GB livres.
 5. **Derrubar containers não é derrubar a aplicação.** São duas coisas; o comando que
    derruba os serviços precisa derrubar os processos também.
 
-E o encerramento tem de estar no `teardown` da esteira, que roda **em todo caminho de
-saída da sessão, inclusive quando ela morre**. Encerramento que depende da boa vontade da
-sessão não acontece: a sessão pode morrer.
+E o `docker-compose*.yml` precisa estar na raiz da worktree para o encerramento fixo achá-lo
+— ele roda **em todo caminho de saída da sessão, inclusive quando ela morre**, porque é o
+próprio orquestrador que o dispara ao mudar o status, não a sessão. Encerramento que
+dependesse da boa vontade da sessão não aconteceria: a sessão pode morrer.
 
 ## Log por cópia de trabalho
 

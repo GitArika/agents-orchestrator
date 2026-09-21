@@ -882,6 +882,41 @@ const commands = {
     console.log(max > 0 ? body.slice(0, max) : body)
   },
 
+  // A ordem de serviço inteira de uma sessão do papel único (OA-05, passo 1
+  // do BRIEFING em bin/orq): descrição E todos os comentários, do mais antigo
+  // ao mais recente. `desc` só tem a descrição; os comentários são onde mora
+  // o que ela não tem — divergência registrada por uma sessão anterior,
+  // ambiguidade deixada em aberto de propósito, pedido de mudança de uma
+  // revisão. Tratar só a descrição como a tarefa inteira já foi o erro mais
+  // caro desta esteira (aprendizado nº 1).
+  async show([taskId, ...flags]) {
+    if (!taskId) die('usage: show <taskId> [--max=N]')
+    const max = Number(flagVal(flags, 'max') || 0)
+    const [t, c] = await Promise.all([
+      api('GET', `/task/${taskId}?include_markdown_description=true`),
+      api('GET', `/task/${taskId}/comment`),
+    ])
+    const body = t.markdown_description || t.description || t.text_content || ''
+    console.log(`# ${t.name}  [${t.status?.status}]  ${t.id}`)
+    console.log(max > 0 ? body.slice(0, max) : body)
+
+    const comentarios = [...(c.comments || [])].reverse()   // a API devolve do mais novo
+    console.log('')
+    console.log(`── comentários (${comentarios.length}, do mais antigo ao mais recente) ──`)
+    if (!comentarios.length) {
+      console.log('(nenhum)')
+      return
+    }
+    for (const com of comentarios) {
+      const quando = Number(com.date)
+      const carimbo = Number.isFinite(quando)
+        ? new Date(quando).toISOString().replace(/\.\d+Z$/, 'Z') : '(sem data)'
+      console.log('')
+      console.log(`[${carimbo}] ${com.user?.username || '(desconhecido)'}:`)
+      console.log(com.comment_text || '')
+    }
+  },
+
   // --- Dependências ----------------------------------------------------------
   // O bloqueio real do ClickUp (waiting on / blocking), que é coisa DIFERENTE do
   // `relate` (task link, sem semântica de ordem). Sem isto não dá para responder
@@ -1025,6 +1060,7 @@ const usage = `ClickUp CLI — token-frugal wrappers. Run from the vault root:
   branch      <taskId>                                  the task's "branch" field value
   types                                                 workspace task types     -> NDJSON {id,name}
   desc        <taskId> [--max=N]                        descricao COMPLETA (a spec) -> markdown
+  show        <taskId> [--max=N]                        desc + TODOS os comentarios, do mais antigo ao mais recente (a ordem de servico inteira)
   spaces                                                spaces do workspace      -> NDJSON {id,name}
   folders     <spaceId|alias>                           folders + suas listas    -> NDJSON {id,name,lists[]}
   space-lists <spaceId|alias>                           listas soltas do space   -> NDJSON {id,name}

@@ -386,6 +386,11 @@ ferramenta antes de acusar o projeto**. Vale também para o navegador de teste: 
 **fora** do repositório, porque acrescentá-lo às dependências quebraria a instalação
 congelada de toda cópia de trabalho em voo.
 
+**Onde isso virou decisão.** [OA-05](specs/orquestrador-agil/OA-05-papel-unico-auto-contido.md):
+o orquestrador parou de declarar portões (setup/verify) numa cópia à parte que podia divergir
+do comando real — quem manda agora é o `CLAUDE.md`/`AGENTS.md` que o próprio projeto já
+declara, a mesma fonte que qualquer sessão do Claude Code segue.
+
 ---
 
 ## 21. O quadro não vende o relógio, mas dá ele de graça em outro lugar
@@ -412,6 +417,11 @@ transição de etapa deixou um comentário com hora, autor e o commit citado. El
 também **o que** aconteceu, não só quando. Antes de assumir que falta um recurso, procure o
 mesmo fato num rastro que você já produz.
 
+**Onde isso virou decisão.** [OA-13](specs/orquestrador-agil/OA-13-medicao-adaptada.md)
+manteve os comentários do ClickUp como fonte, sem mudança, mesmo trocando as outras quatro
+fontes da medição pelo banco da esteira — é o único lugar em que ele continua sendo o
+relógio mais barato.
+
 ---
 
 ## 22. A base local envelhece sem avisar e faz a medição mentir
@@ -437,6 +447,11 @@ git rev-list --count homol..origin/homol      # quanto a base local está atrasa
 **Como não repetir.** Atribuir pelo **merge**, que diz de qual branch veio o que entrou, e
 não pelo intervalo. E, sempre que houver referência remota, preferir a remota à local: a
 local só anda quando alguém puxa.
+
+**Onde isso virou decisão.** [OA-13](specs/orquestrador-agil/OA-13-medicao-adaptada.md) foi
+além: com o número do PR já conhecido pela unidade (OA-08), a atribuição por merge passou a
+achar o commit pelo **número do PR** no assunto — o que também cobre squash, que não cria
+commit de merge nenhum e escapava por completo da regra antiga.
 
 ---
 

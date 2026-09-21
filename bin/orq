@@ -16,6 +16,10 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
 `grep -n '^# ---' bin/orq`, que devolve a linha de cada uma.
 
   modelo          Config, Unit, Stage — leitura e validação do pipeline.toml
+  estado          o banco SQLite por esteira — esquema, transação, migração.
+                  Substitui pipeline.toml + loop-<esteira>.json (em construção,
+                  ver docs/specs/orquestrador-agil/OA-01-nucleo-sqlite.md). Ainda
+                  não está ligado aos comandos abaixo — isso é OA-02/OA-03.
   clickup         chamadas à API: status, comentário, descrição
   capacidade      quanto a máquina aguenta; host: o que de fato limita
   sessões         worktree, confiança de pasta, briefing, lançamento, cerca
@@ -31,6 +35,7 @@ import os
 import re
 import hashlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -38,6 +43,7 @@ import tomllib
 import unicodedata
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -306,6 +312,337 @@ class Config:
             elif line.startswith("pk_"):
                 return line
         die(f"chave '{key}' não encontrada em {f}")
+
+
+# ---------------------------------------------------------------- estado (SQLite)
+#
+# Substitui TRÊS lugares que hoje não se coordenam: o `pipeline.toml` versionado
+# (grafo), o ClickUp (status) e `state/loop-<esteira>.json` (strikes, quarentena,
+# bloqueios) — o terceiro sem lock nenhum: `tick()` lia o arquivo, gastava
+# minutos em rede e lançamento de sessão, e só então gravava por cima com
+# `write_text`, que apaga o arquivo antes de escrever. Uma queda no meio deixava
+# JSON inválido, e `loop_state` engolia a exceção e devolvia estado VAZIO —
+# quarentena e bloqueios sumindo em silêncio. Ver
+# docs/specs/orquestrador-agil/OA-01-nucleo-sqlite.md.
+#
+# Nada aqui embaixo está ligado aos comandos do motor ainda — isto é só a
+# fundação. Ligar (verbos de declaração, máquina de estados, remoção do
+# pipeline.toml) é OA-02, OA-03 e OA-04.
+
+VERSAO_ESQUEMA = 1
+
+BANCOS = Path.home() / ".config" / "orquestrador" / "esteiras"
+
+ESQUEMA_SQL = """
+CREATE TABLE esquema (versao INTEGER NOT NULL);
+INSERT INTO esquema (versao) VALUES (1);
+
+CREATE TABLE config (
+  chave TEXT PRIMARY KEY,
+  valor TEXT NOT NULL
+);
+
+CREATE TABLE unidade (
+  id            INTEGER PRIMARY KEY,
+  chave         TEXT NOT NULL UNIQUE,
+  clickup_id    TEXT UNIQUE,
+  titulo        TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'backlog'
+                CHECK (status IN ('backlog','em_progresso','revisao','pronto','bloqueado')),
+  motivo        TEXT NOT NULL DEFAULT '',
+  modo          TEXT NOT NULL DEFAULT 'autonomous',
+  prioridade    INTEGER NOT NULL DEFAULT 2,
+  branch        TEXT,
+  pr_numero     INTEGER,
+  pr_url        TEXT,
+  strikes       INTEGER NOT NULL DEFAULT 0,
+  retrabalho    INTEGER NOT NULL DEFAULT 0,
+  criado_em     TEXT NOT NULL,
+  atualizado_em TEXT NOT NULL
+);
+
+CREATE TABLE dependencia (
+  unidade_id INTEGER NOT NULL REFERENCES unidade(id) ON DELETE CASCADE,
+  depende_de INTEGER NOT NULL REFERENCES unidade(id) ON DELETE CASCADE,
+  PRIMARY KEY (unidade_id, depende_de),
+  CHECK (unidade_id <> depende_de)
+);
+
+CREATE TABLE portao (
+  id      INTEGER PRIMARY KEY,
+  tipo    TEXT NOT NULL CHECK (tipo IN ('setup','verify','teardown')),
+  ordem   INTEGER NOT NULL,
+  comando TEXT NOT NULL
+);
+
+-- Append-only: é o rastro. Nenhuma escrita aqui é apagada ou reescrita, só
+-- inserida — é o que permite reconstruir o que aconteceu quando o resto
+-- divergir (o cartão do ClickUp, uma pessoa perguntando "o que houve aqui?").
+CREATE TABLE evento (
+  id          INTEGER PRIMARY KEY,
+  unidade_id  INTEGER REFERENCES unidade(id) ON DELETE SET NULL,
+  tipo        TEXT NOT NULL,
+  de_status   TEXT,
+  para_status TEXT,
+  texto       TEXT NOT NULL DEFAULT '',
+  ts          TEXT NOT NULL
+);
+
+CREATE TABLE sessao (
+  id           INTEGER PRIMARY KEY,
+  unidade_id   INTEGER NOT NULL REFERENCES unidade(id) ON DELETE CASCADE,
+  tmux         TEXT,
+  pid          INTEGER,
+  worktree     TEXT NOT NULL,
+  branch       TEXT NOT NULL,
+  iniciada_em  TEXT NOT NULL,
+  encerrada_em TEXT,
+  desfecho     TEXT
+);
+"""
+
+
+class ErroEstado(Exception):
+    """Banco ilegível, corrompido, ou de versão que este binário não conhece.
+
+    Nunca é engolida em silêncio: o defeito que este módulo substitui é
+    justamente `loop_state` devolvendo `{}` quando o JSON não abria, e a
+    esteira seguindo em frente como se quarentena e bloqueios não existissem.
+    """
+
+
+def caminho_banco_padrao(nome: str) -> Path:
+    """Onde o banco de uma esteira mora, por convenção.
+
+    Um arquivo por esteira, fora do repositório: esteira travada não segura a
+    outra, e o descarte — apagar o arquivo — é por esteira. O diretório já é a
+    convenção usada para os pipeline.toml fora do repo (ver `ESTEIRAS` acima);
+    aqui os bancos vivem ao lado, distinguidos pela extensão.
+
+    A resolução COMPLETA (--db, $ORQ_DB, casar com o repositório atual, o
+    último banco usado) é responsabilidade de quem chama os comandos — isso
+    entra com os verbos de declaração (OA-02) e a máquina de estados (OA-03).
+    Esta função só sabe o nome canônico do arquivo.
+    """
+    return BANCOS / f"{slugify(nome, 40)}.db"
+
+
+def _pragmas(con: sqlite3.Connection) -> None:
+    """As três garantias que fazem a fila existir sem daemon nenhum.
+
+    WAL: leitor nunca espera o escritor. `foreign_keys`: uma dependência não
+    pode apontar para unidade que não existe. `busy_timeout`: quem chega
+    segundo enquanto outro escritor está com o lock espera no KERNEL até 10s
+    em vez de falhar na hora — é o enfileiramento que o requisito pede, de
+    graça, sem processo novo para subir, cair e precisar ser diagnosticado.
+    """
+    con.execute("PRAGMA journal_mode = WAL")
+    con.execute("PRAGMA foreign_keys = ON")
+    con.execute("PRAGMA busy_timeout = 10000")
+
+
+def criar_banco(caminho: Path, *, forcar: bool = False) -> sqlite3.Connection:
+    """Cria o banco de uma esteira nova, com o esquema completo.
+
+    Recusa sobrescrever por acidente: um banco existente carrega o estado de
+    unidades de verdade, e `criar` não é o verbo para apagar isso. `--forcar`
+    é escolha explícita de quem chama, não comportamento padrão.
+    """
+    caminho = Path(caminho)
+    if caminho.exists() and not forcar:
+        die(f"banco já existe: {caminho}\n  Use --forcar para recriar do zero, "
+            f"apagando tudo que está nele.")
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    if forcar and caminho.exists():
+        caminho.unlink()
+    con = sqlite3.connect(caminho)
+    con.row_factory = sqlite3.Row
+    _pragmas(con)
+    con.executescript(ESQUEMA_SQL)
+    con.commit()
+    caminho.chmod(0o600)
+    return con
+
+
+def _migrar(con: sqlite3.Connection, de_versao: int) -> None:
+    """Aplica as migrações em ordem, dentro da MESMA transação da abertura.
+
+    Não existe migração ainda — a única versão até agora é a 1. O ponto de
+    entrada já existe porque um esquema que só sabe nascer na versão mais
+    recente é um esquema que vai forçar `--forcar` na primeira mudança de
+    campo, e isso apaga o estado de gente de verdade.
+    """
+    raise ErroEstado(
+        f"banco na versão {de_versao}, e este binário não tem migração "
+        f"cadastrada para chegar à {VERSAO_ESQUEMA}. Isto não deveria "
+        f"acontecer com a única versão existente — o banco está incoerente.")
+
+
+def abrir_banco(caminho: Path) -> sqlite3.Connection:
+    """Abre um banco existente e confere a versão do esquema antes de devolver.
+
+    Três recusas, de propósito, e nenhuma delas inventa um estado vazio para
+    seguir em frente:
+
+      * arquivo não existe -> erro dizendo o caminho, não banco "novo" silencioso;
+      * ilegível ou corrompido -> erro com a causa do SQLite, não estado zerado;
+      * versão maior que a que este binário conhece -> erro dizendo para
+        atualizar, nunca ignora o que não entende.
+
+    Versão MENOR aplica migração, dentro de transação: ou o banco chega
+    inteiro na versão atual, ou nada muda.
+    """
+    caminho = Path(caminho)
+    if not caminho.exists():
+        raise ErroEstado(f"banco não encontrado: {caminho}")
+    try:
+        con = sqlite3.connect(caminho)
+        con.row_factory = sqlite3.Row
+        _pragmas(con)
+        row = con.execute("SELECT versao FROM esquema").fetchone()
+    except sqlite3.DatabaseError as e:
+        raise ErroEstado(f"banco ilegível ou corrompido: {caminho}\n  {e}") from e
+    if row is None:
+        raise ErroEstado(f"banco sem tabela de esquema em {caminho} — "
+                         f"versão desconhecida, recuso adivinhar.")
+    versao = row["versao"]
+    if versao > VERSAO_ESQUEMA:
+        con.close()
+        raise ErroEstado(
+            f"banco na versão {versao}; este binário só conhece até "
+            f"{VERSAO_ESQUEMA}. Atualize o orquestrador antes de usar este banco.")
+    if versao < VERSAO_ESQUEMA:
+        with con:
+            _migrar(con, versao)
+    return con
+
+
+@contextmanager
+def transacao(caminho: Path):
+    """O ÚNICO ponto de escrita do estado. Todo `UPDATE`/`INSERT` passa por aqui.
+
+    `BEGIN IMMEDIATE` pega o lock de escrita JÁ na entrada, não na primeira
+    instrução de escrita — com o `BEGIN` implícito do sqlite3, dois escritores
+    só descobrem que colidiram no COMMIT, um deles depois de já ter feito todo
+    o trabalho. Com `IMMEDIATE`, o segundo a chegar espera no `busy_timeout`
+    (10s) e SEGUE dali, sem refazer nada.
+
+    Falhar dentro do bloco desfaz tudo — nunca fica meio gravado. É a garantia
+    que falta em `save_loop_state` hoje: `write_text` trunca o arquivo antes de
+    escrever, e uma queda no meio deixa JSON inválido para sempre.
+    """
+    con = abrir_banco(caminho)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield con
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def _agora() -> str:
+    return time.strftime("%FT%TZ", time.gmtime())
+
+
+def registrar_evento(con: sqlite3.Connection, unidade_id: int | None, tipo: str,
+                     *, de_status: str | None = None, para_status: str | None = None,
+                     texto: str = "") -> None:
+    """Grava uma linha no rastro append-only, na transação corrente.
+
+    Toda função de escrita deste módulo chama isto antes de devolver — nunca
+    depois, e nunca numa transação separada. Rastro que pode divergir do
+    estado que ele descreve não é rastro, é boato.
+    """
+    con.execute(
+        "INSERT INTO evento (unidade_id, tipo, de_status, para_status, texto, ts) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (unidade_id, tipo, de_status, para_status, texto, _agora()))
+
+
+def criar_unidade(con: sqlite3.Connection, chave: str, *, clickup_id: str | None,
+                  titulo: str, modo: str = "autonomous", prioridade: int = 2) -> int:
+    """Declara uma unidade nova. Idempotente por `chave` fica para OA-02 — aqui
+    é a escrita crua, usada pelos testes deste núcleo e pelo verbo de cima."""
+    agora = _agora()
+    cur = con.execute(
+        "INSERT INTO unidade (chave, clickup_id, titulo, modo, prioridade, "
+        "                     criado_em, atualizado_em) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (chave, clickup_id, titulo, modo, prioridade, agora, agora))
+    uid = cur.lastrowid
+    registrar_evento(con, uid, "declaracao", texto=f"unidade {chave} criada")
+    return uid
+
+
+class ErroDependenciaCiclica(ErroEstado):
+    """Uma dependência nova fecharia um ciclo. Carrega o caminho encontrado,
+    porque "dependência inválida" não diz a quem for corrigir o que consertar."""
+
+
+def _alcancaveis(con: sqlite3.Connection, origem: int) -> dict:
+    """BFS a partir de `origem` seguindo `depende_de`: quem `origem` precisa,
+    direta ou indiretamente. Devolve {id_alcancado: id_anterior_no_caminho},
+    para reconstruir o caminho quando um ciclo for encontrado."""
+    veio_de = {origem: None}
+    fila = [origem]
+    while fila:
+        atual = fila.pop(0)
+        for row in con.execute(
+                "SELECT depende_de FROM dependencia WHERE unidade_id = ?", (atual,)):
+            prox = row["depende_de"]
+            if prox not in veio_de:
+                veio_de[prox] = atual
+                fila.append(prox)
+    return veio_de
+
+
+def adicionar_dependencia(con: sqlite3.Connection, unidade_id: int, depende_de: int) -> None:
+    """`unidade_id` passa a depender de `depende_de`. Recusa se isso fechar um
+    ciclo — verificado ANTES de gravar, seguindo a cadeia que `depende_de` já
+    precisa: se ela alcança `unidade_id`, a aresta nova fecharia o laço."""
+    if unidade_id == depende_de:
+        raise ErroDependenciaCiclica(
+            f"uma unidade não pode depender de si mesma (id {unidade_id}).")
+    veio_de = _alcancaveis(con, depende_de)
+    if unidade_id in veio_de:
+        caminho = [unidade_id]
+        cursor = unidade_id
+        while veio_de.get(cursor) is not None:
+            cursor = veio_de[cursor]
+            caminho.append(cursor)
+        caminho.reverse()
+        nomes = " → ".join(
+            (con.execute("SELECT chave FROM unidade WHERE id = ?", (i,)).fetchone()
+             or {"chave": str(i)})["chave"]
+            for i in caminho)
+        raise ErroDependenciaCiclica(
+            f"dependência recusada: fecharia um ciclo {nomes} → "
+            f"{(con.execute('SELECT chave FROM unidade WHERE id = ?', (unidade_id,)).fetchone())['chave']}.")
+    con.execute(
+        "INSERT INTO dependencia (unidade_id, depende_de) VALUES (?, ?)",
+        (unidade_id, depende_de))
+    registrar_evento(con, unidade_id, "declaracao",
+                     texto=f"passou a depender da unidade {depende_de}")
+
+
+def definir_status(con: sqlite3.Connection, unidade_id: int, novo_status: str,
+                   *, motivo: str = "", tipo_evento: str = "transicao") -> None:
+    """Grava a transição e o evento na MESMA transação — nunca em duas.
+
+    A legalidade da transição (o que pode virar o quê) é a máquina de estados
+    de OA-03; aqui é só a escrita atômica que ela vai chamar por baixo.
+    """
+    row = con.execute("SELECT status FROM unidade WHERE id = ?", (unidade_id,)).fetchone()
+    if row is None:
+        raise ErroEstado(f"unidade {unidade_id} não existe.")
+    de_status = row["status"]
+    con.execute(
+        "UPDATE unidade SET status = ?, motivo = ?, atualizado_em = ? WHERE id = ?",
+        (novo_status, motivo, _agora(), unidade_id))
+    registrar_evento(con, unidade_id, tipo_evento,
+                     de_status=de_status, para_status=novo_status, texto=motivo)
 
 
 def git_dir_comum(cwd=None):

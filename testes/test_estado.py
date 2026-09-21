@@ -209,22 +209,28 @@ class DependenciaCiclica(unittest.TestCase):
             with orq.transacao(self.caminho) as con:
                 orq.adicionar_dependencia(con, self.a, self.a)
 
-    def test_ciclo_direto_recusa_com_caminho(self):
+    def test_ciclo_direto_recusa_com_caminho_fechado(self):
         with orq.transacao(self.caminho) as con:
             orq.adicionar_dependencia(con, self.b, self.a)   # B -> A
         with self.assertRaises(orq.ErroDependenciaCiclica) as ctx:
             with orq.transacao(self.caminho) as con:
                 orq.adicionar_dependencia(con, self.a, self.b)   # A -> B fecharia o ciclo
-        self.assertIn("FE-A", str(ctx.exception))
-        self.assertIn("FE-B", str(ctx.exception))
+        # O caminho mostrado precisa FECHAR o laço (mesmo nome no início e no
+        # fim) — não repetir o último nó, que é o bug que o primeiro rascunho
+        # tinha (FE-B → FE-A → FE-A, em vez de FE-B → FE-A → FE-B).
+        self.assertEqual(str(ctx.exception),
+                         "dependência recusada: fecharia um ciclo FE-B → FE-A → FE-B.")
 
-    def test_ciclo_transitivo_recusa(self):
+    def test_ciclo_transitivo_recusa_com_caminho_fechado(self):
         with orq.transacao(self.caminho) as con:
             orq.adicionar_dependencia(con, self.b, self.a)   # B -> A
             orq.adicionar_dependencia(con, self.c, self.b)   # C -> B
-        with self.assertRaises(orq.ErroDependenciaCiclica):
+        with self.assertRaises(orq.ErroDependenciaCiclica) as ctx:
             with orq.transacao(self.caminho) as con:
                 orq.adicionar_dependencia(con, self.a, self.c)   # A -> C fecharia A->C->B->A
+        self.assertEqual(
+            str(ctx.exception),
+            "dependência recusada: fecharia um ciclo FE-C → FE-B → FE-A → FE-C.")
 
     def test_ciclo_recusado_nao_deixa_nada_gravado(self):
         with orq.transacao(self.caminho) as con:

@@ -31,7 +31,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | id | requisito | prioridade | depende de | estado |
 | --- | --- | --- | --- | --- |
 | [OA-01](OA-01-nucleo-sqlite.md) | Núcleo de estado em SQLite | P0 | — | concluído (`bin/orq`, `testes/test_estado.py`) |
-| [OA-02](OA-02-verbos-de-declaracao.md) | Verbos de declaração e configuração | P0 | OA-01 | não iniciado |
+| [OA-02](OA-02-verbos-de-declaracao.md) | Verbos de declaração e configuração | P0 | OA-01 | concluído (`bin/orq`, `testes/test_verbos.py`) |
 | [OA-03](OA-03-maquina-de-cinco-estados.md) | Máquina de cinco estados e quadro derivado | P0 | OA-01, OA-02 | não iniciado |
 | [OA-04](OA-04-motor-sem-clickup.md) | O motor deixa de falar com o ClickUp | P0 | OA-03 | não iniciado |
 | [OA-05](OA-05-papel-unico-auto-contido.md) | O papel único auto-contido | P0 | OA-03, OA-04 | não iniciado |

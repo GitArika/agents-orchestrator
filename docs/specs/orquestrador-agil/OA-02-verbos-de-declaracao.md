@@ -21,23 +21,34 @@ portões. Ver "Gates saem do orquestrador" abaixo.
 
 ## Desenho
 
+**Resolução do banco, por ora: `--db` obrigatório em todo verbo.** Decisão de
+22/09/2026 — nada de `$ORQ_DB` nem de "último usado" ainda; isso é conveniência que
+entra quando os comandos de LEITURA (`board`, `next`, `status` — OA-03) também
+precisarem resolver o banco, e faz mais sentido desenhar a resolução completa junto
+deles. `--db` é uma flag do `orq` de nível superior, igual `--pipeline` já é hoje —
+por isso aparece ANTES do verbo:
+
 ```bash
-orq init --nome "front-end" --repo ~/projetos/app --base main \
-         --worktrees ~/worktrees/front-end --lista 901... --github org/app
+orq --db ~/.config/orquestrador/esteiras/front-end.db init \
+    --nome "front-end" --repo ~/projetos/app --base main \
+    --worktrees ~/worktrees/front-end --lista 901... --github org/app
 # cria o banco, grava a config, falha se o banco já existir (--forcar recria)
+# SUBSTITUI o `orq init` de hoje (que gera pipeline.toml) — mesmo nome, papel novo.
 
-orq task add  FE-01 --clickup 868abc --titulo "Uma frase em português comum" \
-              [--prioridade alta] [--modo hands-on]
-orq task rm   FE-01
-orq task set  FE-01 --titulo "..." | --prioridade normal | --modo autonomous
+orq --db <caminho> task add  FE-01 --clickup 868abc --titulo "Uma frase em português comum" \
+                   [--prioridade alta] [--modo hands-on]
+orq --db <caminho> task rm   FE-01 --forcar
+orq --db <caminho> task set  FE-01 --titulo "..." | --prioridade normal | --modo autonomous
 
-orq dep add   FE-03 --precisa FE-01 --precisa FE-02
-orq dep rm    FE-03 --precisa FE-01
+orq --db <caminho> dep add   FE-03 --precisa FE-01 --precisa FE-02
+orq --db <caminho> dep rm    FE-03 --precisa FE-01
 
-orq config set max_concurrent 4 | orq config list | orq config get interval_seconds
+orq --db <caminho> config set max_concurrent 4
+orq --db <caminho> config list
+orq --db <caminho> config get interval_seconds
 
-orq export [--formato toml|json]     # o estado inteiro em texto estável
-orq validate                          # recusa esteira incoerente, sem escrever nada
+orq --db <caminho> export [--formato toml|json]     # o estado inteiro em texto estável
+orq --db <caminho> validate                          # recusa esteira incoerente, sem escrever nada
 ```
 
 ### Regras de escrita
@@ -50,8 +61,10 @@ orq validate                          # recusa esteira incoerente, sem escrever 
   comando não pode produzir duas unidades.
 - **`orq dep add` valida o grafo inteiro antes de gravar.** Ciclo recusa com o caminho
   completo (`FE-03 → FE-01 → FE-03`), não com "dependência inválida".
-- **`orq task rm` recusa unidade com sessão viva ou PR aberto.** `--forcar` exige que a
-  unidade esteja em `backlog` ou `pronto`.
+- **`orq task rm` é sempre destrutivo e sempre pede `--forcar`** — não há remoção "de
+  leve". E `--forcar` **não** passa por cima de uma unidade em `em_progresso` ou
+  `revisao`: isso significaria apagar a declaração debaixo de uma sessão viva ou de um PR
+  aberto, e nenhuma bandeira destrava isso. Resolva com `orq hold`/`orq release` antes.
 
 ### Gates saem do orquestrador
 

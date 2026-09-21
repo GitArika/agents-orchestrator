@@ -605,14 +605,18 @@ def adicionar_dependencia(con: sqlite3.Connection, unidade_id: int, depende_de: 
         while veio_de.get(cursor) is not None:
             cursor = veio_de[cursor]
             caminho.append(cursor)
-        caminho.reverse()
-        nomes = " → ".join(
+        caminho.reverse()   # depende_de → … → unidade_id: a cadeia que já existe
+        nomes = [
             (con.execute("SELECT chave FROM unidade WHERE id = ?", (i,)).fetchone()
              or {"chave": str(i)})["chave"]
-            for i in caminho)
+            for i in caminho
+        ]
+        # Fecha o laço visualmente: a aresta nova (unidade_id -> depende_de)
+        # volta exatamente ao primeiro nome da cadeia, então repeti-lo no fim é
+        # o que mostra o ciclo completo — não o último (esse já é unidade_id).
         raise ErroDependenciaCiclica(
-            f"dependência recusada: fecharia um ciclo {nomes} → "
-            f"{(con.execute('SELECT chave FROM unidade WHERE id = ?', (unidade_id,)).fetchone())['chave']}.")
+            f"dependência recusada: fecharia um ciclo "
+            f"{' → '.join(nomes + [nomes[0]])}.")
     con.execute(
         "INSERT INTO dependencia (unidade_id, depende_de) VALUES (?, ?)",
         (unidade_id, depende_de))
@@ -636,6 +640,397 @@ def definir_status(con: sqlite3.Connection, unidade_id: int, novo_status: str,
         (novo_status, motivo, _agora(), unidade_id))
     registrar_evento(con, unidade_id, tipo_evento,
                      de_status=de_status, para_status=novo_status, texto=motivo)
+
+
+# ---------------------------------------------------------------- estado — verbos (OA-02)
+#
+# A escrita no banco (OA-01) por linha de comando. Cada `cmd_*` daqui embaixo
+# recebe `(cfg, args)` como qualquer outro comando do motor, mas `cfg` é sempre
+# None — estes verbos não tocam `pipeline.toml`, e resolvem o banco só por
+# `--db` (ver `main()`; resolução automática entra em OA-03).
+#
+# GATES SAEM DAQUI. Decisão de 22/09/2026: não existe `orq gate`. Setup e
+# verify são responsabilidade do agente, seguindo o CLAUDE.md/AGENTS.md que o
+# próprio projeto já declara — por isso `validate` recusa esteira sem nenhum
+# dos dois. Teardown de ambiente vira comando fixo do orquestrador (OA-08),
+# nunca declarado por esteira.
+
+PRIORIDADES = {"urgente": 0, "alta": 1, "normal": 2, "baixa": 3, "sem": 4}
+
+CONFIG_CHAVES_CONHECIDAS = frozenset({
+    "name", "repo", "base_branch", "work_dir", "worktree_root", "branch_template",
+    "list_id", "github_repo", "max_concurrent", "reserve_ram_gb", "ram_per_session_gb",
+    "interval_seconds", "max_strikes", "max_rework", "permission_mode",
+    "remote_control", "model", "verificacao_automatica",
+})
+
+
+def definir_config(con: sqlite3.Connection, chave: str, valor: str) -> None:
+    con.execute(
+        "INSERT INTO config (chave, valor) VALUES (?, ?) "
+        "ON CONFLICT(chave) DO UPDATE SET valor = excluded.valor", (chave, valor))
+
+
+def obter_config(con: sqlite3.Connection, chave: str, padrao=None):
+    row = con.execute("SELECT valor FROM config WHERE chave = ?", (chave,)).fetchone()
+    return row["valor"] if row else padrao
+
+
+def _resolver_unidade_id(con: sqlite3.Connection, chave: str) -> int:
+    row = con.execute("SELECT id FROM unidade WHERE chave = ?", (chave,)).fetchone()
+    if row is None:
+        die(f"unidade '{chave}' não existe. Declare com 'orq task add' antes.")
+    return row["id"]
+
+
+def cmd_init(cfg, args):
+    """Cria o banco de uma esteira nova. SUBSTITUI o `orq init` antigo (que
+    gerava pipeline.toml) — decisão de 22/09/2026, ver
+    docs/specs/orquestrador-agil/OA-02-verbos-de-declaracao.md."""
+    caminho = Path(args.db).expanduser()
+    repo = Path(args.repo).expanduser().resolve()
+    if not (repo / ".git").exists():
+        die(f"{repo} não é um repositório git (sem .git).")
+    worktrees = Path(args.worktrees).expanduser()
+    try:
+        worktrees.resolve().relative_to(repo)
+        die(f"--worktrees ({worktrees}) está DENTRO do repositório. Worktrees "
+            f"ali fazem o `git status` do repo pai listar milhares de arquivos "
+            f"não rastreados. Escolha um caminho fora dele.")
+    except ValueError:
+        pass   # não está dentro — é o esperado
+    r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", args.base],
+                       capture_output=True)
+    if r.returncode != 0:
+        die(f"branch base '{args.base}' não existe em {repo}.")
+
+    con = criar_banco(caminho, forcar=args.forcar)
+    con.close()
+    nome = args.nome or caminho.stem
+    valores = {
+        "name": nome, "repo": str(repo), "base_branch": args.base,
+        "worktree_root": str(worktrees), "list_id": args.lista or "",
+        "github_repo": args.github or "",
+    }
+    with transacao(caminho) as con:
+        for chave, valor in valores.items():
+            definir_config(con, chave, valor)
+        registrar_evento(con, None, "declaracao", texto=f"esteira '{nome}' inicializada")
+    print(f"{C['grn']}✓{C['r']} banco criado em {caminho}")
+    print(f"{C['d']}  repo={repo} base={args.base} worktrees={worktrees}{C['r']}")
+
+
+def cmd_task_add(cfg, args):
+    prioridade = PRIORIDADES.get(args.prioridade)
+    if prioridade is None:
+        die(f"--prioridade '{args.prioridade}' desconhecida. Use uma de: "
+            f"{', '.join(PRIORIDADES)}.")
+    if args.modo not in ("autonomous", "hands-on"):
+        die(f"--modo precisa ser 'autonomous' ou 'hands-on', recebeu '{args.modo}'.")
+    caminho = Path(args.db)
+    with transacao(caminho) as con:
+        existente = con.execute(
+            "SELECT * FROM unidade WHERE chave = ?", (args.chave,)).fetchone()
+        if existente:
+            igual = (existente["clickup_id"] == args.clickup
+                     and existente["titulo"] == args.titulo
+                     and existente["modo"] == args.modo
+                     and existente["prioridade"] == prioridade)
+            if igual:
+                print(f"{args.chave} já declarada, sem mudança.")
+                return
+            if not args.forcar:
+                die(f"{args.chave} já existe com valores diferentes. "
+                    f"Use --forcar para sobrescrever.")
+            con.execute(
+                "UPDATE unidade SET clickup_id=?, titulo=?, modo=?, prioridade=?, "
+                "atualizado_em=? WHERE id=?",
+                (args.clickup, args.titulo, args.modo, prioridade, _agora(),
+                 existente["id"]))
+            registrar_evento(con, existente["id"], "declaracao",
+                             texto="unidade redeclarada (--forcar)")
+            print(f"{C['grn']}✓{C['r']} {args.chave} atualizada")
+            return
+        try:
+            criar_unidade(con, args.chave, clickup_id=args.clickup, titulo=args.titulo,
+                         modo=args.modo, prioridade=prioridade)
+        except sqlite3.IntegrityError as e:
+            die(f"não consegui declarar {args.chave}: {e}")
+    print(f"{C['grn']}✓{C['r']} {args.chave} declarada")
+
+
+def cmd_task_rm(cfg, args):
+    caminho = Path(args.db)
+    with transacao(caminho) as con:
+        row = con.execute(
+            "SELECT * FROM unidade WHERE chave = ?", (args.chave,)).fetchone()
+        if row is None:
+            die(f"{args.chave} não existe.")
+        if row["status"] in ("em_progresso", "revisao"):
+            die(f"{args.chave} está '{row['status']}' — pode ter sessão viva ou PR "
+                f"aberto. Resolva isso antes (orq hold / orq release); --forcar não "
+                f"passa por cima disto.")
+        if not args.forcar:
+            die(f"remover {args.chave} é irreversível. Use --forcar para confirmar.")
+        con.execute("DELETE FROM unidade WHERE id = ?", (row["id"],))
+        registrar_evento(con, None, "declaracao", texto=f"unidade {args.chave} removida")
+    print(f"{C['grn']}✓{C['r']} {args.chave} removida")
+
+
+def cmd_task_set(cfg, args):
+    if not any((args.titulo, args.prioridade, args.modo)):
+        die("informe ao menos um de --titulo, --prioridade, --modo.")
+    caminho = Path(args.db)
+    with transacao(caminho) as con:
+        row = con.execute(
+            "SELECT * FROM unidade WHERE chave = ?", (args.chave,)).fetchone()
+        if row is None:
+            die(f"{args.chave} não existe.")
+        campos, valores, mudancas = [], [], []
+        if args.titulo:
+            campos.append("titulo = ?"); valores.append(args.titulo)
+            mudancas.append(f"titulo → {args.titulo!r}")
+        if args.prioridade:
+            p = PRIORIDADES.get(args.prioridade)
+            if p is None:
+                die(f"--prioridade '{args.prioridade}' desconhecida. Use uma de: "
+                    f"{', '.join(PRIORIDADES)}.")
+            campos.append("prioridade = ?"); valores.append(p)
+            mudancas.append(f"prioridade → {args.prioridade}")
+        if args.modo:
+            if args.modo not in ("autonomous", "hands-on"):
+                die("--modo precisa ser 'autonomous' ou 'hands-on'.")
+            campos.append("modo = ?"); valores.append(args.modo)
+            mudancas.append(f"modo → {args.modo}")
+        campos.append("atualizado_em = ?"); valores.append(_agora())
+        valores.append(row["id"])
+        con.execute(f"UPDATE unidade SET {', '.join(campos)} WHERE id = ?", valores)
+        registrar_evento(con, row["id"], "declaracao", texto="; ".join(mudancas))
+    print(f"{C['grn']}✓{C['r']} {args.chave}: {'; '.join(mudancas)}")
+
+
+def cmd_dep_add(cfg, args):
+    caminho = Path(args.db)
+    with transacao(caminho) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        for dep_chave in args.precisa:
+            dep_id = _resolver_unidade_id(con, dep_chave)
+            try:
+                adicionar_dependencia(con, uid, dep_id)
+            except ErroDependenciaCiclica as e:
+                die(str(e))
+    print(f"{C['grn']}✓{C['r']} {args.chave} depende de: {', '.join(args.precisa)}")
+
+
+def cmd_dep_rm(cfg, args):
+    caminho = Path(args.db)
+    removidas = []
+    with transacao(caminho) as con:
+        uid = _resolver_unidade_id(con, args.chave)
+        for dep_chave in args.precisa:
+            dep_id = _resolver_unidade_id(con, dep_chave)
+            cur = con.execute(
+                "DELETE FROM dependencia WHERE unidade_id = ? AND depende_de = ?",
+                (uid, dep_id))
+            if cur.rowcount:
+                removidas.append(dep_chave)
+                registrar_evento(con, uid, "declaracao",
+                                 texto=f"deixou de depender de {dep_chave}")
+    if removidas:
+        print(f"{C['grn']}✓{C['r']} {args.chave} não depende mais de: "
+              f"{', '.join(removidas)}")
+    else:
+        print(f"{C['d']}nenhuma dessas dependências existia.{C['r']}")
+
+
+def cmd_config_set(cfg, args):
+    if args.chave not in CONFIG_CHAVES_CONHECIDAS:
+        die(f"'{args.chave}' não é uma chave de config conhecida. Conhecidas: "
+            f"{', '.join(sorted(CONFIG_CHAVES_CONHECIDAS))}")
+    with transacao(Path(args.db)) as con:
+        definir_config(con, args.chave, args.valor)
+        registrar_evento(con, None, "declaracao", texto=f"config {args.chave} = {args.valor}")
+    print(f"{C['grn']}✓{C['r']} {args.chave} = {args.valor}")
+
+
+def cmd_config_get(cfg, args):
+    con = abrir_banco(Path(args.db))
+    valor = obter_config(con, args.chave)
+    con.close()
+    if valor is None:
+        die(f"'{args.chave}' não está definida.")
+    print(valor)
+
+
+def cmd_config_list(cfg, args):
+    con = abrir_banco(Path(args.db))
+    linhas = con.execute("SELECT chave, valor FROM config ORDER BY chave").fetchall()
+    con.close()
+    for r in linhas:
+        print(f"{r['chave']} = {r['valor']}")
+
+
+def _dados_para_exportar(con: sqlite3.Connection) -> dict:
+    config = {r["chave"]: r["valor"]
+             for r in con.execute("SELECT chave, valor FROM config ORDER BY chave")}
+    unidades = []
+    for u in con.execute("SELECT * FROM unidade ORDER BY chave"):
+        deps = [d["chave"] for d in con.execute(
+            "SELECT unidade.chave AS chave FROM dependencia "
+            "JOIN unidade ON unidade.id = dependencia.depende_de "
+            "WHERE dependencia.unidade_id = ? ORDER BY unidade.chave", (u["id"],))]
+        unidades.append({
+            "chave": u["chave"], "clickup_id": u["clickup_id"] or "",
+            "titulo": u["titulo"], "status": u["status"], "modo": u["modo"],
+            "prioridade": u["prioridade"], "depends_on": deps,
+        })
+    return {"config": config, "unidades": unidades}
+
+
+def _toml_str(valor) -> str:
+    return '"' + str(valor).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _formatar_toml(dados: dict) -> str:
+    linhas = ["[config]"]
+    for k in sorted(dados["config"]):
+        linhas.append(f"{k} = {_toml_str(dados['config'][k])}")
+    for u in dados["unidades"]:
+        linhas += ["", "[[unidade]]",
+                   f"chave = {_toml_str(u['chave'])}",
+                   f"clickup_id = {_toml_str(u['clickup_id'])}",
+                   f"titulo = {_toml_str(u['titulo'])}",
+                   f"status = {_toml_str(u['status'])}",
+                   f"modo = {_toml_str(u['modo'])}",
+                   f"prioridade = {u['prioridade']}",
+                   "depends_on = [" + ", ".join(_toml_str(d) for d in u["depends_on"]) + "]"]
+    return "\n".join(linhas) + "\n"
+
+
+def cmd_export(cfg, args):
+    con = abrir_banco(Path(args.db))
+    dados = _dados_para_exportar(con)
+    con.close()
+    if args.formato == "json":
+        print(json.dumps(dados, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        sys.stdout.write(_formatar_toml(dados))
+
+
+def _primeiro_ciclo(con: sqlite3.Connection, ids: list) -> str | None:
+    """Varredura defensiva do grafo INTEIRO. `adicionar_dependencia` já impede
+    ciclo na escrita; isto pega um banco editado por fora dos verbos."""
+    grafo = {}
+    for row in con.execute("SELECT unidade_id, depende_de FROM dependencia"):
+        grafo.setdefault(row["unidade_id"], []).append(row["depende_de"])
+    cor, caminho = {}, []
+
+    def chave_de(i):
+        r = con.execute("SELECT chave FROM unidade WHERE id = ?", (i,)).fetchone()
+        return r["chave"] if r else str(i)
+
+    def dfs(no):
+        cor[no] = 1
+        caminho.append(no)
+        for viz in grafo.get(no, []):
+            if cor.get(viz, 0) == 1:
+                inicio = caminho.index(viz)
+                return " → ".join(chave_de(x) for x in caminho[inicio:] + [viz])
+            if cor.get(viz, 0) == 0:
+                achado = dfs(viz)
+                if achado:
+                    return achado
+        caminho.pop()
+        cor[no] = 2
+        return None
+
+    for i in ids:
+        if cor.get(i, 0) == 0:
+            achado = dfs(i)
+            if achado:
+                return achado
+    return None
+
+
+def cmd_validate(cfg, args):
+    """Recusa esteira incoerente, sem escrever nada no banco."""
+    con = abrir_banco(Path(args.db))
+    problemas = []
+    conf = {r["chave"]: r["valor"] for r in con.execute("SELECT chave, valor FROM config")}
+
+    repo_str = conf.get("repo")
+    if not repo_str:
+        problemas.append("config 'repo' não declarada.")
+    else:
+        repo = Path(repo_str).expanduser()
+        if not (repo / ".git").exists():
+            problemas.append(f"'repo' ({repo}) não parece um repositório git.")
+        base = conf.get("base_branch")
+        if not base:
+            problemas.append("config 'base_branch' não declarada.")
+        elif (repo / ".git").exists():
+            r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", base],
+                               capture_output=True)
+            if r.returncode != 0:
+                problemas.append(f"branch base '{base}' não existe em {repo}.")
+        wt = conf.get("worktree_root")
+        if not wt:
+            problemas.append("config 'worktree_root' não declarada.")
+        else:
+            try:
+                Path(wt).expanduser().resolve().relative_to(repo.resolve())
+                problemas.append(f"'worktree_root' ({wt}) está DENTRO do repositório.")
+            except ValueError:
+                pass
+        if (repo / ".git").exists() and not any(
+                (repo / n).exists() for n in ("CLAUDE.md", "AGENTS.md")):
+            problemas.append(
+                f"{repo} não tem CLAUDE.md nem AGENTS.md na raiz — é de lá que o "
+                f"agente auto-contido tira os portões (setup/verify). Sem um dos "
+                f"dois, a unidade nasce sem portão de qualidade.")
+
+    if not conf.get("github_repo"):
+        problemas.append("config 'github_repo' não declarada — o vigia de PR (OA-08) "
+                         "depende dela.")
+
+    for chave, minimo in (("max_concurrent", 1), ("interval_seconds", 30)):
+        v = conf.get(chave)
+        if v is None:
+            continue
+        try:
+            if int(v) < minimo:
+                problemas.append(f"'{chave}' = {v}, precisa ser >= {minimo}.")
+        except ValueError:
+            problemas.append(f"'{chave}' = {v!r} não é um número inteiro.")
+    ram = conf.get("ram_per_session_gb")
+    if ram is not None:
+        try:
+            if float(ram) <= 0:
+                problemas.append(f"'ram_per_session_gb' = {ram}, precisa ser > 0.")
+        except ValueError:
+            problemas.append(f"'ram_per_session_gb' = {ram!r} não é um número.")
+
+    unidades = con.execute("SELECT id, chave, clickup_id, titulo FROM unidade").fetchall()
+    ids_validos = {u["id"] for u in unidades}
+    for u in unidades:
+        if not u["clickup_id"]:
+            problemas.append(f"{u['chave']}: sem clickup_id.")
+        if not u["titulo"]:
+            problemas.append(f"{u['chave']}: sem titulo.")
+    for row in con.execute("SELECT unidade_id, depende_de FROM dependencia"):
+        if row["unidade_id"] not in ids_validos or row["depende_de"] not in ids_validos:
+            problemas.append("dependência aponta para unidade inexistente "
+                             "(banco incoerente, editado por fora dos verbos).")
+    ciclo = _primeiro_ciclo(con, [u["id"] for u in unidades])
+    if ciclo:
+        problemas.append(f"ciclo de dependência: {ciclo}.")
+    con.close()
+
+    if problemas:
+        for p in problemas:
+            print(f"{C['red']}✗{C['r']} {p}")
+        sys.exit(1)
+    print(f"{C['grn']}✓{C['r']} esteira coerente.")
 
 
 def git_dir_comum(cwd=None):
@@ -2917,8 +3312,13 @@ def descobrir_projeto(raiz: Path) -> dict:
     return d
 
 
-def cmd_init(cfg, args):
-    """Cria o .orchestrator/pipeline.toml deste projeto, a partir do que ele é."""
+def cmd_init_toml_legado(cfg, args):
+    """Cria o .orchestrator/pipeline.toml deste projeto, a partir do que ele é.
+
+    LEGADO — desregistrado do argparse em 22/09/2026 (OA-02). `orq init` passa a
+    ser o novo, que cria o banco SQLite (ver `cmd_init` mais abaixo). O código
+    daqui fica só até OA-04 remover o `pipeline.toml` por inteiro; nada mais o
+    chama."""
     raiz = Path(args.repo or os.getcwd()).expanduser().resolve()
     if not (raiz / ".git").exists():
         die(f"{raiz} não é a raiz de um repositório git.")
@@ -3140,21 +3540,88 @@ def main():
     p = argparse.ArgumentParser(prog="orq",
                                 description="Orquestrador de esteiras guiadas por ClickUp.")
     p.add_argument("--pipeline", help="caminho do pipeline.toml (ou $ORQ_PIPELINE)")
+    p.add_argument("--db", help="caminho do banco SQLite da esteira — obrigatório para "
+                               "os verbos de declaração (OA-02). Mundo separado do "
+                               "--pipeline até OA-04 fundir os dois.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add(name, fn, help, sem_config=False):
+    def add(name, fn, help, sem_config=False, banco=False):
         s = sub.add_parser(name, help=help)
         # `host` fala da MÁQUINA, não de uma esteira: precisa responder num
         # diretório qualquer, inclusive antes de existir qualquer pipeline.toml.
-        s.set_defaults(fn=fn, sem_config=sem_config)
+        # `banco=True` marca os verbos novos (OA-02): não tocam pipeline.toml,
+        # exigem --db, e chegam à função como (None, args) — cfg não existe
+        # para eles.
+        s.set_defaults(fn=fn, sem_config=sem_config, banco=banco)
         return s
 
-    s = add("init", cmd_init, "cria o pipeline.toml deste projeto, a partir do que ele é",
-            sem_config=True)
-    s.add_argument("--repo", help="raiz do repositório (padrão: o diretório atual)")
+    # ---- OA-02: verbos de declaração — o estado vive no banco (OA-01), nunca
+    # mais em pipeline.toml. `orq init` SUBSTITUI o comando antigo (que gerava
+    # pipeline.toml): decisão de 22/09/2026, registrada em
+    # docs/specs/orquestrador-agil/OA-02-verbos-de-declaracao.md. O código do
+    # comando antigo continua no arquivo, sem registro aqui, até OA-04 remover
+    # o pipeline.toml por inteiro.
+    s = add("init", cmd_init, "cria o banco de uma esteira nova", sem_config=True, banco=True)
+    s.add_argument("--nome", help="nome da esteira (padrão: o nome do arquivo do banco)")
+    s.add_argument("--repo", required=True, help="raiz do repositório git")
+    s.add_argument("--base", required=True, help="branch de publicação (ex.: main)")
+    s.add_argument("--worktrees", required=True,
+                   help="raiz das worktrees, FORA do repositório")
     s.add_argument("--lista", help="id da lista no ClickUp")
-    s.add_argument("--simular", action="store_true", help="mostra e não escreve")
-    s.add_argument("--forcar", action="store_true", help="sobrescreve um já existente")
+    s.add_argument("--github", help="owner/repo no GitHub, para o vigia de PR (OA-08)")
+    s.add_argument("--forcar", action="store_true", help="recria o banco do zero")
+
+    s_task = sub.add_parser("task", help="declara, remove ou altera uma unidade")
+    sub_task = s_task.add_subparsers(dest="subcmd", required=True)
+    st = sub_task.add_parser("add", help="declara uma unidade nova")
+    st.add_argument("chave"); st.add_argument("--clickup", required=True,
+                                              help="id da tarefa no ClickUp")
+    st.add_argument("--titulo", required=True)
+    st.add_argument("--prioridade", default="normal",
+                    help="urgente | alta | normal | baixa | sem (padrão: normal)")
+    st.add_argument("--modo", default="autonomous", help="autonomous | hands-on")
+    st.add_argument("--forcar", action="store_true",
+                    help="sobrescreve uma unidade já declarada com valores diferentes")
+    st.set_defaults(fn=cmd_task_add, sem_config=True, banco=True)
+    st = sub_task.add_parser("rm", help="remove uma unidade")
+    st.add_argument("chave")
+    st.add_argument("--forcar", action="store_true", help="confirma a remoção")
+    st.set_defaults(fn=cmd_task_rm, sem_config=True, banco=True)
+    st = sub_task.add_parser("set", help="altera título, prioridade ou modo")
+    st.add_argument("chave")
+    st.add_argument("--titulo"); st.add_argument("--prioridade"); st.add_argument("--modo")
+    st.set_defaults(fn=cmd_task_set, sem_config=True, banco=True)
+
+    s_dep = sub.add_parser("dep", help="declara ou remove dependência entre unidades")
+    sub_dep = s_dep.add_subparsers(dest="subcmd", required=True)
+    sd = sub_dep.add_parser("add", help="unidade passa a depender de outra(s)")
+    sd.add_argument("chave")
+    sd.add_argument("--precisa", action="append", required=True, metavar="CHAVE",
+                    help="pode repetir para declarar mais de uma dependência")
+    sd.set_defaults(fn=cmd_dep_add, sem_config=True, banco=True)
+    sd = sub_dep.add_parser("rm", help="remove dependência(s)")
+    sd.add_argument("chave")
+    sd.add_argument("--precisa", action="append", required=True, metavar="CHAVE")
+    sd.set_defaults(fn=cmd_dep_rm, sem_config=True, banco=True)
+
+    s_cfg = sub.add_parser("config", help="lê ou altera a configuração da esteira")
+    sub_cfg = s_cfg.add_subparsers(dest="subcmd", required=True)
+    sc = sub_cfg.add_parser("set", help="define uma chave de configuração")
+    sc.add_argument("chave"); sc.add_argument("valor")
+    sc.set_defaults(fn=cmd_config_set, sem_config=True, banco=True)
+    sc = sub_cfg.add_parser("get", help="lê uma chave de configuração")
+    sc.add_argument("chave")
+    sc.set_defaults(fn=cmd_config_get, sem_config=True, banco=True)
+    sc = sub_cfg.add_parser("list", help="lista toda a configuração")
+    sc.set_defaults(fn=cmd_config_list, sem_config=True, banco=True)
+
+    s = add("export", cmd_export, "emite o estado inteiro em texto estável",
+            sem_config=True, banco=True)
+    s.add_argument("--formato", choices=["toml", "json"], default="toml")
+
+    add("validate", cmd_validate, "recusa esteira incoerente, sem escrever nada",
+        sem_config=True, banco=True)
+
     s = add("doctor", cmd_doctor, "pré-voo: prova cada dependência por chamada real")
     s.add_argument("--rapido", action="store_true",
                    help="pula a chamada ao agente (a mais demorada). NÃO é prova: "
@@ -3232,6 +3699,9 @@ def main():
     s.add_argument("unit"); s.add_argument("--stage")
 
     args = p.parse_args()
+    if getattr(args, "banco", False) and not args.db:
+        die("--db é obrigatório para este comando: o caminho do banco SQLite "
+            "desta esteira (não há resolução automática ainda — ver OA-02/OA-03).")
     cfg = None if getattr(args, "sem_config", False) else find_config(args.pipeline)
     # ANTES de qualquer comando agir. `doctor` é a exceção porque ele é a
     # ferramenta de diagnóstico: morrer aqui esconderia dele justamente o achado

@@ -1,7 +1,7 @@
 # Instalação
 
 ```bash
-git clone <endereço deste repositório> ~/orquestrador
+git clone git@github.com:GitArika/agents-orchestrator.git ~/orquestrador
 cd ~/orquestrador
 ./instalar.sh
 ```

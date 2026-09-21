@@ -16,7 +16,7 @@ descobre até perguntar.
 ## Os primeiros dez minutos
 
 ```bash
-git clone <endereço deste repositório> ~/orquestrador
+git clone git@github.com:GitArika/agents-orchestrator.git ~/orquestrador
 cd ~/orquestrador
 ./instalar.sh                    # guiado; --simular mostra tudo sem escrever nada
 

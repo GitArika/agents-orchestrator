@@ -12,10 +12,9 @@ Divisão de autoridade, de propósito:
 
 Isto substitui o motor anterior, guiado por `pipeline.toml` e pelo ClickUp em
 todo ciclo — removido em 22/09/2026 (OA-04,
-docs/specs/orquestrador-agil/OA-04-motor-sem-clickup.md). `orq run`/
-`orq dispatch`/`orq doctor`/`orq capacity` ainda não existem: dependiam do
-motor removido, e cada um volta com um lançador/checagem de verdade contra o
-banco (OA-05, OA-12) em vez de um comando que finge funcionar.
+docs/specs/orquestrador-agil/OA-04-motor-sem-clickup.md). `orq doctor` ainda
+não existe: dependia do motor removido, e volta com checagem de verdade
+contra o banco em OA-12.
 
 MAPA DO ARQUIVO. Este motor é um arquivo só de propósito: é o que faz a
 instalação ser um symlink e não haver dependência para dar errado na máquina de
@@ -27,6 +26,8 @@ outra pessoa. As seções abaixo são a divisão interna; localize-as por
   estado — máquina         as cinco transições legais, sessão viva, fila de
   de cinco estados         despacho, board/next/status/show, hold/release/
                            reopen/advance/tick (OA-03)
+  estado — sessão e        worktree, briefing único, cerca, capacidade,
+  lançamento               run/dispatch/attach/log/stop (OA-05)
 """
 from __future__ import annotations
 
@@ -910,13 +911,26 @@ def recolher_sessoes_mortas(con: sqlite3.Connection, max_strikes: int) -> list:
     encontrada sem sessão — é perdoada, e o bilhete é consumido (`solta_em`
     volta a NULL). Sem isto, toda unidade liberada seria imediatamente
     recolhida de novo antes de alguém ter a chance de despachá-la.
+
+    Arquiva os artefatos de cada uma (rápido: mover 3 arquivos pequenos). O
+    que NÃO roda aqui, de propósito, é o encerramento de ambiente
+    (`encerramento_fixo`) — ele pode levar até dois minutos por
+    docker-compose, e segurar o lock de escrita por isso seria o mesmo erro
+    que a migração para SQLite corrigiu (OA-01). Por isso o desfecho
+    'quarentena' devolve o `worktree`: quem chama (`cmd_tick`) faz o
+    encerramento DEPOIS de fechar esta transação.
     """
     recolhidas = []
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
     for u in con.execute(
             "SELECT id, chave, strikes, solta_em FROM unidade WHERE status = 'em_progresso'"):
         if sessao_viva(con, u["id"]):
             continue
+        sessao_row = con.execute(
+            "SELECT worktree FROM sessao WHERE unidade_id = ? AND encerrada_em IS NULL "
+            "ORDER BY id DESC LIMIT 1", (u["id"],)).fetchone()
         encerrar_sessao(con, u["id"], "sessao-morta")
+        arquivar_artefatos(nome_esteira, u["id"], u["chave"], "sessao-morta")
         if u["solta_em"] is not None:
             con.execute("UPDATE unidade SET solta_em = NULL WHERE id = ?", (u["id"],))
             transicionar(con, u["id"], "backlog",
@@ -928,7 +942,8 @@ def recolher_sessoes_mortas(con: sqlite3.Connection, max_strikes: int) -> list:
         if n >= max_strikes:
             transicionar(con, u["id"], "bloqueado",
                         motivo=f"{n} arranques falhos seguidos", tipo_evento="recolhida")
-            recolhidas.append({"chave": u["chave"], "desfecho": "quarentena", "strikes": n})
+            recolhidas.append({"chave": u["chave"], "desfecho": "quarentena", "strikes": n,
+                               "worktree": sessao_row["worktree"] if sessao_row else None})
         else:
             transicionar(con, u["id"], "backlog",
                         motivo=f"arranque falho ({n}/{max_strikes})", tipo_evento="recolhida")
@@ -1137,19 +1152,50 @@ def cmd_show(cfg, args):
             print(f"  {e['ts']}  {e['tipo']}{seta}  {e['texto'][:80]}")
 
 
-# ---- transições sem lançador — hold/release/reopen/advance não precisam de
-# worktree nem tmux, só do banco. `orq run` continua sem existir aqui.
+# ---- transições — release/reopen são banco puro. hold/advance também
+# encerram a sessão e arquivam os artefatos (OA-05: `arquivar_artefatos`,
+# `_matar_sessao_com_delicadeza`, `encerramento_fixo`, definidos mais abaixo).
 
 def cmd_hold(cfg, args):
+    """em_progresso → bloqueado. Encerra a sessão desta unidade e o ambiente
+    que ela subiu (`encerramento_fixo` — a mesma busca por docker-compose que
+    OA-08 vai usar no gatilho de merge; construída aqui porque este spec já
+    amarra o fim da worktree ao `bloqueado`, e duplicar depois seria
+    desperdício), e remove a worktree — o branch e os commits ficam, então
+    nada se perde: `orq release` devolve a unidade à fila, e o próximo
+    despacho parte do mesmo branch."""
     if not args.motivo or len(args.motivo.strip()) < 10:
         die("--motivo é obrigatório e precisa dizer o que trava (mín. 10 caracteres).")
-    with transacao(Path(args.db)) as con:
+    caminho = Path(args.db)
+    with transacao(caminho) as con:
         uid = _resolver_unidade_id(con, args.chave)
+        row_sessao = con.execute(
+            "SELECT tmux, pid, worktree FROM sessao WHERE unidade_id = ? "
+            "AND encerrada_em IS NULL ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
         try:
             transicionar(con, uid, "bloqueado", motivo=args.motivo, tipo_evento="bloqueada")
         except ErroTransicaoIlegal as e:
             die(str(e))
+        encerrar_sessao(con, uid, "hold")
+        nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+        repo = obter_config(con, "repo")
+    # FORA da transação: teardown e `git worktree remove` podem demorar, e
+    # seria o mesmo erro que a migração para SQLite existiu para consertar
+    # segurar o lock de escrita durante I/O lento (OA-01).
+    dest = arquivar_artefatos(nome_esteira, uid, args.chave, "hold")
+    _matar_sessao_com_delicadeza(row_sessao)
+    falhas_td = []
+    if row_sessao and row_sessao["worktree"]:
+        wt = Path(row_sessao["worktree"])
+        falhas_td = encerramento_fixo(wt)
+        if not falhas_td and wt.exists() and repo:
+            subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
+                           capture_output=True)
+    if falhas_td:
+        print(f"{C['yel']}!{C['r']} o encerramento do ambiente falhou; a worktree "
+              f"NÃO foi removida:\n  " + "\n  ".join(falhas_td))
     print(f"{C['yel']}✋{C['r']} {args.chave} bloqueada: {args.motivo}")
+    print(f"{C['d']}  artefatos em {dest}{C['r']}")
 
 
 def cmd_release(cfg, args):
@@ -1190,43 +1236,651 @@ def _numero_e_url_do_pr(con: sqlite3.Connection, valor: str):
     return numero, (f"https://github.com/{gh}/pull/{numero}" if gh else None)
 
 
+def _pr_existe(github_repo: str | None, numero: int) -> bool:
+    """A única chamada de rede do motor fora do vigia (OA-08). Pega erro de
+    digitação no PR na hora — sem isto a unidade ficaria em 'revisao' para
+    sempre, esperando um vigia que nunca vai achar nada."""
+    if not github_repo:
+        return True   # nada declarado pra checar; `orq validate` já cobra isso
+    if not shutil.which("gh"):
+        die("`gh` não está na PATH — não dá para confirmar que o PR existe.")
+    r = subprocess.run(["gh", "pr", "view", str(numero), "--repo", github_repo],
+                       capture_output=True, text=True, timeout=20)
+    return r.returncode == 0
+
+
 def cmd_advance(cfg, args):
-    """PR aberto → 'revisão'. Não confere se o PR existe de verdade no GitHub
-    — essa é a única chamada de rede fora do vigia, e fica para OA-05, que é
-    quem sabe o `github_repo` no contexto certo de uma sessão."""
-    with transacao(Path(args.db)) as con:
+    """em_progresso → revisão. Confere que o PR existe de verdade — a única
+    chamada de rede do motor fora do vigia. A worktree SOBREVIVE (retrabalho
+    de OA-09 pode reusá-la); só a sessão de agente encerra."""
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    _resolver_unidade_id(con, args.chave)   # valida cedo, antes da chamada de rede
+    numero, url = _numero_e_url_do_pr(con, args.pr)
+    github_repo = obter_config(con, "github_repo")
+    con.close()
+    if not _pr_existe(github_repo, numero):
+        die(f"PR #{numero} não existe em {github_repo or '(github_repo não declarado)'} "
+            f"— ou o `gh` não está autenticado para vê-lo.")
+
+    with transacao(caminho) as con:
         uid = _resolver_unidade_id(con, args.chave)
-        numero, url = _numero_e_url_do_pr(con, args.pr)
         con.execute("UPDATE unidade SET pr_numero = ?, pr_url = ? WHERE id = ?",
                    (numero, url, uid))
+        row_sessao = con.execute(
+            "SELECT tmux, pid FROM sessao WHERE unidade_id = ? AND encerrada_em IS NULL "
+            "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
         try:
             transicionar(con, uid, "revisao", tipo_evento="pr_aberto",
                         motivo=f"PR #{numero}")
         except ErroTransicaoIlegal as e:
             die(str(e))
         encerrar_sessao(con, uid, "advance")
+        nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+    dest = arquivar_artefatos(nome_esteira, uid, args.chave, "advance")
+    _matar_sessao_com_delicadeza(row_sessao)
     print(f"{C['grn']}✓{C['r']} {args.chave}: revisão — PR #{numero}"
           + (f" {url}" if url else ""))
+    print(f"{C['d']}  artefatos em {dest} · worktree continua (retrabalho pode reusar){C['r']}")
 
 
 def cmd_tick(cfg, args):
-    """SÓ recolhe sessão morta. Despachar (preencher vaga, lançar sessão) é
-    `orq run`/`orq dispatch`, e eles continuam sem lançador de verdade até
-    OA-05 — chamá-los aqui seria fingir que a esteira anda sozinha quando
-    ela ainda não anda."""
+    """SÓ recolhe sessão morta. Preencher vaga (o laço autônomo de verdade)
+    não existe ainda — `orq run`/`orq dispatch` são manuais nesta unidade."""
     caminho = Path(args.db)
     con = abrir_banco(caminho)
     max_strikes = int(obter_config(con, "max_strikes", "2") or 2)
+    repo = obter_config(con, "repo")
     con.close()
     with transacao(caminho) as con:
         recolhidas = recolher_sessoes_mortas(con, max_strikes)
     if not recolhidas:
         print("nada para recolher.")
+        return
+    for r in recolhidas:
+        extra = f" ({r['strikes']}/{max_strikes})" if "strikes" in r else ""
+        print(f"  {r['chave']}: {r['desfecho']}{extra}")
+        # Quarentena é o único desfecho que mata a worktree (mesma regra de
+        # `orq hold` — bloqueado é onde a worktree termina). FORA da
+        # transação que já fechou: teardown pode levar minutos.
+        if r["desfecho"] == "quarentena" and r.get("worktree"):
+            wt = Path(r["worktree"])
+            falhas_td = encerramento_fixo(wt)
+            if falhas_td:
+                print(f"    {C['yel']}!{C['r']} encerramento do ambiente falhou; "
+                     f"worktree NÃO removida: {'; '.join(falhas_td)}")
+            elif wt.exists() and repo:
+                subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", str(wt)],
+                               capture_output=True)
+
+
+# ---------------------------------------------------------------- estado — sessão e
+# lançamento (OA-05)
+#
+# O papel único: uma unidade, um ciclo inteiro — ler o requisito, implementar,
+# revisar o próprio trabalho, abrir o PR, atualizar o cartão. Devolve a `orq
+# run`/`orq dispatch` que OA-04 tirou, com lançador de verdade contra o banco.
+# Ver docs/specs/orquestrador-agil/OA-05-papel-unico-auto-contido.md.
+#
+# A CERCA NÃO FOI TOCADA AQUI — decisão de 22/09/2026. `hooks/cerca.sh` ainda
+# só libera `git push`/`gh pr merge` com `ORQ_STAGE=integrate`, e este
+# lançador não injeta `ORQ_STAGE` (estágio não existe mais). Consequência
+# ACEITA, não escondida: uma sessão lançada consegue implementar e comitar
+# localmente, mas a cerca barra a publicação do próprio branch — o passo 6 do
+# briefing — até OA-06 trocar a regra de "por estágio" para "por branch". O
+# briefing instrui a sessão a `orq hold` se for barrada, como sempre foi: a
+# saída de ser barrado nunca é contornar.
+
+CERCA = ORQ_REPO / "hooks" / "cerca.sh"
+HOOK = ORQ_REPO / "hooks" / "notificar.sh"
+CLAUDE_JSON = Path(os.environ.get("ORQ_CLAUDE_JSON", str(Path.home() / ".claude.json")))
+
+
+def branch_for(con: sqlite3.Connection, chave: str, clickup_id: str | None,
+               titulo: str) -> str:
+    template = obter_config(con, "branch_template") or "CU-{id}-{slug}"
+    slug_max = int(obter_config(con, "slug_max") or 40)
+    return template.format(id=clickup_id or chave, key=chave.lower(),
+                           slug=slugify(titulo or chave, slug_max))
+
+
+def ensure_worktree(con: sqlite3.Connection, u) -> tuple:
+    """Cria ou reaproveita a worktree da unidade — nasce de `origin/<base>`, e
+    dependência só libera em `pronto` (OA-03), que significa fundido; então o
+    código de que esta unidade depende já está na base quando ela nasce (o
+    caso que custou uma sessão em 01/09/2026 deixa de ser possível).
+
+    Reaproveitar em vez de recriar é o que permite ao retrabalho de OA-09
+    relançar na MESMA worktree: `--ff-only` contra `origin/<base>` traz a
+    base para cima sem nunca perder commit — ou avança em linha reta, ou não
+    avança."""
+    repo = Path(obter_config(con, "repo")).expanduser()
+    base = obter_config(con, "base_branch") or "main"
+    worktree_root = Path(obter_config(con, "worktree_root")).expanduser()
+    branch = branch_for(con, u["chave"], u["clickup_id"], u["titulo"])
+    wt = worktree_root / branch
+    if wt.exists():
+        subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"],
+                       capture_output=True, text=True, timeout=120)
+        remoto = f"origin/{base}"
+        tem_remoto = subprocess.run(["git", "-C", str(wt), "rev-parse", "--verify", remoto],
+                                    capture_output=True).returncode == 0
+        subprocess.run(["git", "-C", str(wt), "merge", "--ff-only",
+                        remoto if tem_remoto else base],
+                       capture_output=True, text=True, timeout=120)
+        return wt, branch
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    existe = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", branch],
+                            capture_output=True).returncode == 0
+    args = ["git", "-C", str(repo), "worktree", "add", str(wt)]
+    args += [branch] if existe else ["-b", branch, base]
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"falha ao criar worktree para {u['chave']}: {r.stderr.strip()[:300]}")
+    return wt, branch
+
+
+def ensure_trusted(repo: Path, path: Path) -> None:
+    """A worktree HERDA a confiança do repositório base — nunca a inventa. Se
+    o base não estiver marcado como confiável, recusa em vez de decidir por
+    você; senão o Claude Code abriria o diálogo de confiança numa sessão
+    desacoplada, e ela travaria antes de começar."""
+    if not CLAUDE_JSON.exists():
+        die(f"{CLAUDE_JSON} não existe — abra o Claude Code uma vez antes.")
+    try:
+        d = json.loads(CLAUDE_JSON.read_text())
+    except Exception as e:
+        die(f"não consegui ler {CLAUDE_JSON}: {e}")
+    projects = d.setdefault("projects", {})
+    base = projects.get(str(repo), {})
+    if not base.get("hasTrustDialogAccepted"):
+        die(f"o repositório base não está marcado como confiável.\n"
+            f"  Abra-o uma vez e aceite: cd {repo} && claude\n"
+            f"  A esteira só herda confiança; nunca a concede por conta própria.")
+    entry = projects.setdefault(str(path), {})
+    if entry.get("hasTrustDialogAccepted"):
+        return
+    entry["hasTrustDialogAccepted"] = True
+    tmp = CLAUDE_JSON.with_suffix(".json.orq-tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    tmp.replace(CLAUDE_JSON)
+
+
+def settings_json(label: str, worktree: str) -> str:
+    """A cerca (PreToolUse) e os avisos (Notification/Stop) que a sessão
+    recebe. A CERCA É UM GANCHO, não uma lista de negação — decidido por
+    experimento em 02/09/2026: uma negação `Bash(git push:*)` por --settings
+    NÃO venceu um `allow` idêntico que a pessoa já tinha nas próprias
+    configurações. O gancho vê o comando inteiro, roda sempre, não é anulável.
+    """
+    if not CERCA.exists():
+        die(f"a cerca sumiu: {CERCA}\n"
+            f"  Nenhuma sessão sobe sem ela. Restaure com:\n"
+            f"    git -C {ORQ_REPO} checkout hooks/cerca.sh")
+    amb = f"ORQ_UNIT={label} ORQ_WORKTREE={worktree}"
+    return json.dumps({"hooks": {
+        "PreToolUse": [{"hooks": [{"type": "command", "command": f"{amb} {CERCA}"}]}],
+        "Notification": [{"hooks": [{"type": "command",
+                                     "command": f"ORQ_UNIT={label} {HOOK} notification"}]}],
+        "Stop": [{"hooks": [{"type": "command",
+                             "command": f"ORQ_UNIT={label} {HOOK} stop"}]}]}})
+
+
+def sess_name(con: sqlite3.Connection, chave: str) -> str:
+    nome = slugify(obter_config(con, "name") or "esteira", 16)
+    return f"orq-{nome}-{chave}"
+
+
+def argumentos_new_session(nome: str, wt, ambiente: dict, cmd: list) -> list:
+    """Monta o `tmux new-session` levando o ambiente da unidade por `-e`.
+
+    `subprocess.run(env=...)` só alcança o CLIENTE tmux — quando o servidor já
+    está de pé (dias, compartilhado por todas as esteiras da máquina), a
+    sessão nova herda o ambiente do SERVIDOR, congelado na primeira sessão que
+    o criou. `-e` (tmux ≥ 3.2) põe a variável no ambiente da SESSÃO, o único
+    escopo por unidade que existe aqui."""
+    args = ["tmux", "new-session", "-d", "-s", nome, "-c", str(wt)]
+    for chave in sorted(ambiente):
+        args += ["-e", f"{chave}={ambiente[chave]}"]
+    # O comando por último, sempre: tmux trata o primeiro argumento livre como
+    # o comando do painel, e uma opção depois dele viraria argumento DELE.
+    return args + list(cmd)
+
+
+BRIEFING = """Você é o agente auto-contido da esteira "{pipeline}". Um papel só, um ciclo
+inteiro: ler o requisito, implementar, revisar o próprio trabalho, abrir o PR,
+atualizar o cartão. Não há segunda sessão atrás de você — o que você não
+verificar, ninguém verifica antes de uma pessoa olhar o PR.
+
+Tarefa: {chave} — {titulo}
+Cartão: {url}
+Worktree: {worktree}  (branch {branch}, a partir de {base})
+Repositório: {repo}
+
+────────────────────────────────────────────────────────────────────────────
+1. LEIA A TAREFA INTEIRA — antes de qualquer outra coisa
+
+    orq-clickup show {clickup_id}
+
+Isso imprime a descrição E todos os comentários, do mais antigo ao mais
+recente. Os comentários não são conversa paralela: é onde mora o que a
+descrição não tem.
+
+  - Divergências entre a descrição e o código real, registradas por quem veio
+    antes.
+  - Ambiguidades que uma sessão anterior encontrou e deliberadamente NÃO
+    resolveu sozinha — se você resolver por conta própria sem dizer, ninguém
+    saberá.
+  - Um comentário pedindo mudança numa revisão anterior: esta unidade já teve
+    PR devolvido, e o que foi pedido é o seu escopo agora, com prioridade
+    sobre o resto do cartão.
+  - Instruções escritas por uma pessoa no meio do caminho.
+
+Tratar a descrição como o todo é o erro mais caro desta esteira: você refaz
+uma decisão que já foi tomada, ou repete um engano que já foi diagnosticado.
+
+────────────────────────────────────────────────────────────────────────────
+2. PREPARO — leia o CLAUDE.md ou AGENTS.md deste projeto
+
+A worktree nasce sem dependência instalada e sem nada subido. Quem diz como
+deixar isto pronto é o `CLAUDE.md`/`AGENTS.md` do PRÓPRIO projeto — não um
+portão declarado à parte: uma cópia mantida fora do projeto diverge do
+comando real e falha pelo motivo errado.
+
+Se o repositório não tiver nenhum dos dois: pare com `orq hold`. Não é "sem
+portão" — é um projeto sem guia, e inventar um comando é pior que admitir a
+lacuna.
+
+────────────────────────────────────────────────────────────────────────────
+3. IMPLEMENTE — escopo é o do cartão
+
+Defeito fora de escopo vira comentário no cartão (`orq-clickup comment`), não
+conserto. Ambiguidade genuína no critério: pare e pergunte — não decida
+sozinho por um lado.
+
+────────────────────────────────────────────────────────────────────────────
+4. REVISE O PRÓPRIO TRABALHO — não há segunda leitura
+
+Para CADA critério de aceite do cartão: atendido, não atendido, ou não
+verificável — com evidência (arquivo e linha, ou a saída de um comando).
+Critério sem evidência NÃO está atendido. O caminho para isso é travar
+(`orq hold`), nunca afirmar.
+
+────────────────────────────────────────────────────────────────────────────
+5. RODE A VERIFICAÇÃO QUE O CLAUDE.md MANDA
+
+Tipo, lint, teste — o que o projeto declarar. Cole a saída no corpo do PR.
+
+────────────────────────────────────────────────────────────────────────────
+6. COMMIT, PUBLIQUE, ABRA O PR — e NÃO FUNDA
+
+    git add -A && git commit -m "<tipo(escopo): assunto>"
+    git push -u origin {branch}
+    gh pr create --base {base} --repo {github_repo} \\
+        --title "<tipo(escopo): assunto>" --body "<...>"
+
+O corpo do PR carrega: os critérios de aceite com a evidência do passo 4, a
+saída da verificação do passo 5, e o que ficou fora de escopo e por quê.
+
+VOCÊ NÃO FUNDE. `gh pr merge` é barrado pela cerca, sem exceção — quem decide
+fundir é uma pessoa, olhando o diff.
+
+SE A CERCA BARRAR O `git push`: a saída NÃO é contornar nem tentar outro
+jeito — pare com `orq hold` explicando que a publicação foi barrada. Ordem
+que a cerca proíbe não é ordem; já custou sessões inteiras insistir.
+
+────────────────────────────────────────────────────────────────────────────
+7. ENCERRE — por um destes dois caminhos, sempre
+
+    orq advance {chave} --pr <número ou URL do PR>
+    orq hold    {chave} --motivo "<o que exatamente trava>"
+
+`advance` só depois do PR aberto — sem PR não há o que o gate humano revisar,
+e o comando recusa se o PR não existir de verdade. `hold` é para o que só uma
+pessoa resolve: credencial que falta, decisão de produto, ambiguidade que não
+dá para resolver sozinho.
+
+Encerrar sem nenhum dos dois deixa a unidade em 'em_progresso' sem sessão
+viva — a esteira lê isso como arranque falho e conta uma falta.
+
+────────────────────────────────────────────────────────────────────────────
+8. SÓ DEPOIS, ATUALIZE O CARTÃO
+
+    orq-clickup comment {clickup_id} --text "<resumo com o link do PR>"
+
+NESTA ORDEM, não na inversa: o banco (passo 7) é a autoridade da esteira; o
+cartão é só o espelho que uma pessoa lê. Se você morrer entre os dois passos,
+a divergência fica visível no lugar onde alguém olha — o cartão —, e o
+rastro do banco permite reconstruir o que houve. Comentar antes de encerrar
+deixaria o cartão dizendo "revisão" com a esteira ainda achando que ninguém
+trabalhou.
+"""
+
+
+def build_brief(con: sqlite3.Connection, u, wt: Path, branch: str) -> str:
+    base = obter_config(con, "base_branch") or "main"
+    repo = obter_config(con, "repo") or "?"
+    github_repo = obter_config(con, "github_repo") or "(github_repo não declarado)"
+    url = (f"https://app.clickup.com/t/{u['clickup_id']}" if u["clickup_id"]
+          else "(sem ClickUp)")
+    return BRIEFING.format(
+        pipeline=obter_config(con, "name") or "(sem nome)", chave=u["chave"],
+        clickup_id=u["clickup_id"] or "?", titulo=u["titulo"] or "(ver ClickUp)",
+        url=url, worktree=wt, branch=branch, base=base, repo=repo,
+        github_repo=github_repo)
+
+
+def launch(con: sqlite3.Connection, banco: Path, u, attach: bool = False) -> str:
+    """Lança a sessão: worktree, confiança, briefing, settings, tmux ou
+    processo solto. Só a ÚLTIMA escrita (registrar a sessão) roda em
+    transação — o resto é git/tmux e pode demorar; segurar o lock de escrita
+    durante isso seria o mesmo erro que a migração para SQLite corrigiu."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    wt, branch = ensure_worktree(con, u)
+    repo = Path(obter_config(con, "repo")).expanduser()
+    ensure_trusted(repo, wt)
+    label = u["chave"]
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+    brief_path = STATE / f"{nome_esteira}-{u['id']}.brief.md"
+    brief_path.write_text(build_brief(con, u, wt, branch))
+    setts = STATE / f"{nome_esteira}-{u['id']}.settings.json"
+    setts.write_text(settings_json(label, str(wt)))
+    logf = STATE / f"{nome_esteira}-{u['id']}.log"
+
+    permission_mode = obter_config(con, "permission_mode") or "auto"
+    cmd = ["claude", "--permission-mode", permission_mode,
+           "--settings", str(setts), "--add-dir", str(wt)]
+    remote_control = (obter_config(con, "remote_control") or "true").strip().lower()
+    if remote_control not in ("false", "0", "nao", "não"):
+        # Toda sessão sobe com acompanhamento remoto — não é conveniência, é
+        # como uma pessoa vê e interrompe, de outro dispositivo, uma sessão
+        # que está agindo sozinha.
+        cmd += ["--remote-control", f"{nome_esteira}-{label}"]
+    modelo = obter_config(con, "model")
+    if modelo:
+        cmd += ["--model", modelo]
+    cmd += [f"Leia e siga integralmente o briefing em {brief_path}. "
+            f"Ele é a sua única ordem de serviço."]
+
+    ambiente_unidade = {"ORQ_UNIT": label, "ORQ_LOG_DIR": str(STATE), "ORQ_DB": str(banco)}
+    env = {**os.environ, **ambiente_unidade}
+    nome_sessao = sess_name(con, label)
+    tmux_nome, pid = None, None
+    if has_tmux():
+        subprocess.run(["tmux", "kill-session", "-t", nome_sessao], capture_output=True)
+        subprocess.run(argumentos_new_session(nome_sessao, wt, ambiente_unidade, cmd),
+                       env=env, check=True)
+        subprocess.run(["tmux", "pipe-pane", "-t", nome_sessao, "-o", f"cat >> {logf}"],
+                       capture_output=True)
+        tmux_nome = nome_sessao
+        how = f"orq attach {label}   (ou: tmux attach -t {nome_sessao})"
     else:
-        for r in recolhidas:
-            extra = f" ({r['strikes']}/{max_strikes})" if "strikes" in r else ""
-            print(f"  {r['chave']}: {r['desfecho']}{extra}")
-    print(f"{C['d']}(isto só recolhe — despachar ainda é orq run/orq dispatch){C['r']}")
+        with open(logf, "ab") as fh:
+            p = subprocess.Popen(cmd, cwd=str(wt), env=env, stdout=fh,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+        pid = p.pid
+        how = f"orq log {label} -f   (tmux ausente)"
+
+    with transacao(banco) as con_escrita:
+        uid = con_escrita.execute(
+            "SELECT id FROM unidade WHERE chave = ?", (label,)).fetchone()["id"]
+        registrar_sessao(con_escrita, uid, worktree=str(wt), branch=branch,
+                         tmux=tmux_nome, pid=pid)
+
+    if attach and has_tmux():
+        os.execvp("tmux", ["tmux", "attach", "-t", nome_sessao])
+    return how
+
+
+def arquivar_artefatos(nome_esteira: str, uid: int, chave: str, outcome: str) -> Path:
+    """Guarda briefing, settings e log num diretório com `meta.json` — puro
+    sistema de arquivos, sem tocar o banco, para poder rodar tanto dentro
+    quanto fora de uma transação sem custar tempo de lock."""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dest = STATE / "archive" / nome_esteira / f"{chave}-{ts}"
+    dest.mkdir(parents=True, exist_ok=True)
+    movidos = []
+    for suf in (".brief.md", ".settings.json", ".log"):
+        f = STATE / f"{nome_esteira}-{uid}{suf}"
+        if f.exists():
+            shutil.move(str(f), dest / f.name)
+            movidos.append(f.name)
+    (dest / "meta.json").write_text(json.dumps({
+        "unidade": chave, "outcome": outcome,
+        "arquivado_em": time.strftime("%FT%TZ", time.gmtime()), "artefatos": movidos,
+    }, ensure_ascii=False, indent=2))
+    return dest
+
+
+def _matar_sessao_com_delicadeza(row_sessao, kill_delay: int = 3) -> None:
+    """SIGTERM antes de `tmux kill-session`, adiado. `advance`/`hold` costumam
+    ser chamados DE DENTRO da própria sessão — matar na hora mataria o
+    processo que está executando o comando antes de ele terminar. E matar de
+    supetão não dá ao Claude Code a chance de se despedir: a sessão sobe com
+    `--remote-control`, e morta assim ela fica listada como offline para
+    sempre em claude.ai/code."""
+    if row_sessao is None:
+        return
+    if row_sessao["tmux"]:
+        nome = row_sessao["tmux"]
+        panes = subprocess.run(["tmux", "list-panes", "-t", nome, "-F", "#{pane_pid}"],
+                               capture_output=True, text=True).stdout.split()
+        alvos = " ".join(f"-{p}" for p in panes)
+        encerra = (f"sleep {kill_delay}; "
+                   + (f"kill -TERM {alvos} 2>/dev/null; sleep 4; " if panes else "")
+                   + f"tmux kill-session -t {nome}")
+        subprocess.Popen(["sh", "-c", encerra], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    elif row_sessao["pid"]:
+        try:
+            os.kill(int(row_sessao["pid"]), 15)
+        except Exception:
+            pass
+
+
+def encerramento_fixo(worktree: Path) -> list:
+    """O encerramento de ambiente que toda unidade recebe ao sair de
+    `em_progresso` para `bloqueado` — NUNCA declarado por esteira, desde que
+    os portões saíram do orquestrador (OA-02). Busca por convenção, a mesma
+    que a skill `esteira-sandbox` já usa para achar serviço: qualquer
+    `docker-compose*.yml`/`.yaml` ou `compose*.yml`/`.yaml` na raiz da
+    worktree, `down`. Nada encontrado não é falha — é nada para encerrar.
+
+    Antecipado de OA-08 (que descreve este mesmo mecanismo para o gatilho de
+    merge): construído aqui porque `orq hold` já precisa dele, e duplicar
+    depois seria desperdício. Existe porque 27 ambientes sobreviveram a uma
+    noite inteira segurando 8,8 GB de uma VPS.
+    """
+    if not worktree.exists():
+        return []
+    falhas = []
+    vistos = set()
+    for padrao in ("docker-compose*.yml", "docker-compose*.yaml",
+                   "compose*.yml", "compose*.yaml"):
+        for arquivo in sorted(worktree.glob(padrao)):
+            if arquivo in vistos:
+                continue
+            vistos.add(arquivo)
+            try:
+                r = subprocess.run(
+                    ["docker", "compose", "-f", str(arquivo), "down",
+                     "--volumes", "--remove-orphans"],
+                    cwd=str(worktree), capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    falhas.append(f"{arquivo.name} → "
+                                 f"{(r.stderr or r.stdout or '').strip()[:160]}")
+            except Exception as e:
+                falhas.append(f"{arquivo.name} → {str(e)[:160]}")
+    return falhas
+
+
+def capacidade(con: sqlite3.Connection) -> dict:
+    """Quantas sessões A MAIS cabem agora — vagas LIVRES, nunca teto total: a
+    RAM disponível já desconta o que está vivo, então comparar 'vivas >= teto'
+    contaria o mesmo consumo duas vezes e travaria a esteira em zero.
+
+    Um orçamento só (`ram_per_session_gb`) — não há mais estágio com custo
+    diferente (OA-03)."""
+    logical = os.cpu_count() or 4
+    total, load1 = total_ram_gb(), os.getloadavg()[0]
+    free = available_ram_gb()
+    per = float(obter_config(con, "ram_per_session_gb") or 1.2)
+    reserve = float(obter_config(con, "reserve_ram_gb") or 3.0)
+    nlive = sum(1 for u in con.execute(
+        "SELECT id FROM unidade WHERE status = 'em_progresso'") if sessao_viva(con, u["id"]))
+
+    by_ram = max(0, int((free - reserve) // per)) if free >= 0 else 1
+    cpu_ceiling = max(1, logical - 2)
+    load_factor = float(obter_config(con, "load_factor") or 3.0)
+    load_ceiling = max(1, int(logical * load_factor - load1))
+    by_cpu = max(0, cpu_ceiling - nlive)
+    by_load = max(0, load_ceiling - nlive)
+    hard = int(obter_config(con, "max_concurrent") or 0)
+    by_hard = max(0, hard - nlive) if hard else 10 ** 6
+
+    return {"logical_cpus": logical, "total_ram_gb": round(total, 1),
+            "free_ram_gb": round(free, 1), "load1": round(load1, 2),
+            "ram_per_session_gb": per, "reserve_ram_gb": reserve, "live": nlive,
+            "by_ram": by_ram, "by_cpu": by_cpu, "by_load": by_load, "hard_cap": hard,
+            "slots_free": min(by_ram, by_cpu, by_load, by_hard)}
+
+
+def cmd_capacity(cfg, args):
+    con = abrir_banco(Path(args.db))
+    cap = capacidade(con)
+    con.close()
+    print(f"vagas livres: {cap['slots_free']}  (vivas: {cap['live']})")
+    print(f"RAM: {cap['free_ram_gb']}GB livre de {cap['total_ram_gb']}GB total · "
+          f"{cap['ram_per_session_gb']}GB/sessão + {cap['reserve_ram_gb']}GB de reserva "
+          f"→ {cap['by_ram']} por RAM")
+    print(f"CPU/carga: {cap['by_cpu']} por CPU, {cap['by_load']} por carga "
+          f"(load1={cap['load1']}, {cap['logical_cpus']} lógicos)")
+    if cap["hard_cap"]:
+        print(f"max_concurrent: {cap['hard_cap']} (restam "
+              f"{max(0, cap['hard_cap'] - cap['live'])})")
+
+
+def cmd_run(cfg, args):
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    uid = _resolver_unidade_id(con, args.chave)
+    u = con.execute("SELECT * FROM unidade WHERE id = ?", (uid,)).fetchone()
+    if u["status"] != "backlog" and not args.force:
+        die(f"{args.chave} está '{u['status']}', não 'backlog'. --force ignora.")
+    if u["status"] == "backlog":
+        prontas_ids = {r["id"] for r in unidades_prontas(con)}
+        if uid not in prontas_ids and not args.force:
+            faltando = con.execute(
+                "SELECT dep.chave AS chave FROM dependencia d "
+                "JOIN unidade dep ON dep.id = d.depende_de "
+                "WHERE d.unidade_id = ? AND dep.status != 'pronto'", (uid,)).fetchall()
+            die(f"{args.chave} espera: {', '.join(f['chave'] for f in faltando)}. "
+                f"--force ignora.")
+    if sessao_viva(con, uid):
+        die(f"{args.chave} já tem sessão viva. `orq attach {args.chave}` ou --force.")
+    cap = capacidade(con)
+    if cap["slots_free"] <= 0 and not args.force:
+        die(f"sem vaga: RAM livre {cap['free_ram_gb']}GB (precisa "
+            f"{cap['ram_per_session_gb']}GB + {cap['reserve_ram_gb']}GB de reserva), "
+            f"{cap['live']} viva(s). --force ignora.")
+
+    how = launch(con, caminho, u, attach=args.attach)
+    with transacao(caminho) as con2:
+        uid2 = _resolver_unidade_id(con2, args.chave)
+        try:
+            transicionar(con2, uid2, "em_progresso", tipo_evento="despachada")
+        except ErroTransicaoIlegal as e:
+            die(str(e))
+    print(f"{C['grn']}✓{C['r']} {args.chave} despachada")
+    print(f"  {how}")
+
+
+def cmd_dispatch(cfg, args):
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    prontas = unidades_prontas(con)
+    cap = capacidade(con)
+    vagas = cap["slots_free"]
+    n = min(args.n or vagas, vagas, len(prontas))
+    if n <= 0:
+        print(f"nada a disparar (prontas: {len(prontas)}, vagas: {vagas}).")
+        return
+    picked = prontas[:n]
+    print(f"{C['b']}Disparando {n}{C['r']} de {len(prontas)} prontas (vagas: {vagas})")
+    for r in picked:
+        print(f"  {r['chave']:<10} {r['modo']:<10} {(r['titulo'] or '')[:50]}")
+    hands = [r["chave"] for r in picked if r["modo"] == "hands-on"]
+    if hands:
+        print(f"{C['yel']}atenção:{C['r']} {', '.join(hands)} hands-on — "
+             f"acompanhe com attach.")
+    if not args.yes and input("\nconfirmar? [s/N] ").strip().lower() not in ("s", "sim", "y"):
+        print("cancelado.")
+        return
+    for r in picked:
+        try:
+            how = launch(con, caminho, r, attach=False)
+            with transacao(caminho) as con2:
+                uid2 = con2.execute(
+                    "SELECT id FROM unidade WHERE chave = ?", (r["chave"],)).fetchone()["id"]
+                transicionar(con2, uid2, "em_progresso", tipo_evento="despachada")
+            print(f"  {C['grn']}✓{C['r']} {r['chave']} — {how}")
+        except SystemExit:
+            print(f"  {C['red']}pulou {r['chave']}{C['r']}")
+
+
+def cmd_attach(cfg, args):
+    con = abrir_banco(Path(args.db))
+    uid = _resolver_unidade_id(con, args.chave)
+    row = con.execute(
+        "SELECT tmux FROM sessao WHERE unidade_id = ? AND encerrada_em IS NULL "
+        "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+    con.close()
+    if not row or not row["tmux"]:
+        die(f"{args.chave} não tem sessão tmux viva.")
+    if not has_tmux():
+        die("tmux ausente.")
+    os.execvp("tmux", ["tmux", "attach", "-t", row["tmux"]])
+
+
+def cmd_log(cfg, args):
+    con = abrir_banco(Path(args.db))
+    uid = _resolver_unidade_id(con, args.chave)
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+    con.close()
+    lf = STATE / f"{nome_esteira}-{uid}.log"
+    if not lf.exists():
+        die(f"sem log para {args.chave}.")
+    os.execvp("tail", ["tail", "-f", str(lf)] if args.follow
+              else ["tail", "-n", "200", str(lf)])
+
+
+def cmd_stop(cfg, args):
+    caminho = Path(args.db)
+    con = abrir_banco(caminho)
+    uid = _resolver_unidade_id(con, args.chave)
+    if not sessao_viva(con, uid):
+        die(f"{args.chave} não tem sessão viva.")
+    row = con.execute(
+        "SELECT tmux, pid FROM sessao WHERE unidade_id = ? AND encerrada_em IS NULL "
+        "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+    nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
+    con.close()
+    if row["tmux"]:
+        subprocess.run(["tmux", "kill-session", "-t", row["tmux"]], check=False)
+    elif row["pid"]:
+        try:
+            os.kill(int(row["pid"]), 15)
+        except Exception:
+            pass
+    with transacao(caminho) as con2:
+        uid2 = _resolver_unidade_id(con2, args.chave)
+        encerrar_sessao(con2, uid2, "stopped")
+    if args.archive:
+        dest = arquivar_artefatos(nome_esteira, uid, args.chave, "stopped")
+        print(f"{C['d']}  artefatos em {dest}{C['r']}")
+    print(f"{C['grn']}✓{C['r']} sessão de {args.chave} encerrada; status não muda. "
+         f"Worktree e branch continuam.")
 
 
 def git_dir_comum(cwd=None):
@@ -1532,8 +2186,7 @@ def main():
     add("validate", cmd_validate, "recusa esteira incoerente, sem escrever nada",
         banco=True)
 
-    # ---- OA-03: máquina de cinco estados. `orq run`/`orq dispatch` não
-    # existem — precisam de um lançador de verdade, que só chega em OA-05.
+    # ---- OA-03: máquina de cinco estados.
     s = add("board", cmd_board, "quadro: o que está pronto, travado, rodando, bloqueado",
             banco=True)
     s = add("next", cmd_next, "fila priorizada do que pode começar agora",
@@ -1558,9 +2211,28 @@ def main():
             banco=True)
     s.add_argument("chave")
     s.add_argument("--forcar", action="store_true", help="obrigatório — confirma a reabertura")
-    s = add("tick", cmd_tick,
-            "recolhe sessão morta (isto NÃO despacha — ver orq run/orq dispatch)",
+    s = add("tick", cmd_tick, "recolhe sessão morta (isto NÃO despacha)", banco=True)
+
+    # ---- OA-05: o lançador de verdade — worktree, briefing único, tmux/
+    # processo, encerramento sem lançador (hold/advance já arquivam e matam a
+    # sessão com delicadeza).
+    s = add("run", cmd_run, "lança a sessão de uma unidade pronta", banco=True)
+    s.add_argument("chave")
+    s.add_argument("--attach", action="store_true", help="entra na sessão já lançada")
+    s.add_argument("--force", action="store_true",
+                   help="ignora status/dependência/vaga — decisão sua, não da esteira")
+    s = add("dispatch", cmd_dispatch, "lança as N prontas de maior prioridade",
             banco=True)
+    s.add_argument("-n", type=int, default=0)
+    s.add_argument("-y", "--yes", action="store_true")
+    add("capacity", cmd_capacity, "vagas livres para lançar sessão agora", banco=True)
+    s = add("attach", cmd_attach, "entra na sessão (tmux) de uma unidade", banco=True)
+    s.add_argument("chave")
+    s = add("log", cmd_log, "lê o log da sessão de uma unidade", banco=True)
+    s.add_argument("chave"); s.add_argument("-f", "--follow", action="store_true")
+    s = add("stop", cmd_stop, "encerra a sessão sem mudar o status", banco=True)
+    s.add_argument("chave")
+    s.add_argument("--archive", action="store_true", help="também arquiva os artefatos")
 
     # ---- máquina — não depende de esteira nenhuma.
     s = add("host", cmd_host, "o que limita esta máquina agora (dispensa esteira)")
@@ -1568,12 +2240,9 @@ def main():
     s.add_argument("--check", action="store_true",
                    help="só alerta; sai com 1 quando há alerta")
 
-    # `orq run`/`orq dispatch` (lançar sessão), `orq doctor` (pré-voo) e
-    # `orq capacity` (orçamento de RAM por sessão) NÃO EXISTEM ainda. Todos
-    # dependiam do motor TOML removido nesta unidade (OA-04); cada um volta
-    # com um lançador/checagem de verdade contra o banco — `run`/`dispatch`
-    # em OA-05, `doctor` em OA-12. Não há comando aqui fingindo fazer o que
-    # ainda não faz.
+    # `orq doctor` (pré-voo) ainda não existe — dependia do motor TOML
+    # removido em OA-04, e volta com checagem de verdade contra o banco em
+    # OA-12. Não há comando aqui fingindo fazer o que ainda não faz.
 
     args = p.parse_args()
     if getattr(args, "banco", False):

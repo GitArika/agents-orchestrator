@@ -123,3 +123,41 @@ unidade depende **está** na base quando ela começa. O caso que custou uma sess
 - **O humano vira o gargalo.** Com dependência liberando só no merge, um PR esquecido
   trava toda a cadeia abaixo dele. Por isso o Telegram avisa PR aberto (OA-11) e o quadro
   mostra há quanto tempo a unidade está em `revisao`.
+
+## Nota de implementação (22/09/2026)
+
+**A cerca não foi tocada, por decisão explícita.** `hooks/cerca.sh` continua barrando
+`git push` por `ORQ_STAGE == 'integrate'`, e este lançador nunca injeta `ORQ_STAGE`
+(estágio não existe mais). Consequência aceita: uma sessão lançada implementa e comita
+localmente, mas a cerca barra a publicação do próprio branch — o passo 6 do briefing —
+até OA-06 trocar a regra por "branch da própria unidade". Provado estruturalmente em
+`testes/test_lancador.py::CercaSemOrqStageBarraPush`, rodando a cerca de verdade com o
+ambiente exato que `settings_json()` produz.
+
+**Escopo além da letra do spec, decidido ao codificar, sem precisar perguntar de novo**
+(mesma politica de "aceitar buraco, documentar" das unidades anteriores):
+
+- `orq run`/`orq dispatch`/`orq attach`/`orq log`/`orq stop`/`orq capacity` — todos
+  precisavam existir para o lançador ser genuinamente usável, e nenhum tinha dono definido
+  fora desta unidade (OA-03 explicitamente os excluiu; OA-04 os deixou pendentes).
+- **`encerramento_fixo`** (busca por `docker-compose*.yml`, `down`) — antecipado de OA-08,
+  porque este spec já amarra a morte da worktree a `bloqueado`, e OA-08 só cuida do
+  gatilho de merge. `orq hold` e `orq tick` (reap→quarentena) já chamam.
+- **`orq advance` ganhou a checagem de PR real** (`gh pr view`) — o próprio spec já previa
+  isso como trabalho desta unidade ("fica para OA-05, que é quem sabe o `github_repo` no
+  contexto certo").
+- **Ordem dos passos 7/8 do briefing corrigida.** O spec original listava "atualizar o
+  cartão" ANTES de "encerrar" — contradizendo a própria seção "Banco primeiro, cartão
+  depois" duas seções abaixo. Resolvido a favor do princípio explícito: encerrar (escrita
+  no banco) vem primeiro; atualizar o cartão, depois. Testado
+  (`test_ordem_das_escritas_banco_antes_do_cartao`).
+
+**Todas as escritas lentas (worktree, tmux, `docker compose down`, `git worktree remove`)
+rodam FORA de qualquer transação SQLite** — só a escrita final (registrar sessão,
+transicionar status) abre `transacao()`. É a mesma disciplina que motivou a migração para
+SQLite (OA-01): segurar o lock de escrita durante I/O de minutos seria o mesmo erro de
+novo, com banco novo.
+
+`bin/orq`: 2258 linhas. `testes/test_lancador.py`: 32 testes, incluindo um ciclo completo
+`run → hold` (mata a sessão com delicadeza, teardown, remove a worktree) e
+`run → advance` (worktree sobrevive) com tmux de verdade e um `claude`/`gh` de mentira.

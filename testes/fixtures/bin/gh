@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""`gh` de mentira para os testes: nenhum teste automatizado deve depender da
+API real do GitHub nem de um repositório `acme/x` que não existe.
+
+Só entende `gh pr view <numero> --repo <repo>` — o único subcomando que
+`_pr_existe` (OA-05) chama. Sai 0 (PR existe) se `<numero>` estiver na lista
+`FAKE_GH_PRS_OK` (separada por vírgula), ou se essa variável for "*" (todos
+existem — o padrão para testes que não estão testando ESTA checagem). Sai 1
+(PR não existe) caso contrário.
+"""
+import os
+import sys
+
+if len(sys.argv) >= 3 and sys.argv[1] == "pr" and sys.argv[2] == "view":
+    numero = sys.argv[3] if len(sys.argv) > 3 else ""
+    ok = os.environ.get("FAKE_GH_PRS_OK", "*")
+    if ok == "*" or numero in {n.strip() for n in ok.split(",") if n.strip()}:
+        sys.exit(0)
+    sys.exit(1)
+
+sys.exit(1)

@@ -5,16 +5,16 @@ Duas camadas, como o resto da suíte:
     test_estado.py), testando `transicionar`, `sessao_viva`,
     `recolher_sessoes_mortas`, `unidades_prontas`, `classificar` e
     `resolver_banco` diretamente — inclusive o ciclo de vida inteiro
-    (backlog → em_progresso → revisão → pronto libera dependente), que só é
-    alcançável assim porque `orq run`/`orq advance` como CLI dependem de
-    coisas que ainda não existem (OA-05).
+    (backlog → em_progresso → revisão → pronto libera dependente), montado
+    com as funções de biblioteca (não `orq run`, que é CLI e tem suíte
+    própria: testes/test_lancador.py, OA-05).
   * PROCESSO — bin/orq como subprocesso com --db explícito (mesmo padrão de
     test_verbos.py), provando que board/next/status/show/hold/release/
     reopen/advance/tick estão de fato religados.
 
-`orq run`/`orq dispatch` NÃO são testados aqui: continuam apontando para o
-lançador antigo (TOML) até OA-05 lhes dar um de verdade — não foram tocados
-nesta unidade.
+`advance` faz uma chamada de rede real (`gh pr view`, OA-05) — por isso todo
+teste de processo aqui roda com um `gh` de mentira na PATH
+(testes/fixtures/bin/gh) que nunca fala com o GitHub de verdade.
 """
 import importlib.machinery
 import importlib.util
@@ -440,10 +440,19 @@ class ResolverBanco(unittest.TestCase):
 
 # =================================================================== PROCESSO
 
-def orq_cli(db, *args, cwd=None, checar=True):
+FAKE_GH = RAIZ / "testes" / "fixtures" / "bin"
+
+
+def orq_cli(db, *args, cwd=None, checar=True, env_extra=None):
+    # `gh` de mentira na PATH (testes/fixtures/bin/gh): nenhum teste aqui
+    # fala com a API real do GitHub. Por padrão diz que QUALQUER PR existe
+    # (FAKE_GH_PRS_OK="*") — quem quiser testar a recusa passa
+    # env_extra={"FAKE_GH_PRS_OK": "..."} ou "" (nenhum PR existe).
+    env = {**os.environ, "PATH": f"{FAKE_GH}:{os.environ.get('PATH', '')}",
+          "FAKE_GH_PRS_OK": "*", **(env_extra or {})}
     r = subprocess.run(
         [sys.executable, str(ORQ_BIN), "--db", str(db), *args],
-        cwd=cwd, capture_output=True, text=True, timeout=30)
+        cwd=cwd, capture_output=True, text=True, timeout=30, env=env)
     if checar and r.returncode != 0:
         raise AssertionError(
             f"orq {' '.join(args)} falhou ({r.returncode}):\n{r.stdout}\n{r.stderr}")

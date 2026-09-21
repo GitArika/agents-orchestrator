@@ -34,7 +34,7 @@ Estas não são suposições: foram respondidas em 21/09/2026 e valem para todas
 | [OA-02](OA-02-verbos-de-declaracao.md) | Verbos de declaração e configuração | P0 | OA-01 | concluído (`bin/orq`, `testes/test_verbos.py`) |
 | [OA-03](OA-03-maquina-de-cinco-estados.md) | Máquina de cinco estados e quadro derivado | P0 | OA-01, OA-02 | concluído (`bin/orq`, `testes/test_maquina.py`) |
 | [OA-04](OA-04-motor-sem-clickup.md) | O motor deixa de falar com o ClickUp | P0 | OA-03 | concluído (`bin/orq`: 4187→1597 linhas) |
-| [OA-05](OA-05-papel-unico-auto-contido.md) | O papel único auto-contido | P0 | OA-03, OA-04 | não iniciado |
+| [OA-05](OA-05-papel-unico-auto-contido.md) | O papel único auto-contido | P0 | OA-03, OA-04 | concluído (`bin/orq`, `testes/test_lancador.py`) |
 | [OA-06](OA-06-cerca-do-papel-unico.md) | A cerca do papel único | P0 | OA-05 | não iniciado |
 | [OA-07](OA-07-espelho-de-cinco-status-no-clickup.md) | Espelho de cinco status no ClickUp | P1 | OA-04, OA-05 | não iniciado |
 | [OA-08](OA-08-vigia-de-pr-no-laco.md) | O vigia de PR dentro do laço | P0 | OA-03, OA-05 | não iniciado |
@@ -139,6 +139,9 @@ errada, o conserto agora é barato.
 | 11 | `orq run`/`orq dispatch` ficam de fora de OA-03 — só entram quando OA-05 der a eles um lançador de verdade | OA-03 | Despachar sem lançar seria um comando que promete e não faz; melhor não ter o verbo agora |
 | 12 | `orq advance`/`orq hold`/`orq release`/`orq reopen`/`orq tick` (só recolhimento) e `orq board/next/status/show` SUBSTITUEM os de mesmo nome do motor TOML, mesma decisão já aplicada a `orq init` em OA-02 | OA-03 | Reabre oito comandos de uma vez; se a substituição em massa incomodar, o caminho é reverter comando a comando, não a decisão |
 | 13 | OA-04 removeu o motor TOML **por inteiro** (Config/Stage/launch/worktree/capacity/BRIEFS/doctor/laço), não só as chamadas ao ClickUp que a letra original do spec listava — confirmado com você, aceitando o hiato | OA-04 | `orq run`/`orq dispatch`/`orq doctor`/`orq capacity` ficam indisponíveis até OA-05/OA-12; se o hiato doer, a saída é acelerar essas duas unidades, não reintroduzir código morto |
+| 14 | A cerca **não** foi tocada em OA-05, por decisão explícita — `hooks/cerca.sh` continua exigindo `ORQ_STAGE=integrate` para `git push`, que este lançador nunca injeta | OA-05 | Sessão lançada implementa e comita, mas a cerca barra a publicação do próprio branch até OA-06 trocar a regra por branch. Provado estruturalmente contra a cerca de verdade; sem OA-06, nenhuma unidade sai de `em_progresso` pelo caminho normal |
+| 15 | `encerramento_fixo` (busca `docker-compose*.yml`, `down`) foi construído em OA-05, antecipando o mecanismo que OA-08 descreve para o gatilho de merge — porque `orq hold`/`orq tick` já precisavam dele para o gatilho de `bloqueado` | OA-05 | Se OA-08 quiser um mecanismo diferente, é ajustar uma função já testada, não construir do zero |
+| 16 | Ordem dos passos 7/8 do briefing original (spec) estava invertida — "atualizar cartão" antes de "encerrar" contradizia a própria seção "banco primeiro, cartão depois". Corrigido a favor do princípio explícito | OA-05 | Se a ordem original fosse intencional, a seção "Ordem das escritas" precisaria ser reescrita — não parece ser o caso |
 
 ## A perda que esta entrega aceita
 

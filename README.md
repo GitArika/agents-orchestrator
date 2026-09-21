@@ -91,8 +91,8 @@ independente foi o humano olhando o diff, e a taxa de devolução é o termômet
 **O Telegram é o canal padrão de aviso.** PR aberto, unidade bloqueada e falha operacional
 chegam lá — exceto sessão pedindo decisão dentro do app, que já chega por outro caminho.
 
-O desenho completo, com as decisões e o porquê de cada uma, está em
-[`docs/specs/orquestrador-agil/index.md`](docs/specs/orquestrador-agil/index.md).
+O desenho completo e as decisões por trás dessa troca de modelo estão contados nos
+[Aprendizados](docs/aprendizados.md), que apontam para cada uma onde ela importa.
 
 ## O que já se sabe
 

@@ -535,6 +535,31 @@ class ComoSubprocesso(unittest.TestCase):
         self.assertEqual(u["pr_numero"], 55)
         self.assertEqual(u["pr_url"], "https://github.com/acme/x/pull/55")
 
+    def test_advance_nao_depende_de_ler_os_checks_de_ci(self):
+        # Um token sem leitura de checks faz a visão padrão de `gh pr view`
+        # falhar com o PR existindo — medido em 22/09/2026 no mine-one. A
+        # checagem de existência não pode depender disso.
+        _direto(self.db, orq.transicionar, self.a, "em_progresso")
+        orq_cli(self.db, "advance", "FE-A", "--pr", "25", env_extra={"FAKE_GH_SEM_CHECKS": "1"})
+        con = orq.abrir_banco(self.db)
+        u = con.execute("SELECT status FROM unidade WHERE id = ?", (self.a,)).fetchone()
+        con.close()
+        self.assertEqual(u["status"], "revisao")
+
+    def test_encerramento_espera_o_passo_8_so_de_dentro_da_sessao(self):
+        # De dentro da sessão o briefing ainda manda espelhar o cartão; com
+        # 3 s ela morria no meio disso (DS-05 do mine-one, 22/09/2026).
+        antigo = os.environ.pop("ORQ_UNIT", None)
+        try:
+            self.assertEqual(orq._atraso_encerramento("FE-A"), 3)
+            os.environ["ORQ_UNIT"] = "FE-A"
+            self.assertEqual(orq._atraso_encerramento("FE-A"), orq.ESPERA_PASSO_8_S)
+            self.assertEqual(orq._atraso_encerramento("FE-B"), 3)
+        finally:
+            os.environ.pop("ORQ_UNIT", None)
+            if antigo is not None:
+                os.environ["ORQ_UNIT"] = antigo
+
     def test_hold_exige_motivo_com_tamanho_minimo(self):
         _direto(self.db, orq.transicionar, self.a, "em_progresso")
         r = orq_cli(self.db, "hold", "FE-A", "--motivo", "curto", checar=False)

@@ -1363,7 +1363,10 @@ def cmd_hold(cfg, args):
     # seria o mesmo erro que a migração para SQLite existiu para consertar
     # segurar o lock de escrita durante I/O lento (OA-01).
     dest = arquivar_artefatos(nome_esteira, uid, args.chave, "hold")
-    _matar_sessao_com_delicadeza(row_sessao)
+    atraso = _atraso_encerramento(args.chave)
+    _matar_sessao_com_delicadeza(row_sessao, atraso)
+    if atraso > 3:
+        print(f"  esta sessão encerra em {atraso // 60} min — faça o passo 8 (cartão) agora.")
     falhas_td = []
     if row_sessao and row_sessao["worktree"]:
         wt = Path(row_sessao["worktree"])
@@ -1428,12 +1431,20 @@ def _numero_e_url_do_pr(con: sqlite3.Connection, valor: str):
 def _pr_existe(github_repo: str | None, numero: int) -> bool:
     """A única chamada de rede do motor fora do vigia (OA-08). Pega erro de
     digitação no PR na hora — sem isto a unidade ficaria em 'revisao' para
-    sempre, esperando um vigia que nunca vai achar nada."""
+    sempre, esperando um vigia que nunca vai achar nada.
+
+    `--json number`, e não a visão padrão: sem `--json` o `gh` também busca o
+    status dos checks de CI, e um token sem leitura de checks falha a chamada
+    inteira com o PR existindo. Medido em 22/09/2026 no mine-one: `gh pr view
+    25` saía 1 com "Resource not accessible by personal access token
+    (…statusCheckRollup…)" e `--json number` respondia. Existir é tudo o que
+    esta função precisa saber."""
     if not github_repo:
         return True   # nada declarado pra checar; `orq validate` já cobra isso
     if not shutil.which("gh"):
         die("`gh` não está na PATH — não dá para confirmar que o PR existe.")
-    r = subprocess.run(["gh", "pr", "view", str(numero), "--repo", github_repo],
+    r = subprocess.run(["gh", "pr", "view", str(numero), "--repo", github_repo,
+                        "--json", "number"],
                        capture_output=True, text=True, timeout=20)
     return r.returncode == 0
 
@@ -1667,7 +1678,10 @@ def cmd_advance(cfg, args):
         encerrar_sessao(con, uid, "advance")
         nome_esteira = slugify(obter_config(con, "name") or "esteira", 16)
     dest = arquivar_artefatos(nome_esteira, uid, args.chave, "advance")
-    _matar_sessao_com_delicadeza(row_sessao)
+    atraso = _atraso_encerramento(args.chave)
+    _matar_sessao_com_delicadeza(row_sessao, atraso)
+    if atraso > 3:
+        print(f"  esta sessão encerra em {atraso // 60} min — faça o passo 8 (cartão) agora.")
     print(f"{C['grn']}✓{C['r']} {args.chave}: revisão — PR #{numero}"
           + (f" {url}" if url else ""))
     print(f"{C['d']}  artefatos em {dest} · worktree continua (retrabalho pode reusar){C['r']}")
@@ -1958,6 +1972,10 @@ dá para resolver sozinho.
 Encerrar sem nenhum dos dois deixa a unidade em 'em_progresso' sem sessão
 viva — a esteira lê isso como arranque falho e conta uma falta.
 
+Rode `advance`/`hold` SOZINHO, não encadeado com outros comandos. Ele
+encerra esta sessão 3 minutos depois: faça o passo 8 logo em seguida, sem
+mais nada no meio.
+
 ────────────────────────────────────────────────────────────────────────────
 8. SÓ DEPOIS, ATUALIZE O CARTÃO — os dois lados do espelho (OA-07)
 
@@ -2227,6 +2245,21 @@ def arquivar_artefatos(nome_esteira: str, uid: int, chave: str, outcome: str) ->
         "arquivado_em": time.strftime("%FT%TZ", time.gmtime()), "artefatos": movidos,
     }, ensure_ascii=False, indent=2))
     return dest
+
+
+ESPERA_PASSO_8_S = 180
+
+
+def _atraso_encerramento(chave: str) -> int:
+    """Quanto esperar antes de matar a sessão que acabou de sair de trabalho.
+
+    Chamado de DENTRO da própria sessão (`ORQ_UNIT` é a unidade), o briefing
+    ainda manda um passo depois: espelhar o cartão (passo 8). Com os 3 s de
+    antes a sessão morria no meio desse passo, sempre — medido em 22/09/2026
+    no mine-one: o cartão do DS-05 ficou em "em progresso" com a unidade em
+    revisão, e o acompanhamento remoto mostrava o `orq advance` rodando para
+    sempre. De fora (uma pessoa no terminal), não há passo seguinte."""
+    return ESPERA_PASSO_8_S if os.environ.get("ORQ_UNIT") == chave else 3
 
 
 def _matar_sessao_com_delicadeza(row_sessao, kill_delay: int = 3) -> None:

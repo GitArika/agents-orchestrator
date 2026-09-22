@@ -84,6 +84,10 @@ orq hold    <unidade> --motivo "<o que exatamente trava>"   # → 'bloqueado'
 decisão de produto, ambiguidade que não dá para resolver sozinho. O motivo precisa dizer o
 que trava, com pelo menos vinte caracteres — é validado. "Não consegui" não é motivo.
 
+Rode `advance`/`hold` **sozinho**, não encadeado com outros comandos: ele encerra esta
+sessão 3 minutos depois, e o passo 8 precisa caber nesse intervalo. Faça o passo 8 logo em
+seguida, sem nada no meio.
+
 **Não existe um terceiro caminho de "reprovar".** Quem reprova agora é o gate humano, no PR
 — o caminho de volta é a esteira relançar você com os comentários da revisão, não um comando
 seu.
